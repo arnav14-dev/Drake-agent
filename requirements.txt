@@ -1,0 +1,6 @@
+# Fynn Drake agent — install on the Windows VM (Python 3.9+).
+#   pip install -r requirements.txt
+pywinauto>=0.6.8
+comtypes>=1.2.0
+# connect mode only (live link to Fynn):
+websocket-client>=1.6.0

@@ -1,0 +1,114 @@
+{
+  "_about": "Per-Drake-build field binding. Copy to binding.json and fill in with `agent.py probe` + `agent.py calibrate` on the VM. Each field maps a LOGICAL name (what Fynn sends) to how the agent reaches it: automation_id (preferred, if Drake's grid exposes it to UI Automation), field_no (Drake heads-down field number), or tab_index (Tabs from the screen's first field). Fill whichever your probe shows works; the agent tries automation_id, then field_no, then tab_index.",
+
+  "app_title_re": ".*Drake.*",
+
+  "capabilities": {
+    "_note": "Set can_read_field_values TRUE only after `agent.py probe` confirms Drake boxes expose a readable UIA value. Left FALSE, Fynn's honesty gate refuses to run live (it will not claim a verified read-back it cannot deliver).",
+    "can_read_field_values": false,
+    "can_observe_element_state": true,
+    "can_screenshot": true,
+    "can_keyboard_navigate": true
+  },
+
+  "navigation": {
+    "_note": "Key chords in pywinauto send_keys() syntax. Calibrate against your Drake build.",
+    "to_data_entry_selector": "{ESC}",
+    "open_screen_suffix": "{ENTER}",
+    "headsdown_toggle": "^n",
+    "headsdown_jump_suffix": "{ENTER}",
+    "new_instance": "{PGDN}",
+    "save_and_exit": "{ESC}",
+    "field_commit": "{ENTER}",
+    "field_clear": "^a{BACKSPACE}"
+  },
+
+  "screens": {
+    "W2": {
+      "repeatable": true,
+      "fields": {
+        "employer_ein": { "automation_id": null, "field_no": null, "tab_index": null },
+        "employer_name": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box1_wages": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box2_fed_wh": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box3_ss_wages": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box4_ss_tax": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box5_medicare_wages": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box6_medicare_tax": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box12a_code": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box12a_amount": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box12b_code": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box12b_amount": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box15_state": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box15_state_id": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box16_state_wages": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box17_state_tax": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box18_local_wages": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box19_local_tax": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box20_locality": { "automation_id": null, "field_no": null, "tab_index": null }
+      }
+    },
+    "INT": {
+      "repeatable": true,
+      "fields": {
+        "payer_name": { "automation_id": null, "field_no": null, "tab_index": null },
+        "payer_tin": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box1_interest": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box3_savings_bond_int": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box4_fed_wh": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box8_tax_exempt_int": { "automation_id": null, "field_no": null, "tab_index": null }
+      }
+    },
+    "DIV": {
+      "repeatable": true,
+      "fields": {
+        "payer_name": { "automation_id": null, "field_no": null, "tab_index": null },
+        "payer_tin": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box1a_ordinary_div": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box1b_qualified_div": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box2a_cap_gain": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box5_sec199a": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box4_fed_wh": { "automation_id": null, "field_no": null, "tab_index": null }
+      }
+    },
+    "NEC": {
+      "repeatable": true,
+      "fields": {
+        "payer_name": { "automation_id": null, "field_no": null, "tab_index": null },
+        "payer_tin": { "automation_id": null, "field_no": null, "tab_index": null },
+        "recipient_tin": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box1_nonemployee_comp": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box4_fed_wh": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box5_state_wh": { "automation_id": null, "field_no": null, "tab_index": null }
+      }
+    },
+    "1099": {
+      "_note": "Drake screen code '1099' = 1099-R retirement distributions.",
+      "repeatable": true,
+      "fields": {
+        "payer_tin": { "automation_id": null, "field_no": null, "tab_index": null },
+        "recipient_tin": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box1_gross_distribution": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box2a_taxable": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box4_fed_wh": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box5_employee_contrib": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box7_dist_code": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box7_ira_sep_simple": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box14_state_wh": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box16_state_dist": { "automation_id": null, "field_no": null, "tab_index": null }
+      }
+    },
+    "1098": {
+      "repeatable": true,
+      "fields": {
+        "lender_name": { "automation_id": null, "field_no": null, "tab_index": null },
+        "lender_tin": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box1_mortgage_interest": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box2_principal": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box3_origination_date": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box5_mip": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box6_points": { "automation_id": null, "field_no": null, "tab_index": null }
+      }
+    }
+  }
+}
