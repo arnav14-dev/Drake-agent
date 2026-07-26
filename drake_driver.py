@@ -277,6 +277,51 @@ class DrakeDriver:
             v = ""
         return v or None
 
+    def _foreground(self) -> None:
+        """
+        Bring the Drake window to the FRONT before any screen capture. `capture_as_image`
+        grabs the window's screen rectangle, not its pixels directly — so if Drake is
+        occluded by the editor/terminal, the capture returns the *occluding* window
+        (this is why an early after.png caught VS Code). Restores it if minimized, then
+        raises + focuses. All best-effort: a missing method just no-ops.
+        """
+        if self.dry_run or self.win is None:
+            return
+        import time
+        try:
+            if self.win.is_minimized():
+                self.win.restore()
+        except Exception:
+            pass
+        try:
+            # pywinauto's set_focus does the AttachThreadInput + SetForegroundWindow
+            # dance that reliably surfaces a window owned by another process.
+            self.win.set_focus()
+        except Exception:
+            pass
+        # Fallback z-order raise for when SetForegroundWindow is restricted (Python
+        # launched from the editor's terminal may lack foreground rights — then keystrokes
+        # still reach Drake via AttachThreadInput but the window never rises, which is how
+        # a capture caught VS Code even though data went into Drake). ctypes.windll only
+        # resolves on Windows; this path never runs on Mac (guarded by dry_run/win above).
+        try:
+            import ctypes
+            hwnd = int(self.win.handle)
+            user32 = ctypes.windll.user32
+            user32.BringWindowToTop(hwnd)
+            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW = 0x0002, 0x0001, 0x0040
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        except Exception:
+            pass
+        time.sleep(0.25)  # let the window actually paint on top before we grab pixels
+
+    def _capture_window_image(self):
+        """A PIL image of JUST the Drake window rectangle, Drake brought to front first.
+        `capture_as_image()` already crops to the window's bounding rect (not the whole
+        monitor), so background windows are excluded once Drake is foreground."""
+        self._foreground()
+        return self.win.capture_as_image()
+
     def _ocr_read(self, box) -> Optional[str]:
         """
         OCR the calibrated [x, y, w, h] pixel crop of the Drake window (coordinates
@@ -291,7 +336,7 @@ class DrakeDriver:
             raise RuntimeError(
                 "OCR read-back needs pytesseract + Pillow (pip install pytesseract pillow) "
                 "and the Tesseract binary installed on the VM")
-        img = self.win.capture_as_image()  # pywinauto returns a PIL image
+        img = self._capture_window_image()  # Drake-to-front, window rect, PIL image
         x, y, w, h = (int(n) for n in box)
         crop = img.crop((x, y, x + w, y + h))
         # psm 7 = "treat the crop as a single line" — right for one field's value.
@@ -301,11 +346,12 @@ class DrakeDriver:
     def save_screenshot(self, path: str) -> dict:
         """Save a PNG of the live Drake window to disk — the human-verify floor and the
         source you read OCR boxes off. (screenshot() returns base64 for the wire;
-        this writes a file for a person to open.)"""
+        this writes a file for a person to open.) Brings Drake to the front first so the
+        capture is Drake, never the editor/terminal that launched the run."""
         try:
             if self.dry_run or self.win is None:
                 return {"ok": False, "path": None, "error": "no window"}
-            self.win.capture_as_image().save(path, format="PNG")
+            self._capture_window_image().save(path, format="PNG")
             return {"ok": True, "path": path, "takenAt": _now()}
         except Exception as e:
             return {"ok": False, "path": None, "error": str(e)}
@@ -334,7 +380,7 @@ class DrakeDriver:
             if self.dry_run or self.win is None:
                 return {"ok": False, "pngBase64": None, "takenAt": _now(), "error": "no window"}
             import base64, io
-            img = self.win.capture_as_image()
+            img = self._capture_window_image()
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             return {"ok": True, "pngBase64": base64.b64encode(buf.getvalue()).decode(), "takenAt": _now()}

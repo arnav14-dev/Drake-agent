@@ -37,6 +37,12 @@ while a run is in progress.
 > - The default window match is now `Drake \d{4} Tax Software` (e.g. "Drake 2025 Tax
 >   Software"), so it won't collide with **Drake Software Chat** or a browser tab. If
 >   your title differs, set `app_title_re` in `binding.json`.
+> - **Screenshots capture the window's *screen rectangle*, not its pixels** — so if
+>   Drake is behind the editor/terminal, the capture (and OCR) grabs the *wrong* window.
+>   The agent now forces Drake to the foreground (`set_focus` + a z-order raise) before
+>   every capture. Still: don't touch the mouse/keyboard mid-run, and if you can, launch
+>   from a plain terminal rather than the editor's integrated one (foreground rights are
+>   friendlier). If an early `after.png` shows VS Code, that's this bug — re-run.
 
 ## What we learned probing Drake Tax 2025: no programmatic read-back exists
 
