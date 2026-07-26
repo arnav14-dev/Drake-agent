@@ -102,28 +102,50 @@ build/software. On Drake 2025 skip straight to the screenshot floor + OCR.
 
 ### 1c. The make-or-break that's actually left: can the robot TYPE reliably?
 
-All read-back is now visual, so the open question is no longer "can we read?" but
-**"can we put values in the right boxes with keyboard nav, given chords break focus?"**
-Prove that first — it's cheaper than OCR and decides whether Drake-RPA is viable at all:
+All read-back is now visual, so the open question is **"can we plant a caret in the
+right box and get the digits to land?"** Two hard-won facts shape the answer:
+- Drake's canvas has **no focusable OS element**, so the only reliable focus is a
+  **physical mouse click** at the field's pixel point (`click_xy`). `send_keys` is a
+  global inject — with no caret it vanishes into the frame.
+- **Ctrl chords are toxic**: `Ctrl+A` (the old `clearFirst` clear) and `Ctrl+N` (the old
+  heads-down toggle) break focus + pop a modal. Both are now purged from the defaults.
 
-1. Fill `field_no` (or `tab_index`) for the W-2 fields in `binding.json` (keyboard nav,
-   not clicks).
+So the sequence is: capture the window, read off each field's **click point**, then run
+the self-test (which now clicks-to-focus and never sends a Ctrl chord):
+
+1. `python agent.py shoot --binding binding.json --out drake.png` — open `drake.png`,
+   read each W-2 field's **center pixel** `[x, y]` (window-relative) and put it in
+   `binding.json` as `"click_xy"`. (Grab the full box `[x,y,w,h]` too → `"ocr_box"`.)
 2. `python agent.py selftest --binding binding.json --plan selftest.plan.json --shot after.png`
-3. Open `after.png` and eyeball whether EIN / wages / withholding landed in the right
-   boxes. If yes → build OCR read-back on top (below). If the robot mis-lands → RPA into
-   Drake may not be viable; report back before investing further.
+3. Open `after.png`: did EIN / wages / withholding land in the right boxes? Yes → wire OCR
+   read-back (set `read_back_method: "ocr"` + `can_read_field_values: true`). Mis-lands →
+   the `click_xy` points are off; re-read them from the PNG.
 
-### 1d. `shoot` — capture the window (human floor + OCR calibration)
+**Quick disambiguating test** (if the self-test still types nothing, run this to tell
+*why* in one shot — Drake open on a W-2 screen):
+
+```
+# (1) delivery + caret: click a box by hand, then:
+python -c "from pywinauto.keyboard import send_keys; send_keys('52000', pause=0.05)"
+#   digits appear -> input IS delivered (elevation ruled out) and a click focuses. 
+# (2) clear-chord: with the caret still there:
+python -c "from pywinauto.keyboard import send_keys; send_keys('^a')"
+#   modal pops / caret leaves -> confirms Ctrl+A is toxic (and re-proves delivery).
+# (3) nothing lands in (1) AND ^a pops no modal in (2) -> input is being dropped:
+#   elevation/UIPI — run the agent as Administrator (connect() also warns on mismatch).
+```
+
+### 1d. `shoot` — capture the window (human floor + click/OCR calibration)
 
 ```
 python agent.py shoot --binding binding.json --out drake.png
 ```
 
-Saves a PNG of the live Drake window. Two uses: (1) the **human-verify floor** when
-there's no read-back, and (2) **OCR calibration** — open the PNG, read each field's
-pixel box `[x, y, w, h]` (relative to the window's top-left), and put it in
-`binding.json` under that field's `"ocr_box"`. Then set
-`capabilities.read_back_method: "ocr"` + `can_read_field_values: true`.
+Saves a PNG of the live Drake window (printing the bound window's title + size so you
+can confirm it's the data-entry frame, not the chat overlay). Three uses: the
+**human-verify floor**, **`click_xy` calibration** (each field's center point — the
+click that plants a caret), and **`ocr_box` calibration** (each field's full
+`[x, y, w, h]` rectangle for OCR read-back). One capture gives you all three.
 
 ### 2. `calibrate` — capture the field binding
 

@@ -1,5 +1,5 @@
 {
-  "_about": "Per-Drake-build field binding. Copy to binding.json and fill in on the VM. INPUT: each field maps a LOGICAL name (what Fynn sends) to how the agent reaches it — on Drake 2025 automation_id is dead (custom-drawn grid), so navigate by field_no (Drake heads-down field number) or tab_index (Tabs from the screen's first field); the agent tries automation_id, then field_no, then tab_index. READ-BACK: Drake exposes no programmatic value, so verification is either OCR of a screen crop (add \"ocr_box\": [x, y, w, h] in window-relative pixels — capture the window with `agent.py shoot`, read the box off the PNG) or the human screenshot floor.",
+  "_about": "Per-Drake-build field binding. Copy to binding.json and fill in on the VM. INPUT/FOCUS: each field maps a LOGICAL name (what Fynn sends) to how the agent plants a caret. On Drake 2025 the grid is a custom canvas with NO focusable OS elements, so the only reliable focus is a physical mouse CLICK — set \"click_xy\": [x, y] (window-relative pixels, the field's center). If omitted, the agent clicks the center of \"ocr_box\". field_no/tab_index (keyboard nav) are fallbacks for builds where they work. The agent tries automation_id, then click_xy, then ocr_box-center, then field_no, then tab_index. READ-BACK: Drake exposes no programmatic value, so verification is either OCR of a screen crop (\"ocr_box\": [x, y, w, h] window-relative pixels — capture with `agent.py shoot`, read the box off the PNG) or the human screenshot floor. TIP: one `shoot` PNG gives you BOTH click_xy (the box's center) and ocr_box (the box's rectangle).",
 
   "app_title_re": "Drake \\d{4} Tax Software",
   "main_window_min": [600, 400],
@@ -15,25 +15,25 @@
   },
 
   "navigation": {
-    "_note": "Key chords in pywinauto send_keys() syntax. Calibrate against your Drake build.",
+    "_note": "Key chords in pywinauto send_keys() syntax. IMPORTANT: Ctrl chords are TOXIC on Drake's canvas — Ctrl+A/Ctrl+C break field focus and pop the 'fields must contain data' modal (empirically confirmed). So field_clear is Ctrl-free and headsdown_toggle defaults to empty. Calibrate against your build.",
     "to_data_entry_selector": "{ESC}",
     "open_screen_suffix": "{ENTER}",
-    "headsdown_toggle": "^n",
+    "headsdown_toggle": "",
     "headsdown_jump_suffix": "{ENTER}",
     "new_instance": "{PGDN}",
     "save_and_exit": "{ESC}",
     "field_commit": "{ENTER}",
-    "field_clear": "^a{BACKSPACE}"
+    "field_clear": "{END}{BACKSPACE 40}"
   },
 
   "screens": {
     "W2": {
       "repeatable": true,
       "fields": {
-        "employer_ein": { "automation_id": null, "field_no": null, "tab_index": null, "ocr_box": null },
+        "employer_ein": { "automation_id": null, "field_no": null, "tab_index": null, "click_xy": null, "ocr_box": null },
         "employer_name": { "automation_id": null, "field_no": null, "tab_index": null },
-        "box1_wages": { "automation_id": null, "field_no": null, "tab_index": null, "ocr_box": null },
-        "box2_fed_wh": { "automation_id": null, "field_no": null, "tab_index": null, "ocr_box": null },
+        "box1_wages": { "automation_id": null, "field_no": null, "tab_index": null, "click_xy": null, "ocr_box": null },
+        "box2_fed_wh": { "automation_id": null, "field_no": null, "tab_index": null, "click_xy": null, "ocr_box": null },
         "box3_ss_wages": { "automation_id": null, "field_no": null, "tab_index": null },
         "box4_ss_tax": { "automation_id": null, "field_no": null, "tab_index": null },
         "box5_medicare_wages": { "automation_id": null, "field_no": null, "tab_index": null },

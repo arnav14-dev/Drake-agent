@@ -89,7 +89,51 @@ class DrakeDriver:
             raise RuntimeError("pywinauto is not available (run on the Windows VM)")
         self.app = Application(backend="uia").connect(title_re=self.title_re, timeout=20)
         self.win = self._resolve_main_window()
+        self._warn_if_elevation_mismatch()
         self._foreground()
+
+    def _warn_if_elevation_mismatch(self) -> None:
+        """If Drake runs elevated (as Admin) and this agent does not, Windows UIPI
+        SILENTLY discards our keystrokes — no error, fields just stay empty. Warn loudly
+        so it's an obvious check, not a mystery. (Diagnosis says this is unlikely on the
+        current build — a synthetic ^a still popped Drake's own modal, so input IS getting
+        through — but it's a cheap, permanent guard for other setups.)"""
+        try:
+            import ctypes
+            agent_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+            drake_elevated = self._process_is_elevated(self.win.element_info.process_id)
+            if drake_elevated and not agent_admin:
+                print("WARNING: Drake appears to run ELEVATED but this agent is NOT — Windows "
+                      "UIPI will SILENTLY DROP keystrokes (fields stay empty, no error). "
+                      "Relaunch this agent as Administrator, or run Drake un-elevated.")
+        except Exception:
+            pass
+
+    def _process_is_elevated(self, pid):
+        """Best-effort: is the process at `pid` running elevated? None if we can't tell."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION, TOKEN_QUERY, TokenElevation = 0x1000, 0x0008, 20
+            k32, a32 = ctypes.windll.kernel32, ctypes.windll.advapi32
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not h:
+                return None
+            try:
+                tok = wintypes.HANDLE()
+                if not a32.OpenProcessToken(h, TOKEN_QUERY, ctypes.byref(tok)):
+                    return None
+                try:
+                    elevated, ret_len = wintypes.DWORD(), wintypes.DWORD()
+                    ok = a32.GetTokenInformation(tok, TokenElevation, ctypes.byref(elevated),
+                                                 ctypes.sizeof(elevated), ctypes.byref(ret_len))
+                    return bool(elevated.value) if ok else None
+                finally:
+                    k32.CloseHandle(tok)
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return None
 
     def _resolve_main_window(self):
         """Pick Drake's main window: the LARGEST top-level window of the Drake process
@@ -201,6 +245,13 @@ class DrakeDriver:
         return self.win.child_window(auto_id=auto_id, control_type="Edit")
 
     def focus(self, target: dict) -> dict:
+        """
+        Plant a caret in the field. On Drake's custom canvas the ONLY reliable way is a
+        physical mouse click at the field's window-relative point (UIA/win32 expose no
+        field element, and the heads-down toggle is a Ctrl chord that breaks focus). So:
+        click_xy (preferred) -> center of ocr_box -> field_no/tab_index (keyboard, for
+        builds where that works) -> unbound. NB: no Ctrl chords here anymore.
+        """
         screen, field = target["screen"], target["field"]
         try:
             fb = self._field_binding(screen, field)
@@ -209,15 +260,27 @@ class DrakeDriver:
                 return {"ok": True}
             if fb.get("automation_id"):
                 self._edit_by_auto_id(fb["automation_id"]).set_focus()
-            elif fb.get("field_no") is not None:
-                # Drake heads-down: toggle, jump to the field number, confirm.
-                self._keys(self.nav.get("headsdown_toggle", "^n"))
+                return {"ok": True}
+            click = fb.get("click_xy") or _box_center(fb.get("ocr_box"))
+            if click is not None:
+                self.win.set_focus()  # Drake to foreground so the click lands on it
+                self.win.click_input(coords=(int(click[0]), int(click[1])))
+                return {"ok": True}
+            if fb.get("field_no") is not None:
+                # Heads-down jump. The toggle default is now "" (empty) — the old "^n"
+                # was a Ctrl chord that breaks Drake focus; set it in binding only if a
+                # build genuinely needs a non-Ctrl toggle.
+                tog = self.nav.get("headsdown_toggle", "")
+                if tog:
+                    self._keys(tog)
                 self._keys(str(fb["field_no"]) + self.nav.get("headsdown_jump_suffix", "{ENTER}"))
-            elif fb.get("tab_index") is not None:
+                return {"ok": True}
+            if fb.get("tab_index") is not None:
                 self._keys("{TAB}" * int(fb["tab_index"]))
-            else:
-                return {"ok": False, "error": f"{screen}/{field} is not bound (fill binding.json)"}
-            return {"ok": True}
+                return {"ok": True}
+            return {"ok": False,
+                    "error": f"{screen}/{field} is not bound — set click_xy or ocr_box "
+                             f"(preferred) / field_no / tab_index in binding.json"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -225,25 +288,21 @@ class DrakeDriver:
         opts = opts or {}
         screen, field = target["screen"], target["field"]
         try:
-            fb = self._field_binding(screen, field)
+            self._field_binding(screen, field)  # validate the field is bound (raises if not)
             if self.dry_run:
                 print(f"[dry-run] type {screen}/{field} = {text!r} (opts={opts})")
                 return {"ok": True}
-            auto_id = fb.get("automation_id")
-            if auto_id:
-                ctrl = self._edit_by_auto_id(auto_id)
-                ctrl.set_focus()
-                if opts.get("clearFirst"):
-                    try:
-                        ctrl.set_edit_text("")
-                    except Exception:
-                        self._keys(self.nav.get("field_clear", "^a{BACKSPACE}"))
-                # send_keys types literal text; escape pywinauto's special chars.
-                self._keys(_escape_keys(text))
-            else:
-                if opts.get("clearFirst"):
-                    self._keys(self.nav.get("field_clear", "^a{BACKSPACE}"))
-                self._keys(_escape_keys(text))
+            # Plant a caret FIRST. send_keys is a GLOBAL injection into whatever holds
+            # focus — on Drake's canvas there is no caret until we click, so an unfocused
+            # type silently vanishes into the frame. If we can't focus, do NOT type into
+            # the void and report ok:true; fail honestly so the caller halts.
+            f = self.focus(target)
+            if not f.get("ok"):
+                return {"ok": False, "error": f"cannot focus {screen}/{field} before typing: {f.get('error')}"}
+            if opts.get("clearFirst"):
+                # Ctrl-free clear: End, then Backspaces. "^a{BACKSPACE}" is toxic on Drake.
+                self._keys(self.nav.get("field_clear", "{END}{BACKSPACE 40}"))
+            self._keys(_escape_keys(text))  # escape pywinauto special chars; typed literally
             if opts.get("commit"):
                 self._keys(self.nav.get("field_commit", "{ENTER}"))
             return {"ok": True}
@@ -443,6 +502,15 @@ class DrakeDriver:
 
 
 # --- module helpers ---------------------------------------------------------
+
+def _box_center(box):
+    """Center point (x, y) of a [x, y, w, h] box, or None. Lets a field reuse its
+    ocr_box as a click-to-focus target when no explicit click_xy is set."""
+    if not box:
+        return None
+    x, y, w, h = box
+    return (int(x) + int(w) // 2, int(y) + int(h) // 2)
+
 
 def _escape_keys(text: str) -> str:
     """Escape pywinauto send_keys metacharacters so text is typed literally."""
