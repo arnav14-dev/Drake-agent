@@ -1,10 +1,11 @@
 {
   "_about": "Per-Drake-build field binding. Copy to binding.json and fill in with `agent.py probe` + `agent.py calibrate` on the VM. Each field maps a LOGICAL name (what Fynn sends) to how the agent reaches it: automation_id (preferred, if Drake's grid exposes it to UI Automation), field_no (Drake heads-down field number), or tab_index (Tabs from the screen's first field). Fill whichever your probe shows works; the agent tries automation_id, then field_no, then tab_index.",
 
-  "app_title_re": ".*Drake.*",
+  "app_title_re": "Drake \\d{4} Tax Software",
 
   "capabilities": {
-    "_note": "Set can_read_field_values TRUE only after `agent.py probe` confirms Drake boxes expose a readable UIA value. Left FALSE, Fynn's honesty gate refuses to run live (it will not claim a verified read-back it cannot deliver).",
+    "_note": "read_back_method: how the agent reads a box back. Probe (2026-07) found Drake's grid exposes NO values to UI Automation, so 'uia' is dead on current builds. Run `agent.py clip`; if your value copies back, set read_back_method='clipboard' and can_read_field_values=true. If nothing copies, leave both — Fynn's honesty gate then refuses to run live (it will not claim a verified read-back it cannot deliver) until an OCR/screenshot path is built.",
+    "read_back_method": "none",
     "can_read_field_values": false,
     "can_observe_element_state": true,
     "can_screenshot": true,

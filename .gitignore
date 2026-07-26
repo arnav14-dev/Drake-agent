@@ -1,0 +1,17 @@
+# Machine-specific calibration — never commit (it's per Drake build/resolution).
+binding.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Local artifacts
+*.png
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db

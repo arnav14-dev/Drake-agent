@@ -4,16 +4,19 @@
   { "method": "openScreen", "params": { "screen": "W2", "instance": 0 } },
 
   { "method": "focus", "params": { "target": { "screen": "W2", "field": "employer_ein" } } },
-  { "method": "type", "params": { "target": { "screen": "W2", "field": "employer_ein" }, "text": "12-3456789", "opts": { "clearFirst": true, "commit": true, "kind": "string" } } },
+  { "method": "type", "params": { "target": { "screen": "W2", "field": "employer_ein" }, "text": "12-3456789", "opts": { "clearFirst": true, "commit": false, "kind": "string" } } },
   { "method": "readField", "params": { "target": { "screen": "W2", "field": "employer_ein" } }, "_expect": "12-3456789" },
+  { "method": "press", "params": { "keys": ["Enter"] } },
 
   { "method": "focus", "params": { "target": { "screen": "W2", "field": "box1_wages" } } },
-  { "method": "type", "params": { "target": { "screen": "W2", "field": "box1_wages" }, "text": "52000", "opts": { "clearFirst": true, "commit": true, "kind": "number" } } },
+  { "method": "type", "params": { "target": { "screen": "W2", "field": "box1_wages" }, "text": "52000", "opts": { "clearFirst": true, "commit": false, "kind": "number" } } },
   { "method": "readField", "params": { "target": { "screen": "W2", "field": "box1_wages" } }, "_expect": "52000" },
+  { "method": "press", "params": { "keys": ["Enter"] } },
 
   { "method": "focus", "params": { "target": { "screen": "W2", "field": "box2_fed_wh" } } },
-  { "method": "type", "params": { "target": { "screen": "W2", "field": "box2_fed_wh" }, "text": "6000", "opts": { "clearFirst": true, "commit": true, "kind": "number" } } },
+  { "method": "type", "params": { "target": { "screen": "W2", "field": "box2_fed_wh" }, "text": "6000", "opts": { "clearFirst": true, "commit": false, "kind": "number" } } },
   { "method": "readField", "params": { "target": { "screen": "W2", "field": "box2_fed_wh" } }, "_expect": "6000" },
+  { "method": "press", "params": { "keys": ["Enter"] } },
 
   { "method": "press", "params": { "keys": ["Esc"] } }
 ]

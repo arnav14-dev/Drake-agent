@@ -30,6 +30,11 @@ except Exception:  # pragma: no cover - importable on non-Windows for reading on
     Application = None  # type: ignore
     send_keys = None  # type: ignore
 
+try:
+    import pyperclip  # clipboard read-back (Plan B — Drake exposes no UIA field values)
+except Exception:  # pragma: no cover
+    pyperclip = None  # type: ignore
+
 
 def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -42,7 +47,13 @@ class DrakeDriver:
         self.binding = binding
         self.nav = binding.get("navigation", {})
         self.caps_cfg = binding.get("capabilities", {})
-        self.title_re = binding.get("app_title_re", ".*Drake.*")
+        # How we read a box back. Probe (2026-07) found Drake's custom-drawn grid
+        # exposes NO Edit controls/values to UI Automation, so "uia" is dead on this
+        # build — set "clipboard" after the `clip` test passes, else "none".
+        self.read_back_method = self.caps_cfg.get("read_back_method", "none")
+        # Tight default so we attach to the tax app, not "Drake Software Chat" or a
+        # browser tab that merely contains "Drake" (those triggered ElementAmbiguousError).
+        self.title_re = binding.get("app_title_re", r"Drake \d{4} Tax Software")
         self.key_pause = key_pause
         self.dry_run = dry_run
         self.app = None
@@ -80,8 +91,9 @@ class DrakeDriver:
     def capabilities(self) -> dict:
         return {
             "backend": "uia",
-            # Honest by default: only True once the probe confirms readable UIA values.
+            # Honest by default: only True once probe/clip confirms a real read-back.
             "canReadFieldValues": bool(self.caps_cfg.get("can_read_field_values", False)),
+            "readBackMethod": self.read_back_method,
             "canObserveElementState": bool(self.caps_cfg.get("can_observe_element_state", True)),
             "canScreenshot": bool(self.caps_cfg.get("can_screenshot", True)),
             "canKeyboardNavigate": bool(self.caps_cfg.get("can_keyboard_navigate", True)),
@@ -190,14 +202,19 @@ class DrakeDriver:
                     "error": "dry-run: no live read"}
         try:
             fb = self._field_binding(screen, field)
-            value = None
-            method = "none"
-            confidence = 0.0
-            if fb.get("automation_id"):
+            value, method, confidence = None, "none", 0.0
+            # 1) UIA ValuePattern — only if this build actually exposes it (rare on Drake).
+            if fb.get("automation_id") and self.read_back_method in ("uia", "auto"):
                 ctrl = self._edit_by_auto_id(fb["automation_id"])
                 value, method, confidence = _read_value(ctrl)
-            else:
-                # Read whatever currently holds focus (after keyboard nav).
+            # 2) Clipboard copy-back — the Plan-B path. The field must still be focused
+            #    and NOT yet committed/advanced (read BEFORE the commit keystroke).
+            if value is None and self.read_back_method in ("clipboard", "auto"):
+                v = self.copy_focused_to_clipboard()
+                if v:
+                    value, method, confidence = v, "clipboard", 1.0
+            # 3) Last resort: whatever UIA element holds focus (dead on Drake, kept honest).
+            if value is None and self.read_back_method in ("uia", "auto"):
                 foc = _focused_element(self.app)
                 if foc is not None:
                     value, method, confidence = _read_value(foc)
@@ -208,6 +225,31 @@ class DrakeDriver:
             return out
         except Exception as e:
             return {"ok": False, "value": None, "method": "none", "confidence": 0.0, "error": str(e)}
+
+    def copy_focused_to_clipboard(self) -> Optional[str]:
+        """
+        Read the CURRENTLY FOCUSED Drake field by copying it (Ctrl+A, Ctrl+C) and
+        returning the clipboard text. This is the Plan-B read-back now that Drake's
+        grid exposes no UIA value. The field must already hold keyboard focus and must
+        NOT have been committed/advanced yet. Clears the clipboard first so a stale
+        value can never masquerade as a successful read.
+        """
+        if self.dry_run:
+            return None
+        if pyperclip is None:
+            raise RuntimeError("clipboard read-back needs 'pyperclip' (pip install pyperclip)")
+        import time
+        try:
+            pyperclip.copy("")  # clear — a leftover clipboard must not look like a read
+        except Exception:
+            pass
+        self._keys("^a^c")
+        time.sleep(0.15)  # give Windows a moment to populate the clipboard
+        try:
+            v = pyperclip.paste()
+        except Exception:
+            v = ""
+        return v or None
 
     # -- probe / calibrate helpers -----------------------------------------
 

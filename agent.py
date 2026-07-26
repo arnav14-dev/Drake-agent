@@ -9,8 +9,13 @@ verifies and executes in Drake.
 
 Modes (run in this order the first time):
   probe      Attach to Drake, dump the active screen's Edit controls + whether each
-             exposes a readable UIA value. THIS answers the make-or-break question:
-             can the read-back moat work? Do this first.
+             exposes a readable UIA value. (Probe 2026-07: Drake's grid is custom-drawn
+             and exposes ZERO Edit controls / values to UI Automation. Kept as a
+             per-build re-check, but expect all-opaque.)
+  clip       (Plan B) Manually focus a Drake field that already holds a known value;
+             the agent copies it (Ctrl+A, Ctrl+C) and prints the clipboard. This is the
+             NEW make-or-break test: since UIA is opaque, clipboard copy-back is our
+             shot at EXACT read-back. Run this whenever `probe` shows all-opaque.
   calibrate  Same dump, formatted to help you fill binding.json (logical field →
              automation_id / field_no / tab_index).
   selftest   Run a local plan file (a list of protocol commands) against Drake and
@@ -20,6 +25,7 @@ Modes (run in this order the first time):
 
 Examples:
   python agent.py probe --binding binding.json
+  python agent.py clip --binding binding.json
   python agent.py calibrate --binding binding.json --screen W2
   python agent.py selftest --binding binding.json --plan selftest.plan.json
   python agent.py connect --binding binding.json --url wss://api.fynnalabs.com/drake-agent --token $DRAKE_AGENT_TOKEN
@@ -37,7 +43,9 @@ from protocol import dispatch
 
 
 def load_binding(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
+    # utf-8-sig tolerates the UTF-8 BOM that PowerShell/Notepad prepend when you
+    # create or edit binding.json on Windows (plain utf-8 chokes on it).
+    with open(path, "r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -75,10 +83,42 @@ def cmd_calibrate(args) -> int:
     return 0
 
 
+def cmd_clip(args) -> int:
+    """
+    Clipboard read-back feasibility test — the NEW make-or-break question now that UIA
+    exposes no field values. You focus a Drake field by hand; the agent copies it and
+    prints what landed on the clipboard.
+
+    Uses a countdown (not an Enter prompt) on purpose: pressing Enter in this console
+    would steal focus away from Drake, so instead you get a few seconds to click into a
+    field, and the agent copies whatever is focused when the countdown ends.
+    """
+    import time
+    driver = DrakeDriver(load_binding(args.binding))
+    driver.connect()
+    print(f"\nClick into a Drake data-entry field that already holds a KNOWN value.")
+    print(f"Copying in ", end="", flush=True)
+    for n in range(max(1, args.delay), 0, -1):
+        print(f"{n}… ", end="", flush=True)
+        time.sleep(1)
+    print("\n")
+    got = driver.copy_focused_to_clipboard()
+    print(f"Clipboard after Ctrl+A / Ctrl+C: {got!r}\n")
+    if got:
+        print("VERDICT: Drake fields DO support copy → EXACT clipboard read-back is viable.")
+        print("         Set capabilities.read_back_method = \"clipboard\" and")
+        print("         can_read_field_values = true in binding.json, then run selftest.")
+    else:
+        print("VERDICT: nothing copied → no clipboard read-back on this build.")
+        print("         Read-back falls to OCR of a screenshot crop, or screenshot +")
+        print("         human verify. Report back before building the OCR path.")
+    return 0
+
+
 def cmd_selftest(args) -> int:
     import time
     driver = DrakeDriver(load_binding(args.binding), dry_run=args.dry_run, key_pause=0.12 if args.slow else 0.03)
-    with open(args.plan, "r", encoding="utf-8") as f:
+    with open(args.plan, "r", encoding="utf-8-sig") as f:
         plan = json.load(f)
     print(f"\nRunning {len(plan)} step(s){' (dry-run)' if args.dry_run else ''}{' (slow — watch Drake)' if args.slow else ''}:\n")
     failures = 0
@@ -139,6 +179,7 @@ def main() -> int:
     sub = p.add_subparsers(dest="mode", required=True)
 
     sp = sub.add_parser("probe", parents=[common]); sp.set_defaults(func=cmd_probe)
+    scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)
