@@ -35,6 +35,15 @@ try:
 except Exception:  # pragma: no cover
     pyperclip = None  # type: ignore
 
+try:
+    # OCR read-back (Plan C — Drake exposes NO programmatic value: not UIA, not win32,
+    # not clipboard). We screenshot a calibrated field crop and read the pixels.
+    import pytesseract  # needs the Tesseract binary installed on the VM
+    from PIL import Image  # noqa: F401  (pywinauto capture already returns a PIL image)
+except Exception:  # pragma: no cover
+    pytesseract = None  # type: ignore
+    Image = None  # type: ignore
+
 
 def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -47,9 +56,13 @@ class DrakeDriver:
         self.binding = binding
         self.nav = binding.get("navigation", {})
         self.caps_cfg = binding.get("capabilities", {})
-        # How we read a box back. Probe (2026-07) found Drake's custom-drawn grid
-        # exposes NO Edit controls/values to UI Automation, so "uia" is dead on this
-        # build — set "clipboard" after the `clip` test passes, else "none".
+        # How we read a box back. On Drake Tax 2025 ALL programmatic reads are dead:
+        # UIA exposes 0 values, win32 sees 0 inner fields, and clipboard copy returns
+        # nothing (Ctrl-chords even break focus + pop modal validators). So on Drake:
+        #   "ocr"        -> screenshot a calibrated field crop and OCR it (approximate)
+        #   "screenshot" -> no automated value; a human verifies the capture (the floor)
+        #   "none"       -> no verification at all (honesty gate keeps Fynn live OFF)
+        # "uia"/"clipboard" are kept for a future Drake build or other software.
         self.read_back_method = self.caps_cfg.get("read_back_method", "none")
         # Tight default so we attach to the tax app, not "Drake Software Chat" or a
         # browser tab that merely contains "Drake" (those triggered ElementAmbiguousError).
@@ -203,17 +216,30 @@ class DrakeDriver:
         try:
             fb = self._field_binding(screen, field)
             value, method, confidence = None, "none", 0.0
-            # 1) UIA ValuePattern — only if this build actually exposes it (rare on Drake).
+            # 1) UIA ValuePattern — only if this build actually exposes it (dead on Drake).
             if fb.get("automation_id") and self.read_back_method in ("uia", "auto"):
                 ctrl = self._edit_by_auto_id(fb["automation_id"])
                 value, method, confidence = _read_value(ctrl)
-            # 2) Clipboard copy-back — the Plan-B path. The field must still be focused
-            #    and NOT yet committed/advanced (read BEFORE the commit keystroke).
+            # 2) Clipboard copy-back — dead on Drake 2025 (copy returns nothing + breaks
+            #    focus). Kept for other software / a future build.
             if value is None and self.read_back_method in ("clipboard", "auto"):
                 v = self.copy_focused_to_clipboard()
                 if v:
                     value, method, confidence = v, "clipboard", 1.0
-            # 3) Last resort: whatever UIA element holds focus (dead on Drake, kept honest).
+            # 3) OCR of the field's calibrated pixel crop — approximate, but the only
+            #    automated read-back Drake actually allows. confidence < 1.0 on purpose:
+            #    an OCR match is a typo-catcher, never proof — a human still gates.
+            if value is None and self.read_back_method in ("ocr", "auto") and fb.get("ocr_box"):
+                v = self._ocr_read(fb["ocr_box"])
+                if v is not None:
+                    value, method, confidence = v, "ocr", 0.6
+            # 4) Screenshot floor — no automated value at all; the honest read-back is a
+            #    human looking at the capture. Reported as needsHuman, not an error.
+            if value is None and self.read_back_method == "screenshot":
+                return {"ok": False, "value": None, "method": "screenshot",
+                        "confidence": 0.0, "needsHuman": True,
+                        "error": "screenshot read-back — verify this field visually"}
+            # 5) Last resort: whatever UIA element holds focus (dead on Drake, kept honest).
             if value is None and self.read_back_method in ("uia", "auto"):
                 foc = _focused_element(self.app)
                 if foc is not None:
@@ -221,7 +247,7 @@ class DrakeDriver:
             ok = value is not None and confidence > 0
             out = {"ok": ok, "value": value, "method": method, "confidence": confidence}
             if not ok:
-                out["error"] = "no readable UIA value (Drake box may not expose one)"
+                out["error"] = "no readable value (Drake exposes none; set read_back_method to ocr/screenshot)"
             return out
         except Exception as e:
             return {"ok": False, "value": None, "method": "none", "confidence": 0.0, "error": str(e)}
@@ -250,6 +276,39 @@ class DrakeDriver:
         except Exception:
             v = ""
         return v or None
+
+    def _ocr_read(self, box) -> Optional[str]:
+        """
+        OCR the calibrated [x, y, w, h] pixel crop of the Drake window (coordinates
+        relative to the window's top-left). This is Plan C: Drake exposes no
+        programmatic value, so we read the box the way a human would — off the screen.
+        Approximate by nature; caller keeps confidence < 1.0 and a human still gates.
+        Needs Pillow + pytesseract + the Tesseract binary on the VM.
+        """
+        if self.dry_run or self.win is None:
+            return None
+        if pytesseract is None:
+            raise RuntimeError(
+                "OCR read-back needs pytesseract + Pillow (pip install pytesseract pillow) "
+                "and the Tesseract binary installed on the VM")
+        img = self.win.capture_as_image()  # pywinauto returns a PIL image
+        x, y, w, h = (int(n) for n in box)
+        crop = img.crop((x, y, x + w, y + h))
+        # psm 7 = "treat the crop as a single line" — right for one field's value.
+        text = pytesseract.image_to_string(crop, config="--psm 7").strip()
+        return text or None
+
+    def save_screenshot(self, path: str) -> dict:
+        """Save a PNG of the live Drake window to disk — the human-verify floor and the
+        source you read OCR boxes off. (screenshot() returns base64 for the wire;
+        this writes a file for a person to open.)"""
+        try:
+            if self.dry_run or self.win is None:
+                return {"ok": False, "path": None, "error": "no window"}
+            self.win.capture_as_image().save(path, format="PNG")
+            return {"ok": True, "path": path, "takenAt": _now()}
+        except Exception as e:
+            return {"ok": False, "path": None, "error": str(e)}
 
     # -- probe / calibrate helpers -----------------------------------------
 

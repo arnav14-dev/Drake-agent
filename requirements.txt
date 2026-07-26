@@ -2,7 +2,11 @@
 #   pip install -r requirements.txt
 pywinauto>=0.6.8
 comtypes>=1.2.0
-# clipboard read-back (Plan B — Drake exposes no UIA field values):
+# clipboard read-back (Plan B — ruled out on Drake 2025, kept for other builds):
 pyperclip>=1.8.0
+# OCR read-back (Plan C — the only automated read Drake allows). Also needs the
+# Tesseract binary installed separately (e.g. the UB-Mannheim Windows build):
+pytesseract>=0.3.10
+pillow>=10.0.0
 # connect mode only (live link to Fynn):
 websocket-client>=1.6.0

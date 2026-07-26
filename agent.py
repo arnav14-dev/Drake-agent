@@ -12,22 +12,26 @@ Modes (run in this order the first time):
              exposes a readable UIA value. (Probe 2026-07: Drake's grid is custom-drawn
              and exposes ZERO Edit controls / values to UI Automation. Kept as a
              per-build re-check, but expect all-opaque.)
-  clip       (Plan B) Manually focus a Drake field that already holds a known value;
-             the agent copies it (Ctrl+A, Ctrl+C) and prints the clipboard. This is the
-             NEW make-or-break test: since UIA is opaque, clipboard copy-back is our
-             shot at EXACT read-back. Run this whenever `probe` shows all-opaque.
-  calibrate  Same dump, formatted to help you fill binding.json (logical field →
+  clip       (Plan B, RULED OUT on Drake 2025) Manually focus a Drake field; the agent
+             copies it (Ctrl+A, Ctrl+C) and prints the clipboard. On Drake this returns
+             nothing AND breaks focus, so clipboard read-back is dead — kept as a
+             per-build re-check for other software / a future build.
+  shoot      Save a PNG of the live Drake window. Two jobs: (1) the human-verify FLOOR
+             (no read-back? a person checks this capture), and (2) how you calibrate OCR
+             boxes — open the PNG, read each field's [x,y,w,h], put it in binding.json.
+  calibrate  Same control dump, formatted to help you fill binding.json (logical field →
              automation_id / field_no / tab_index).
-  selftest   Run a local plan file (a list of protocol commands) against Drake and
-             print each result — proves the type→read-back loop end-to-end, no Fynn.
+  selftest   Run a local plan file (a list of protocol commands) against Drake and print
+             each result — proves the type→read-back loop end-to-end, no Fynn. With no
+             programmatic read-back it types + saves a screenshot for a human to verify.
   connect    Dial Fynn over WebSocket and serve the live protocol (needs a signed
              authorization + Fynn's agent endpoint; the last step).
 
 Examples:
   python agent.py probe --binding binding.json
-  python agent.py clip --binding binding.json
+  python agent.py shoot --binding binding.json --out drake.png
   python agent.py calibrate --binding binding.json --screen W2
-  python agent.py selftest --binding binding.json --plan selftest.plan.json
+  python agent.py selftest --binding binding.json --plan selftest.plan.json --shot after.png
   python agent.py connect --binding binding.json --url wss://api.fynnalabs.com/drake-agent --token $DRAKE_AGENT_TOKEN
 """
 
@@ -109,10 +113,41 @@ def cmd_clip(args) -> int:
         print("         Set capabilities.read_back_method = \"clipboard\" and")
         print("         can_read_field_values = true in binding.json, then run selftest.")
     else:
-        print("VERDICT: nothing copied → no clipboard read-back on this build.")
-        print("         Read-back falls to OCR of a screenshot crop, or screenshot +")
-        print("         human verify. Report back before building the OCR path.")
+        print("VERDICT: nothing copied → no clipboard read-back on this build (expected on")
+        print("         Drake 2025). Read-back falls to OCR of a screenshot crop")
+        print("         (read_back_method=\"ocr\" + per-field ocr_box) or the screenshot +")
+        print("         human floor (read_back_method=\"screenshot\"). Use `shoot` to capture.")
     return 0
+
+
+def cmd_shoot(args) -> int:
+    """
+    Save a screenshot of the live Drake window. This is the screenshot 'read-back'
+    FLOOR (no programmatic read exists on Drake, so a human verifies the capture) and
+    the way you calibrate OCR boxes: open the PNG in any image editor, read off each
+    field's [x, y, w, h] in pixels (relative to the window's top-left), and put it in
+    binding.json under the field's "ocr_box".
+    """
+    driver = DrakeDriver(load_binding(args.binding))
+    driver.connect()
+    res = driver.save_screenshot(args.out)
+    if res.get("ok"):
+        print(f"\nSaved Drake window screenshot -> {res['path']}")
+        print("  • Read each field's pixel box [x,y,w,h] off it into binding.json \"ocr_box\".")
+        print("  • This same capture is the human-verify floor when there's no read-back.\n")
+        return 0
+    print(f"\nCould not capture the Drake window: {res.get('error')}\n", file=sys.stderr)
+    return 1
+
+
+def _values_match(got, exp) -> bool:
+    """Compare a read-back to the expected value, tolerant of OCR/format noise:
+    '$52,000' == '52000', '12-3456789' == '123456789'. Alphanumerics only, case-fold."""
+    if got is None:
+        return False
+    def norm(s):
+        return "".join(ch for ch in str(s) if ch.isalnum()).lower()
+    return norm(got) == norm(exp)
 
 
 def cmd_selftest(args) -> int:
@@ -120,8 +155,15 @@ def cmd_selftest(args) -> int:
     driver = DrakeDriver(load_binding(args.binding), dry_run=args.dry_run, key_pause=0.12 if args.slow else 0.03)
     with open(args.plan, "r", encoding="utf-8-sig") as f:
         plan = json.load(f)
-    print(f"\nRunning {len(plan)} step(s){' (dry-run)' if args.dry_run else ''}{' (slow — watch Drake)' if args.slow else ''}:\n")
+    # Can this build read a value back programmatically? On Drake 2025 the honest answer
+    # is no (method "none"/"screenshot") — then _expect checks can't pass or fail, they're
+    # UNVERIFIED and a human confirms from the screenshot.
+    programmatic = driver.read_back_method in ("uia", "clipboard", "ocr")
+    print(f"\nRunning {len(plan)} step(s){' (dry-run)' if args.dry_run else ''}"
+          f"{' (slow — watch Drake)' if args.slow else ''}"
+          f"  read_back_method={driver.read_back_method!r}:\n")
     failures = 0
+    unverified = 0
     for i, req in enumerate(plan):
         req.setdefault("id", i)
         if args.slow and not args.dry_run:
@@ -131,14 +173,28 @@ def cmd_selftest(args) -> int:
         note = ""
         if exp is not None and args.dry_run:
             note = "  (skipped in dry-run — no live read)"
+        elif exp is not None and not programmatic:
+            note = f"  EXPECT {exp!r} -> UNVERIFIED (no programmatic read-back; verify via screenshot)"
+            unverified += 1
         elif exp is not None and "result" in reply:
             got = reply["result"].get("value")
-            ok = str(got) == str(exp)
+            ok = _values_match(got, exp)
             note = f"  EXPECT {exp!r} -> {'OK' if ok else 'MISMATCH (' + repr(got) + ')'}"
             if not ok:
                 failures += 1
         print(f"  [{i:2}] {req.get('method'):14} {json.dumps(req.get('params', {}))[:60]:60} -> {json.dumps(reply.get('result', reply.get('error')))[:70]}{note}")
-    print(f"\n{'PASS' if failures == 0 else str(failures) + ' MISMATCH(es)'}\n")
+    shot_note = ""
+    if args.shot and not args.dry_run:
+        sres = driver.save_screenshot(args.shot)
+        shot_note = (f"\nscreenshot -> {sres['path']}" if sres.get("ok")
+                     else f"\n(screenshot failed: {sres.get('error')})")
+    if failures:
+        print(f"\n{failures} MISMATCH(es){shot_note}\n")
+    elif unverified:
+        print(f"\nTYPED OK — {unverified} field(s) UNVERIFIED: no programmatic read-back on this "
+              f"build, so a human must confirm the values from the screenshot.{shot_note}\n")
+    else:
+        print(f"\nPASS{shot_note}\n")
     return 1 if failures else 0
 
 
@@ -180,8 +236,9 @@ def main() -> int:
 
     sp = sub.add_parser("probe", parents=[common]); sp.set_defaults(func=cmd_probe)
     scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
+    sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.set_defaults(func=cmd_shoot)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
-    ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.set_defaults(func=cmd_selftest)
+    ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)
 
     args = p.parse_args()

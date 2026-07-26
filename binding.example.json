@@ -1,10 +1,10 @@
 {
-  "_about": "Per-Drake-build field binding. Copy to binding.json and fill in with `agent.py probe` + `agent.py calibrate` on the VM. Each field maps a LOGICAL name (what Fynn sends) to how the agent reaches it: automation_id (preferred, if Drake's grid exposes it to UI Automation), field_no (Drake heads-down field number), or tab_index (Tabs from the screen's first field). Fill whichever your probe shows works; the agent tries automation_id, then field_no, then tab_index.",
+  "_about": "Per-Drake-build field binding. Copy to binding.json and fill in on the VM. INPUT: each field maps a LOGICAL name (what Fynn sends) to how the agent reaches it — on Drake 2025 automation_id is dead (custom-drawn grid), so navigate by field_no (Drake heads-down field number) or tab_index (Tabs from the screen's first field); the agent tries automation_id, then field_no, then tab_index. READ-BACK: Drake exposes no programmatic value, so verification is either OCR of a screen crop (add \"ocr_box\": [x, y, w, h] in window-relative pixels — capture the window with `agent.py shoot`, read the box off the PNG) or the human screenshot floor.",
 
   "app_title_re": "Drake \\d{4} Tax Software",
 
   "capabilities": {
-    "_note": "read_back_method: how the agent reads a box back. Probe (2026-07) found Drake's grid exposes NO values to UI Automation, so 'uia' is dead on current builds. Run `agent.py clip`; if your value copies back, set read_back_method='clipboard' and can_read_field_values=true. If nothing copies, leave both — Fynn's honesty gate then refuses to run live (it will not claim a verified read-back it cannot deliver) until an OCR/screenshot path is built.",
+    "_note": "read_back_method: how the agent reads a box back. On Drake 2025 ALL programmatic reads are dead — UIA (0 values), win32 (0 inner fields), clipboard (copy returns nothing + breaks focus). Options: 'ocr' (screenshot a per-field ocr_box crop and OCR it — approximate, needs pytesseract + Tesseract + calibrated ocr_box; set can_read_field_values=true and expect confidence<1.0), 'screenshot' (no automated value — a human verifies the capture; the honest floor), or 'none' (no verification — Fynn's honesty gate keeps live OFF). 'uia'/'clipboard' are kept for other software / a future build.",
     "read_back_method": "none",
     "can_read_field_values": false,
     "can_observe_element_state": true,
@@ -28,10 +28,10 @@
     "W2": {
       "repeatable": true,
       "fields": {
-        "employer_ein": { "automation_id": null, "field_no": null, "tab_index": null },
+        "employer_ein": { "automation_id": null, "field_no": null, "tab_index": null, "ocr_box": null },
         "employer_name": { "automation_id": null, "field_no": null, "tab_index": null },
-        "box1_wages": { "automation_id": null, "field_no": null, "tab_index": null },
-        "box2_fed_wh": { "automation_id": null, "field_no": null, "tab_index": null },
+        "box1_wages": { "automation_id": null, "field_no": null, "tab_index": null, "ocr_box": null },
+        "box2_fed_wh": { "automation_id": null, "field_no": null, "tab_index": null, "ocr_box": null },
         "box3_ss_wages": { "automation_id": null, "field_no": null, "tab_index": null },
         "box4_ss_tax": { "automation_id": null, "field_no": null, "tab_index": null },
         "box5_medicare_wages": { "automation_id": null, "field_no": null, "tab_index": null },
