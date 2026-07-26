@@ -56,6 +56,9 @@ def load_binding(path: str) -> dict:
 def cmd_probe(args) -> int:
     driver = DrakeDriver(load_binding(args.binding))
     driver.connect()
+    wi = driver.window_info()
+    print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}  (hwnd={wi.get('handle')})")
+    print("  ^ must be the main Drake data-entry frame, NOT the ~84x84 chat bubble.")
     controls = driver.list_edit_controls()
     readable = [c for c in controls if c["readable"]]
     print(f"\nActive Drake screen: {len(controls)} Edit control(s), {len(readable)} expose a readable UIA value.\n")
@@ -130,6 +133,11 @@ def cmd_shoot(args) -> int:
     """
     driver = DrakeDriver(load_binding(args.binding))
     driver.connect()
+    wi = driver.window_info()
+    print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}  (hwnd={wi.get('handle')})")
+    if (wi.get("width") or 0) < 600 or (wi.get("height") or 0) < 400:
+        print("  ⚠ that looks too small to be the data-entry frame — is it the chat overlay?")
+        print("    Set \"main_window_min\" or \"app_title_re\" in binding.json.")
     res = driver.save_screenshot(args.out)
     if res.get("ok"):
         print(f"\nSaved Drake window screenshot -> {res['path']}")

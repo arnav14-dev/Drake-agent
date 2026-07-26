@@ -43,6 +43,11 @@ while a run is in progress.
 >   every capture. Still: don't touch the mouse/keyboard mid-run, and if you can, launch
 >   from a plain terminal rather than the editor's integrated one (foreground rights are
 >   friendlier). If an early `after.png` shows VS Code, that's this bug — re-run.
+> - **The Drake Live Chat bubble is a topmost ~84x84 window in the Drake process**, so
+>   `top_window()` binds to *it* — keystrokes go to the chat widget and the form stays
+>   blank. The agent now picks the largest top-level Drake window that clears
+>   `main_window_min` ([600, 400]) instead. `probe` and `shoot` print the bound window's
+>   title + size — check it's the data-entry frame, not an 84x84 overlay.
 
 ## What we learned probing Drake Tax 2025: no programmatic read-back exists
 

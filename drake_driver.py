@@ -67,6 +67,11 @@ class DrakeDriver:
         # Tight default so we attach to the tax app, not "Drake Software Chat" or a
         # browser tab that merely contains "Drake" (those triggered ElementAmbiguousError).
         self.title_re = binding.get("app_title_re", r"Drake \d{4} Tax Software")
+        # The Drake Live Chat overlay is a tiny (~84x84) *topmost* window in the same
+        # process, so top_window() grabs it before the data-entry frame. Require a real
+        # frame size to skip such overlay/tool widgets. Override via binding if needed.
+        mw = binding.get("main_window_min", [600, 400])
+        self.min_main_w, self.min_main_h = int(mw[0]), int(mw[1])
         self.key_pause = key_pause
         self.dry_run = dry_run
         self.app = None
@@ -75,14 +80,51 @@ class DrakeDriver:
     # -- connection ---------------------------------------------------------
 
     def connect(self) -> None:
-        """Attach to the already-running Drake process (UIA backend)."""
+        """Attach to the running Drake process and resolve the MAIN data-entry frame —
+        never a floating overlay (the Live Chat bubble is a topmost ~84x84 window that
+        top_window() would grab first, sending keystrokes to the chat widget)."""
         if self.dry_run:
             return
         if Application is None:
             raise RuntimeError("pywinauto is not available (run on the Windows VM)")
         self.app = Application(backend="uia").connect(title_re=self.title_re, timeout=20)
-        self.win = self.app.top_window()
-        self.win.set_focus()
+        self.win = self._resolve_main_window()
+        self._foreground()
+
+    def _resolve_main_window(self):
+        """Pick Drake's main window: the LARGEST top-level window of the Drake process
+        that meets a real frame size (min_main_w × min_main_h), preferring ones whose
+        title matches app_title_re. Filters out the chat bubble and other tool overlays.
+        Falls back to top_window() only if nothing qualifies."""
+        candidates = []
+        pools = []
+        try:
+            pools.append(self.app.windows(title_re=self.title_re))
+        except Exception:
+            pass
+        try:
+            pools.append(self.app.windows())  # any top-level window of the process
+        except Exception:
+            pass
+        seen = set()
+        for pool in pools:
+            for w in pool:
+                try:
+                    handle = getattr(w, "handle", None)
+                    if handle in seen:
+                        continue
+                    seen.add(handle)
+                    r = w.rectangle()
+                    candidates.append((w, r.width(), r.height()))
+                except Exception:
+                    continue
+        # Real frames only (skips the 84x84 chat bubble); largest area wins.
+        big = [c for c in candidates if c[1] >= self.min_main_w and c[2] >= self.min_main_h]
+        pool = big or candidates
+        if pool:
+            pool.sort(key=lambda t: t[1] * t[2], reverse=True)
+            return pool[0][0]
+        return self.app.top_window()  # last resort — original behaviour
 
     def _keys(self, chord: str) -> None:
         if self.dry_run:
@@ -342,6 +384,18 @@ class DrakeDriver:
         # psm 7 = "treat the crop as a single line" — right for one field's value.
         text = pytesseract.image_to_string(crop, config="--psm 7").strip()
         return text or None
+
+    def window_info(self) -> dict:
+        """Identity of the window the agent bound to — so you can confirm it's the main
+        data-entry frame and not the chat overlay (title + size + handle)."""
+        if self.dry_run or self.win is None:
+            return {"title": None, "width": None, "height": None, "handle": None}
+        try:
+            r = self.win.rectangle()
+            return {"title": self.win.window_text(), "width": r.width(),
+                    "height": r.height(), "handle": getattr(self.win, "handle", None)}
+        except Exception as e:
+            return {"title": None, "width": None, "height": None, "handle": None, "error": str(e)}
 
     def save_screenshot(self, path: str) -> dict:
         """Save a PNG of the live Drake window to disk — the human-verify floor and the
