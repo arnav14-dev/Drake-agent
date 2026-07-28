@@ -1,10 +1,20 @@
 [
-  { "method": "capabilities", "params": {} },
+  { "_note": "VERIFIED W-2 entry. Each field: PHYSICALLY CLICK it (focus:true -> click_input at the field's click_xy) to plant a real caret — openScreen alone does NOT leave an active caret, so focus:false typed into nothing and left everything blank. Then type (commit:false), then readField to OCR-verify. NEEDS calibration: fill click_xy [x,y] and ocr_box [x,y,w,h] for these 4 fields in binding.json (use `agent.py shoot --grid`), set capabilities.read_back_method='ocr' + can_read_field_values=true, and install Tesseract. With read-back 'none' it still types (readField shows UNVERIFIED); a failed click now reports STEP FAILED, never a false PASS.",
+    "method": "capabilities", "params": {} },
   { "method": "openReturn", "params": { "returnRef": "SELFTEST-2024" } },
   { "method": "openScreen", "params": { "screen": "W2", "instance": 0 } },
 
-  { "_note": "SEQUENTIAL / heads-down proof — NO coordinates. focus:false types wherever the caret already sits (Drake drops it in the first field when the W-2 screen opens), and commit:true presses ENTER to advance to the next field — Drake's own data-entry flow. Watch WHICH box each value lands in and tell me the order, then we map fields exactly. This is the cleanest 'does it type?' test: no click_xy calibration needed.",
-    "method": "type", "params": { "target": { "screen": "W2", "field": "employer_ein" }, "text": "12-3456789", "opts": { "focus": false, "commit": true, "kind": "string" } } },
-  { "method": "type", "params": { "target": { "screen": "W2", "field": "box1_wages" }, "text": "52000", "opts": { "focus": false, "commit": true, "kind": "number" } } },
-  { "method": "type", "params": { "target": { "screen": "W2", "field": "box2_fed_wh" }, "text": "6000", "opts": { "focus": false, "commit": true, "kind": "number" } } }
+  { "method": "type", "params": { "target": { "screen": "W2", "field": "employer_ein" }, "text": "12-3456789", "opts": { "focus": true, "commit": false, "kind": "string" } } },
+  { "method": "readField", "params": { "target": { "screen": "W2", "field": "employer_ein" } }, "_expect": "12-3456789" },
+
+  { "method": "type", "params": { "target": { "screen": "W2", "field": "employer_name" }, "text": "TEST EMPLOYER", "opts": { "focus": true, "commit": false, "kind": "string" } } },
+  { "method": "readField", "params": { "target": { "screen": "W2", "field": "employer_name" } }, "_expect": "TEST EMPLOYER" },
+
+  { "method": "type", "params": { "target": { "screen": "W2", "field": "box1_wages" }, "text": "52000", "opts": { "focus": true, "commit": false, "kind": "number" } } },
+  { "method": "readField", "params": { "target": { "screen": "W2", "field": "box1_wages" } }, "_expect": "52000" },
+
+  { "method": "type", "params": { "target": { "screen": "W2", "field": "box2_fed_wh" }, "text": "6000", "opts": { "focus": true, "commit": false, "kind": "number" } } },
+  { "method": "readField", "params": { "target": { "screen": "W2", "field": "box2_fed_wh" } }, "_expect": "6000" },
+
+  { "method": "press", "params": { "keys": ["Enter"] } }
 ]

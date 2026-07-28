@@ -6,7 +6,12 @@
   "_main_window_min_note": "Minimum [width, height] for the window the agent binds to. Drake's Live Chat overlay is a topmost ~84x84 window in the same process; this size floor makes the agent pick the real data-entry frame instead. Confirm with `agent.py probe` / `shoot`, which print the bound window's title + size.",
 
   "send_vk_packet": false,
-  "_send_vk_packet_note": "How literal characters are injected. false = real virtual-key + scan-code events (what DOS-heritage apps like Drake require). true = pywinauto's default Unicode 'packet' method, which Drake IGNORES (caret sits in the field, nothing types). Leave false for Drake.",
+  "_send_vk_packet_note": "How literal characters are injected. false = real virtual-key + scan-code events (what DOS-heritage apps like Drake require). true = pywinauto's default Unicode 'packet' method, which Drake IGNORES (caret sits in the field, nothing types). Leave false for Drake. CONFIRMED working on Drake Tax 2025.",
+
+  "tesseract_cmd": null,
+  "_tesseract_cmd_note": "Full path to tesseract.exe for OCR read-back if it's not on PATH, e.g. \"C:\\\\Program Files\\\\Tesseract-OCR\\\\tesseract.exe\". Install the Tesseract binary (UB-Mannheim Windows build) plus `pip install pytesseract pillow`. Leave null if tesseract is on PATH.",
+
+  "_enter_index_note": "enter_index (per field) = the field's position in Drake's Enter-key navigation order from the first field on screen-open, empirically mapped. W-2 confirmed 2026-07-28: employer_ein=0 -> employer_name=1 -> box1_wages=2 -> box2_fed_wh=3. Sequential entry types down this order pressing Enter to advance; ocr_box gives the pixel rectangle to OCR-verify each value.",
 
   "capabilities": {
     "_note": "read_back_method: how the agent reads a box back. On Drake 2025 ALL programmatic reads are dead — UIA (0 values), win32 (0 inner fields), clipboard (copy returns nothing + breaks focus). Options: 'ocr' (screenshot a per-field ocr_box crop and OCR it — approximate, needs pytesseract + Tesseract + calibrated ocr_box; set can_read_field_values=true and expect confidence<1.0), 'screenshot' (no automated value — a human verifies the capture; the honest floor), or 'none' (no verification — Fynn's honesty gate keeps live OFF). 'uia'/'clipboard' are kept for other software / a future build.",
@@ -33,10 +38,10 @@
     "W2": {
       "repeatable": true,
       "fields": {
-        "employer_ein": { "automation_id": null, "field_no": null, "tab_index": null, "click_xy": null, "ocr_box": null },
-        "employer_name": { "automation_id": null, "field_no": null, "tab_index": null },
-        "box1_wages": { "automation_id": null, "field_no": null, "tab_index": null, "click_xy": null, "ocr_box": null },
-        "box2_fed_wh": { "automation_id": null, "field_no": null, "tab_index": null, "click_xy": null, "ocr_box": null },
+        "employer_ein": { "enter_index": 0, "automation_id": null, "field_no": null, "tab_index": null, "click_xy": null, "ocr_box": null },
+        "employer_name": { "enter_index": 1, "automation_id": null, "field_no": null, "tab_index": null, "click_xy": null, "ocr_box": null },
+        "box1_wages": { "enter_index": 2, "automation_id": null, "field_no": null, "tab_index": null, "click_xy": null, "ocr_box": null },
+        "box2_fed_wh": { "enter_index": 3, "automation_id": null, "field_no": null, "tab_index": null, "click_xy": null, "ocr_box": null },
         "box3_ss_wages": { "automation_id": null, "field_no": null, "tab_index": null },
         "box4_ss_tax": { "automation_id": null, "field_no": null, "tab_index": null },
         "box5_medicare_wages": { "automation_id": null, "field_no": null, "tab_index": null },

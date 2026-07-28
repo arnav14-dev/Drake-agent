@@ -79,6 +79,9 @@ class DrakeDriver:
         # types. vk_packet=False sends real virtual-key + scan-code events legacy apps
         # accept. Default False for Drake; override per binding, or per run for typetest.
         self.vk_packet = binding.get("send_vk_packet", False) if vk_packet is None else bool(vk_packet)
+        # Path to tesseract.exe for OCR read-back, if it isn't on PATH (Windows installs
+        # often aren't). e.g. "C:\\Program Files\\Tesseract-OCR\\tesseract.exe".
+        self.tesseract_cmd = binding.get("tesseract_cmd")
         self.key_pause = key_pause
         self.dry_run = dry_run
         self.app = None
@@ -477,7 +480,12 @@ class DrakeDriver:
             raise RuntimeError(
                 "OCR read-back needs pytesseract + Pillow (pip install pytesseract pillow) "
                 "and the Tesseract binary installed on the VM")
-        img = self._capture_window_image()  # Drake-to-front, window rect, PIL image
+        if self.tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = self.tesseract_cmd
+        # Capture WITHOUT foregrounding: _foreground()'s set_focus would reset Drake's
+        # canvas caret mid-entry, desyncing the next Enter/type. During an active run
+        # Drake is already the foreground window, so a direct grab is correct here.
+        img = self.win.capture_as_image()
         x, y, w, h = (int(n) for n in box)
         crop = img.crop((x, y, x + w, y + h))
         # psm 7 = "treat the crop as a single line" — right for one field's value.
@@ -496,15 +504,19 @@ class DrakeDriver:
         except Exception as e:
             return {"title": None, "width": None, "height": None, "handle": None, "error": str(e)}
 
-    def save_screenshot(self, path: str) -> dict:
+    def save_screenshot(self, path: str, grid: bool = False) -> dict:
         """Save a PNG of the live Drake window to disk — the human-verify floor and the
-        source you read OCR boxes off. (screenshot() returns base64 for the wire;
-        this writes a file for a person to open.) Brings Drake to the front first so the
-        capture is Drake, never the editor/terminal that launched the run."""
+        source you read click_xy / ocr_box coordinates off. (screenshot() returns base64
+        for the wire; this writes a file for a person to open.) Brings Drake to the front
+        first so the capture is Drake, never the editor/terminal that launched the run.
+        grid=True overlays a labeled pixel grid so you can read coordinates by eye."""
         try:
             if self.dry_run or self.win is None:
                 return {"ok": False, "path": None, "error": "no window"}
-            self._capture_window_image().save(path, format="PNG")
+            img = self._capture_window_image()
+            if grid:
+                img = _overlay_grid(img)
+            img.save(path, format="PNG")
             return {"ok": True, "path": path, "takenAt": _now()}
         except Exception as e:
             return {"ok": False, "path": None, "error": str(e)}
@@ -542,6 +554,31 @@ class DrakeDriver:
 
 
 # --- module helpers ---------------------------------------------------------
+
+def _overlay_grid(img, step: int = 50, label_every: int = 100):
+    """Draw a labeled pixel grid over a capture so you can read a field's click_xy /
+    ocr_box coordinates straight off the PNG: faint lines every `step`px, red labeled
+    lines every `label_every`px (labels are window-relative pixels — the same frame
+    click_xy/ocr_box use). No-op if Pillow's ImageDraw isn't available."""
+    try:
+        from PIL import ImageDraw
+    except Exception:
+        return img
+    img = img.convert("RGB")
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+    for x in range(0, w, step):
+        major = x % label_every == 0
+        draw.line([(x, 0), (x, h)], fill=(255, 80, 80) if major else (215, 215, 215))
+        if major:
+            draw.text((x + 2, 2), str(x), fill=(255, 0, 0))
+    for y in range(0, h, step):
+        major = y % label_every == 0
+        draw.line([(0, y), (w, y)], fill=(255, 80, 80) if major else (215, 215, 215))
+        if major:
+            draw.text((2, y + 2), str(y), fill=(255, 0, 0))
+    return img
+
 
 def _box_center(box):
     """Center point (x, y) of a [x, y, w, h] box, or None. Lets a field reuse its

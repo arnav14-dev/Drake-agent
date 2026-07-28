@@ -141,11 +141,12 @@ def cmd_shoot(args) -> int:
     if (wi.get("width") or 0) < 600 or (wi.get("height") or 0) < 400:
         print("  ⚠ that looks too small to be the data-entry frame — is it the chat overlay?")
         print("    Set \"main_window_min\" or \"app_title_re\" in binding.json.")
-    res = driver.save_screenshot(args.out)
+    res = driver.save_screenshot(args.out, grid=args.grid)
     if res.get("ok"):
-        print(f"\nSaved Drake window screenshot -> {res['path']}")
-        print("  • Read each field's pixel box [x,y,w,h] off it into binding.json \"ocr_box\".")
-        print("  • This same capture is the human-verify floor when there's no read-back.\n")
+        print(f"\nSaved Drake window screenshot -> {res['path']}{'  (with coordinate grid)' if args.grid else ''}")
+        print("  • Each field's CENTER [x,y] -> binding.json \"click_xy\" (plants the caret).")
+        print("  • Each field's box [x,y,w,h] -> binding.json \"ocr_box\" (OCR read-back).")
+        print("  • Re-run with --grid to overlay labeled pixel lines and read them by eye.\n")
         return 0
     print(f"\nCould not capture the Drake window: {res.get('error')}\n", file=sys.stderr)
     return 1
@@ -224,9 +225,18 @@ def cmd_selftest(args) -> int:
         if args.slow and not args.dry_run:
             time.sleep(0.6)  # let the eye follow each box
         reply = dispatch(driver, req)
+        method = req.get("method")
+        result = reply.get("result")
         exp = req.get("_expect")  # optional inline assertion on a readField
         note = ""
-        if exp is not None and args.dry_run:
+        # An ACTION step (anything but readField) that errors or comes back ok:false is a
+        # real failure — e.g. a click/focus that couldn't land, or a type into no caret.
+        # Count it so a run where nothing actually typed can NEVER report PASS.
+        if not args.dry_run and method != "readField" and (
+                "error" in reply or (isinstance(result, dict) and result.get("ok") is False)):
+            failures += 1
+            note = "  <-- STEP FAILED"
+        elif exp is not None and args.dry_run:
             note = "  (skipped in dry-run — no live read)"
         elif exp is not None and not programmatic:
             note = f"  EXPECT {exp!r} -> UNVERIFIED (no programmatic read-back; verify via screenshot)"
@@ -244,7 +254,7 @@ def cmd_selftest(args) -> int:
         shot_note = (f"\nscreenshot -> {sres['path']}" if sres.get("ok")
                      else f"\n(screenshot failed: {sres.get('error')})")
     if failures:
-        print(f"\n{failures} MISMATCH(es){shot_note}\n")
+        print(f"\n{failures} FAILURE(S) — step failed or read-back MISMATCH{shot_note}\n")
     elif unverified:
         print(f"\nTYPED OK — {unverified} field(s) UNVERIFIED: no programmatic read-back on this "
               f"build, so a human must confirm the values from the screenshot.{shot_note}\n")
@@ -291,7 +301,7 @@ def main() -> int:
 
     sp = sub.add_parser("probe", parents=[common]); sp.set_defaults(func=cmd_probe)
     scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
-    sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.set_defaults(func=cmd_shoot)
+    sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.add_argument("--grid", action="store_true", help="overlay a labeled pixel grid to read click_xy/ocr_box coordinates by eye"); sst.set_defaults(func=cmd_shoot)
     stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click; a COMMA-separated list cascades through fields (e.g. 11111,22222,33333)"); stt.add_argument("--advance", default="", help="key pressed between values when --text is a list, e.g. ENTER (default) or TAB"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
