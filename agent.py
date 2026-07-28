@@ -163,10 +163,12 @@ def cmd_typetest(args) -> int:
     needs written authorization before it touches real client returns.
     """
     import time
-    driver = DrakeDriver(load_binding(args.binding))
+    driver = DrakeDriver(load_binding(args.binding), vk_packet=(True if args.unicode else None))
     driver.connect()
     wi = driver.window_info()
     print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
+    method = "unicode-packet (modern)" if driver.vk_packet else "scancode/VK (legacy-app friendly)"
+    print(f"Keystroke method: {method}")
     print(f"\nClick into a Drake data-entry field. Typing {args.text!r} in ", end="", flush=True)
     for n in range(max(1, args.delay), 0, -1):
         print(f"{n}… ", end="", flush=True)
@@ -281,7 +283,7 @@ def main() -> int:
     sp = sub.add_parser("probe", parents=[common]); sp.set_defaults(func=cmd_probe)
     scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
     sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.set_defaults(func=cmd_shoot)
-    stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.set_defaults(func=cmd_typetest)
+    stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)

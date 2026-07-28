@@ -52,7 +52,8 @@ def _now() -> str:
 class DrakeDriver:
     """Drives one running Drake instance. Attach to Drake AFTER a return is open."""
 
-    def __init__(self, binding: dict, *, key_pause: float = 0.03, dry_run: bool = False):
+    def __init__(self, binding: dict, *, key_pause: float = 0.03, dry_run: bool = False,
+                 vk_packet: Optional[bool] = None):
         self.binding = binding
         self.nav = binding.get("navigation", {})
         self.caps_cfg = binding.get("capabilities", {})
@@ -72,6 +73,12 @@ class DrakeDriver:
         # frame size to skip such overlay/tool widgets. Override via binding if needed.
         mw = binding.get("main_window_min", [600, 400])
         self.min_main_w, self.min_main_h = int(mw[0]), int(mw[1])
+        # How literal characters are injected. Drake is a DOS-heritage app that reads the
+        # keyboard the OLD way (WM_KEYDOWN + scan codes), so pywinauto's default Unicode
+        # "packet" injection is often IGNORED — the caret sits in the field but nothing
+        # types. vk_packet=False sends real virtual-key + scan-code events legacy apps
+        # accept. Default False for Drake; override per binding, or per run for typetest.
+        self.vk_packet = binding.get("send_vk_packet", False) if vk_packet is None else bool(vk_packet)
         self.key_pause = key_pause
         self.dry_run = dry_run
         self.app = None
@@ -174,7 +181,10 @@ class DrakeDriver:
         if self.dry_run:
             print(f"[dry-run] send_keys({chord!r})")
             return
-        send_keys(chord, pause=self.key_pause, with_spaces=True)
+        # vk_packet=False => real VK + scan-code events (legacy/DOS-heritage apps like
+        # Drake need this; the default Unicode packets are silently ignored). Special keys
+        # ({ENTER}/{TAB}/{ESC}) are VK-based regardless, so this only changes literal chars.
+        send_keys(chord, pause=self.key_pause, with_spaces=True, vk_packet=self.vk_packet)
 
     def _field_binding(self, screen: str, field: str) -> dict:
         scr = self.binding.get("screens", {}).get(screen)

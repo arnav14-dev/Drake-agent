@@ -5,6 +5,9 @@
   "main_window_min": [600, 400],
   "_main_window_min_note": "Minimum [width, height] for the window the agent binds to. Drake's Live Chat overlay is a topmost ~84x84 window in the same process; this size floor makes the agent pick the real data-entry frame instead. Confirm with `agent.py probe` / `shoot`, which print the bound window's title + size.",
 
+  "send_vk_packet": false,
+  "_send_vk_packet_note": "How literal characters are injected. false = real virtual-key + scan-code events (what DOS-heritage apps like Drake require). true = pywinauto's default Unicode 'packet' method, which Drake IGNORES (caret sits in the field, nothing types). Leave false for Drake.",
+
   "capabilities": {
     "_note": "read_back_method: how the agent reads a box back. On Drake 2025 ALL programmatic reads are dead — UIA (0 values), win32 (0 inner fields), clipboard (copy returns nothing + breaks focus). Options: 'ocr' (screenshot a per-field ocr_box crop and OCR it — approximate, needs pytesseract + Tesseract + calibrated ocr_box; set can_read_field_values=true and expect confidence<1.0), 'screenshot' (no automated value — a human verifies the capture; the honest floor), or 'none' (no verification — Fynn's honesty gate keeps live OFF). 'uia'/'clipboard' are kept for other software / a future build.",
     "read_back_method": "none",
