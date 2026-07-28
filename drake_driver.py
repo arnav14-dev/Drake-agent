@@ -296,15 +296,40 @@ class DrakeDriver:
             # focus — on Drake's canvas there is no caret until we click, so an unfocused
             # type silently vanishes into the frame. If we can't focus, do NOT type into
             # the void and report ok:true; fail honestly so the caller halts.
-            f = self.focus(target)
-            if not f.get("ok"):
-                return {"ok": False, "error": f"cannot focus {screen}/{field} before typing: {f.get('error')}"}
+            # EXCEPTION: opts.focus == false → sequential/tab-order entry that types
+            # wherever the caret already sits (right after openScreen, or after a Tab/Enter).
+            if opts.get("focus", True):
+                f = self.focus(target)
+                if not f.get("ok"):
+                    return {"ok": False, "error": f"cannot focus {screen}/{field} before typing: {f.get('error')}"}
+            else:
+                self._foreground()  # no click, but still make Drake the front window
             if opts.get("clearFirst"):
                 # Ctrl-free clear: End, then Backspaces. "^a{BACKSPACE}" is toxic on Drake.
                 self._keys(self.nav.get("field_clear", "{END}{BACKSPACE 40}"))
             self._keys(_escape_keys(text))  # escape pywinauto special chars; typed literally
             if opts.get("commit"):
                 self._keys(self.nav.get("field_commit", "{ENTER}"))
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def type_raw(self, text: str, advance: Optional[str] = None) -> dict:
+        """
+        Type literal text into whatever Drake field currently holds the caret, using
+        genuine foreground synthetic keystrokes (pywinauto send_keys = SendInput) — no
+        field binding, no click. This is the ISOLATION PROOF that our keystrokes actually
+        land on Drake's custom canvas (the thing accessibility/set_text could not do).
+        Optionally press an advance key afterwards (e.g. "TAB" or "ENTER").
+        """
+        try:
+            if self.dry_run:
+                print(f"[dry-run] type_raw {text!r} advance={advance}")
+                return {"ok": True}
+            self._foreground()  # Drake to the front so the synthetic keys go to it
+            self._keys(_escape_keys(text))
+            if advance:
+                self._keys("{" + advance.upper() + "}")
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}

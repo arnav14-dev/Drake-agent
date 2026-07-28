@@ -1,0 +1,10 @@
+[
+  { "method": "capabilities", "params": {} },
+  { "method": "openReturn", "params": { "returnRef": "SELFTEST-2024" } },
+  { "method": "openScreen", "params": { "screen": "W2", "instance": 0 } },
+
+  { "_note": "SEQUENTIAL / heads-down proof — NO coordinates. focus:false types wherever the caret already sits (Drake drops it in the first field when the W-2 screen opens), and commit:true presses ENTER to advance to the next field — Drake's own data-entry flow. Watch WHICH box each value lands in and tell me the order, then we map fields exactly. This is the cleanest 'does it type?' test: no click_xy calibration needed.",
+    "method": "type", "params": { "target": { "screen": "W2", "field": "employer_ein" }, "text": "12-3456789", "opts": { "focus": false, "commit": true, "kind": "string" } } },
+  { "method": "type", "params": { "target": { "screen": "W2", "field": "box1_wages" }, "text": "52000", "opts": { "focus": false, "commit": true, "kind": "number" } } },
+  { "method": "type", "params": { "target": { "screen": "W2", "field": "box2_fed_wh" }, "text": "6000", "opts": { "focus": false, "commit": true, "kind": "number" } } }
+]

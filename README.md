@@ -100,26 +100,48 @@ We already ran this: `Ctrl+A`/`Ctrl+C` copies **nothing** from a Drake field and
 chord breaks focus + pops a modal validator. Re-run it only to re-check a *different*
 build/software. On Drake 2025 skip straight to the screenshot floor + OCR.
 
-### 1c. The make-or-break that's actually left: can the robot TYPE reliably?
+### 1c. Can the robot TYPE into Drake? (Juno does it the same way — foreground keystrokes)
 
-All read-back is now visual, so the open question is **"can we plant a caret in the
-right box and get the digits to land?"** Two hard-won facts shape the answer:
-- Drake's canvas has **no focusable OS element**, so the only reliable focus is a
-  **physical mouse click** at the field's pixel point (`click_xy`). `send_keys` is a
-  global inject — with no caret it vanishes into the frame.
-- **Ctrl chords are toxic**: `Ctrl+A` (the old `clearFirst` clear) and `Ctrl+N` (the old
-  heads-down toggle) break focus + pop a modal. Both are now purged from the defaults.
+Research settled the big question: the competition (Juno) drives Drake with the **same**
+foreground GUI automation — real mouse + real keystrokes — not a secret API. So typing
+IS possible; earlier failures were the *accessibility/set_text* path (empty on a custom
+canvas), not synthetic keystrokes. Prove it in the cheapest order:
 
-So the sequence is: capture the window, read off each field's **click point**, then run
-the self-test (which now clicks-to-focus and never sends a Ctrl chord):
+**Step A — `typetest`: do our keys land at all?** (no calibration)
+
+```
+python agent.py typetest --binding binding.json --text 52000 --shot typed.png
+```
+
+Click a Drake box during the countdown; the agent types with genuine foreground
+keystrokes. Value shows up → typing works, done — move on. Still empty → keys are being
+dropped: re-run the console **as Administrator** (see the elevation warning it prints).
+
+**Step B — `selftest.seq.json`: type a whole W-2 with NO coordinates.**
+
+```
+python agent.py selftest --binding binding.json --plan selftest.seq.json --shot seq.png
+```
+
+This uses Drake's native flow: the caret lands in the first field on screen-open, we type,
+`Enter` advances to the next field, repeat. Open `seq.png` and tell me **which box each
+value landed in** — that reveals the field order so we can map it exactly.
+
+**Step C — `click_xy`: precise per-field targeting** (once A/B prove typing works)
 
 1. `python agent.py shoot --binding binding.json --out drake.png` — open `drake.png`,
-   read each W-2 field's **center pixel** `[x, y]` (window-relative) and put it in
-   `binding.json` as `"click_xy"`. (Grab the full box `[x,y,w,h]` too → `"ocr_box"`.)
+   read each W-2 field's **center pixel** `[x, y]` into `binding.json` as `"click_xy"`
+   (grab the full box `[x,y,w,h]` → `"ocr_box"` too).
 2. `python agent.py selftest --binding binding.json --plan selftest.plan.json --shot after.png`
-3. Open `after.png`: did EIN / wages / withholding land in the right boxes? Yes → wire OCR
-   read-back (set `read_back_method: "ocr"` + `can_read_field_values: true`). Mis-lands →
-   the `click_xy` points are off; re-read them from the PNG.
+3. `after.png` right? → wire OCR read-back (`read_back_method: "ocr"` +
+   `can_read_field_values: true`). Mis-lands → the `click_xy` points need re-reading.
+
+> **Note (facts that shaped this):** Drake's canvas has no focusable OS element, so
+> precise focus needs a physical **click** (`click_xy`); and **Ctrl chords are toxic** —
+> `Ctrl+A` (old clear) and `Ctrl+N` (old heads-down toggle) break focus + pop a modal,
+> both now purged from the defaults. Also: Drake's **2026 license bans automated entry
+> without written authorization** — `typetest`/`selftest` are local proofs on your own
+> install; live client use needs that authorization first.
 
 **Quick disambiguating test** (if the self-test still types nothing, run this to tell
 *why* in one shot — Drake open on a W-2 screen):

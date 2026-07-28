@@ -19,6 +19,9 @@ Modes (run in this order the first time):
   shoot      Save a PNG of the live Drake window. Two jobs: (1) the human-verify FLOOR
              (no read-back? a person checks this capture), and (2) how you calibrate OCR
              boxes — open the PNG, read each field's [x,y,w,h], put it in binding.json.
+  typetest   Proof that the robot can TYPE into Drake: you click a field, the agent types
+             a value with genuine foreground synthetic keystrokes (Juno's technique). Run
+             this first — it isolates "do our keys land?" from field-map calibration.
   calibrate  Same control dump, formatted to help you fill binding.json (logical field →
              automation_id / field_no / tab_index).
   selftest   Run a local plan file (a list of protocol commands) against Drake and print
@@ -148,6 +151,39 @@ def cmd_shoot(args) -> int:
     return 1
 
 
+def cmd_typetest(args) -> int:
+    """
+    The isolation proof for "can the robot actually type into Drake?". You click a Drake
+    field by hand; the agent types a value into it with genuine foreground synthetic
+    keystrokes (the technique Juno uses — NOT the accessibility/set_text path that came
+    back empty). This separates "do our keystrokes land?" from "is the field map right?".
+
+    Uses a countdown (not an Enter prompt) so your console never steals focus from Drake.
+    Internal proof / demo only — never files, and per Drake's 2026 license live automation
+    needs written authorization before it touches real client returns.
+    """
+    import time
+    driver = DrakeDriver(load_binding(args.binding))
+    driver.connect()
+    wi = driver.window_info()
+    print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
+    print(f"\nClick into a Drake data-entry field. Typing {args.text!r} in ", end="", flush=True)
+    for n in range(max(1, args.delay), 0, -1):
+        print(f"{n}… ", end="", flush=True)
+        time.sleep(1)
+    print("\n")
+    res = driver.type_raw(args.text)
+    print(f"Sent {args.text!r} via synthetic keystrokes -> {json.dumps(res)}")
+    if args.shot:
+        s = driver.save_screenshot(args.shot)
+        print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
+    print("\nVERDICT: value appears in the box you clicked -> our keystrokes LAND on Drake's")
+    print("         canvas; typing WORKS and the rest is just navigation/calibration.")
+    print("         Box still empty -> keys are being dropped; check the elevation warning")
+    print("         above and re-run this console 'as Administrator'.")
+    return 0
+
+
 def _values_match(got, exp) -> bool:
     """Compare a read-back to the expected value, tolerant of OCR/format noise:
     '$52,000' == '52000', '12-3456789' == '123456789'. Alphanumerics only, case-fold."""
@@ -245,6 +281,7 @@ def main() -> int:
     sp = sub.add_parser("probe", parents=[common]); sp.set_defaults(func=cmd_probe)
     scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
     sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.set_defaults(func=cmd_shoot)
+    stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.set_defaults(func=cmd_typetest)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)
