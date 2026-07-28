@@ -170,6 +170,36 @@ def cmd_typetest(args) -> int:
     print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
     method = "unicode-packet (modern)" if driver.vk_packet else "scancode/VK (legacy-app friendly)"
     print(f"Keystroke method: {method}")
+
+    # Diagnostic: let the AGENT click at a given window-point, then type — so we can see
+    # whether the agent's own click-to-focus lands (the only new variable vs the manual
+    # typetest that worked). WATCH the mouse cursor.
+    if args.click_xy:
+        x, y = [int(v.strip()) for v in args.click_xy.split(",")]
+        values = [v.strip() for v in args.text.split(",")]
+        print(f"\nAgent will CLICK window-point ({x},{y}), then type. WATCH the mouse cursor.")
+        print("Clicking in ", end="", flush=True)
+        for n in range(3, 0, -1):
+            print(f"{n}… ", end="", flush=True); time.sleep(1)
+        print()
+        cres = driver.click_at(x, y)
+        print(f"click_at -> {json.dumps(cres)}")
+        time.sleep(0.3)
+        adv = (args.advance or "ENTER").upper()
+        for i, v in enumerate(values):
+            driver.type_raw(v, advance=(None if i == len(values) - 1 else adv))
+        print(f"typed {values}")
+        if args.shot:
+            s = driver.save_screenshot(args.shot)
+            print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
+        print("\nVERDICT — tell me two things:")
+        print("  1) did the mouse cursor jump to the box you intended?")
+        print("  2) did the value appear in it?")
+        print("  right box + typed   -> agent click-to-focus WORKS; calibrate the rest.")
+        print("  WRONG spot          -> coordinate/DPI mismatch; paste the click_at numbers.")
+        print("  right spot, no text -> focus/timing; we add a settle pause or a commit.")
+        return 0
+
     print(f"\nClick into a Drake data-entry field. Typing {args.text!r} in ", end="", flush=True)
     for n in range(max(1, args.delay), 0, -1):
         print(f"{n}… ", end="", flush=True)
@@ -291,7 +321,24 @@ def cmd_connect(args) -> int:
     return 0
 
 
+def _set_dpi_aware() -> None:
+    """Make the process DPI-aware so window rectangles, screenshots, and click
+    coordinates all use the SAME physical-pixel space. On a scaled display (125%/150%)
+    without this, the coords you read off a screenshot don't match where click_input
+    actually clicks — the agent clicks empty space and nothing types. Windows-only;
+    a no-op (silently) elsewhere. Must run before pywinauto attaches."""
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE (Win 8.1+)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()  # fallback (Vista+)
+    except Exception:
+        pass
+
+
 def main() -> int:
+    _set_dpi_aware()
     p = argparse.ArgumentParser(description="Fynn Drake agent (pywinauto). Never files.")
     # --binding lives on a shared parent so it works AFTER the subcommand too,
     # e.g. `agent.py probe --binding binding.json`.
@@ -302,7 +349,7 @@ def main() -> int:
     sp = sub.add_parser("probe", parents=[common]); sp.set_defaults(func=cmd_probe)
     scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
     sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.add_argument("--grid", action="store_true", help="overlay a labeled pixel grid to read click_xy/ocr_box coordinates by eye"); sst.set_defaults(func=cmd_shoot)
-    stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click; a COMMA-separated list cascades through fields (e.g. 11111,22222,33333)"); stt.add_argument("--advance", default="", help="key pressed between values when --text is a list, e.g. ENTER (default) or TAB"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
+    stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click; a COMMA-separated list cascades through fields (e.g. 11111,22222,33333)"); stt.add_argument("--click-xy", dest="click_xy", help="AGENT clicks this window-relative x,y first (e.g. 420,180), then types — diagnoses whether the programmatic click lands"); stt.add_argument("--advance", default="", help="key pressed between values when --text is a list, e.g. ENTER (default) or TAB"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)

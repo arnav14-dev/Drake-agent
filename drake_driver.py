@@ -352,6 +352,23 @@ class DrakeDriver:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def click_at(self, x, y) -> dict:
+        """Physically click a window-relative (x, y) point — the agent's own
+        click-to-focus, exposed for diagnosis. Returns the window's top-left + the
+        absolute screen point clicked, so a coordinate/DPI mismatch is visible in the
+        numbers (and you can watch where the cursor actually lands)."""
+        if self.dry_run or self.win is None:
+            return {"ok": False, "error": "no window"}
+        try:
+            r = self.win.rectangle()
+            self.win.set_focus()
+            self.win.click_input(coords=(int(x), int(y)))
+            return {"ok": True, "window_topleft": [r.left, r.top],
+                    "window_size": [r.width(), r.height()],
+                    "clicked_abs": [r.left + int(x), r.top + int(y)]}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def read_field(self, target: dict) -> dict:
         screen, field = target["screen"], target["field"]
         if self.dry_run:
