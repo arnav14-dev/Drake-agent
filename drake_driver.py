@@ -302,8 +302,9 @@ class DrakeDriver:
                 f = self.focus(target)
                 if not f.get("ok"):
                     return {"ok": False, "error": f"cannot focus {screen}/{field} before typing: {f.get('error')}"}
-            else:
-                self._foreground()  # no click, but still make Drake the front window
+            # else: focus:false → type at the caret Drake already placed (on screen-open,
+            # or after a prior Enter/Tab). Do NOT set_focus/foreground — that would reset
+            # the canvas caret and the keys would land nowhere.
             if opts.get("clearFirst"):
                 # Ctrl-free clear: End, then Backspaces. "^a{BACKSPACE}" is toxic on Drake.
                 self._keys(self.nav.get("field_clear", "{END}{BACKSPACE 40}"))
@@ -326,7 +327,11 @@ class DrakeDriver:
             if self.dry_run:
                 print(f"[dry-run] type_raw {text!r} advance={advance}")
                 return {"ok": True}
-            self._foreground()  # Drake to the front so the synthetic keys go to it
+            # Do NOT set_focus / foreground here. You already clicked the field, so it
+            # holds the caret and Drake is in front. set_focus() on the top window would
+            # RESET the canvas caret (the field's cursor vanishes) and the keys land
+            # nowhere — exactly the "cursor disappeared, nothing typed" symptom. Just type
+            # into whatever currently has focus; send_keys injects to the foreground window.
             self._keys(_escape_keys(text))
             if advance:
                 self._keys("{" + advance.upper() + "}")
