@@ -174,15 +174,24 @@ def cmd_typetest(args) -> int:
         print(f"{n}… ", end="", flush=True)
         time.sleep(1)
     print("\n")
-    res = driver.type_raw(args.text)
-    print(f"Sent {args.text!r} via synthetic keystrokes -> {json.dumps(res)}")
+    values = [v.strip() for v in args.text.split(",")]
+    if len(values) == 1:
+        res = driver.type_raw(values[0])
+        print(f"Sent {values[0]!r} via synthetic keystrokes -> {json.dumps(res)}")
+        print("\nVERDICT: value appears in the box you clicked -> keystrokes LAND; typing WORKS.")
+        print("         Still empty -> keys dropped; try `--unicode`, or run as Administrator.")
+    else:
+        adv = (args.advance or "ENTER").upper()
+        for i, v in enumerate(values):
+            last = i == len(values) - 1
+            driver.type_raw(v, advance=(None if last else adv))
+        print(f"Sent {len(values)} values, pressing {{{adv}}} between each: {values}")
+        print(f"\nVERDICT: read off WHICH box each value landed in (in order {values}) — that's")
+        print(f"         Drake's field order. If a value overwrites the previous instead of")
+        print(f"         moving on, {{{adv}}} isn't advancing fields — retry with `--advance TAB`.")
     if args.shot:
         s = driver.save_screenshot(args.shot)
         print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
-    print("\nVERDICT: value appears in the box you clicked -> our keystrokes LAND on Drake's")
-    print("         canvas; typing WORKS and the rest is just navigation/calibration.")
-    print("         Box still empty -> keys are being dropped; check the elevation warning")
-    print("         above and re-run this console 'as Administrator'.")
     return 0
 
 
@@ -283,7 +292,7 @@ def main() -> int:
     sp = sub.add_parser("probe", parents=[common]); sp.set_defaults(func=cmd_probe)
     scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
     sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.set_defaults(func=cmd_shoot)
-    stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
+    stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click; a COMMA-separated list cascades through fields (e.g. 11111,22222,33333)"); stt.add_argument("--advance", default="", help="key pressed between values when --text is a list, e.g. ENTER (default) or TAB"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)
