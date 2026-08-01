@@ -355,18 +355,36 @@ class DrakeDriver:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def headsdown_type(self, field_no, value) -> dict:
-        """Enter one value BY FIELD NUMBER while in heads-down mode: type the field number
-        + Enter (caret jumps to that exact field), type the value, commit with Enter (Drake
-        returns to the field-number prompt). Coordinate-free — no click, no pixel math.
-        Assumes heads-down mode is already ON (call headsdown_toggle() once first)."""
+    def headsdown_type(self, field_no, value, *, reopen: bool = True,
+                       method: str = "scancode", settle: float = 0.15) -> dict:
+        """Enter one value BY FIELD NUMBER via Drake's heads-down JUMP prompt.
+
+        On this Drake build heads-down is a ONE-SHOT jump popup ("enter desired field
+        number…"), NOT a sticky mode: Ctrl+N opens it, you type the field number + Enter
+        to jump the caret to that field, then type the value — but Drake does NOT return
+        to the number prompt afterward (an Enter there just advances the normal form
+        order, cascading every later value into the wrong box — confirmed on the VM). So:
+          reopen=True  -> re-open the prompt with Ctrl+N BEFORE each field (the fix), and
+                          do NOT press Enter after the value (opening the next prompt, or
+                          the caller's final commit, is what leaves the field).
+        Requires an ACTIVE caret in some field before the first call (a click, or a prior
+        jump) — Ctrl+N no-ops with no active field. Coordinate-free; no pixel math."""
         try:
             if self.dry_run:
-                print(f"[dry-run] headsdown field {field_no} = {value!r}")
+                print(f"[dry-run] headsdown field {field_no} = {value!r} (reopen={reopen})")
                 return {"ok": True}
+            import time
+            if reopen:
+                tg = self.headsdown_toggle(method=method)  # re-open the number prompt
+                if not tg.get("ok"):
+                    return {"ok": False, "error": f"could not reopen heads-down prompt: {tg.get('error')}"}
+                time.sleep(max(settle, self.key_pause))  # let the popup take focus
+            # Type the field number into the prompt; Enter jumps the caret to that field.
             self._keys(str(field_no) + self.nav.get("headsdown_jump_suffix", "{ENTER}"))
+            time.sleep(max(settle, self.key_pause))  # let the jump land before typing
+            # Type the value into the now-focused field. NO trailing Enter — that would
+            # advance the normal tab order instead of letting the next reopen re-address.
             self._keys(_escape_keys(str(value)))
-            self._keys(self.nav.get("field_commit", "{ENTER}"))
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}

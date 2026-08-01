@@ -230,51 +230,71 @@ def cmd_typetest(args) -> int:
     return 0
 
 
+def _headsdown_run_seq(driver, seq, *, method, reopen) -> list:
+    """Enter a "N=value,N=value,…" list BY FIELD NUMBER through Drake's heads-down jump
+    prompt. Requires an ACTIVE caret already in a field (a click, or a prior jump) so the
+    first Ctrl+N has something to act on. With reopen=True each field re-opens the prompt
+    (Ctrl+N) before its number — the build's one-shot popup does NOT return to the prompt
+    on its own. A final Enter commits the last field. Returns per-field (num, val, ok)."""
+    import time
+    typed = []
+    for pair in seq.split(","):
+        if "=" not in pair:
+            continue
+        num, val = pair.split("=", 1)
+        num, val = num.strip(), val.strip()
+        res = driver.headsdown_type(num, val, reopen=reopen, method=method)
+        typed.append((num, val, res.get("ok")))
+        time.sleep(0.25)
+    driver.press(["Enter"])  # commit the last field (values are typed without a trailing Enter)
+    return typed
+
+
 def cmd_headsdown(args) -> int:
     """
-    THE pivotal precision test: address Drake fields BY NUMBER, with NO mouse click —
-    Drake's own heads-down data entry. Opens the screen by code, toggles heads-down
-    (Ctrl+N) so every field shows a stable NUMBER, and screenshots it so you can read
-    those numbers. With --seq "N=value,..." it then types each value into field N by its
-    number — zero pixels, DPI-immune. This is the coordinate-free path meant to REPLACE
-    fragile click_xy as our primary targeting. Internal proof only; never files.
+    THE precision path: address Drake fields BY NUMBER via heads-down data entry — no
+    pixel clicks. Heads-down here is a one-shot JUMP popup (Ctrl+N -> "enter field number"
+    -> number+Enter jumps the caret -> type value), so --seq re-opens the prompt before
+    each field. Needs one active caret to bootstrap: --manual (you click a field first) is
+    the confirmed-working path; the auto path opens the screen by code but a code-opened
+    screen may not leave an active caret (then Ctrl+N no-ops — use --manual). With no --seq
+    it just toggles Ctrl+N and screenshots so you can read the field numbers off the PNG.
+    Internal proof only; never files.
     """
     import time
+    reopen = not args.no_reopen
     driver = DrakeDriver(load_binding(args.binding))
     driver.connect()
     wi = driver.window_info()
     print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
 
-    # MANUAL-FOCUS ISOLATION TEST: does Ctrl+N work when a field is ALREADY active?
-    # (Opening a screen by code may not leave a blinking caret — and heads-down toggles
-    # the field you're IN, so with no active field Ctrl+N no-ops. You click first, exactly
-    # like the typing test that worked; the agent only fires Ctrl+N.) No open_screen, no
-    # agent foreground — your click owns the focus.
+    # --manual: YOU click a field first (active caret), the agent only drives Ctrl+N +
+    # field numbers. No open_screen, no agent foreground — your click owns the focus. This
+    # is the proven path (a code-opened screen may not leave an active caret for Ctrl+N).
     if args.manual:
-        print("\nMANUAL-FOCUS TEST — click into any Drake W-2 field NOW so its cursor is")
-        print("blinking (an ACTIVE caret), then leave it. Do NOT touch the keyboard.")
-        print(f"Agent fires Ctrl+N (method={args.toggle_method}) in ", end="", flush=True)
+        print("\nMANUAL-FOCUS — click into any Drake W-2 field NOW so its cursor is blinking")
+        print("(an ACTIVE caret), then take your hands off the keyboard.")
+        print(f"Agent drives heads-down (method={args.toggle_method}) in ", end="", flush=True)
         for n in range(max(1, args.delay), 0, -1):
             print(f"{n}… ", end="", flush=True)
             time.sleep(1)
         print()
-        r = driver.headsdown_toggle(method=args.toggle_method)
-        print(f"headsdown_toggle -> {json.dumps(r)}")
         if args.seq:
-            for pair in args.seq.split(","):
-                if "=" not in pair:
-                    continue
-                num, val = pair.split("=", 1)
-                driver.headsdown_type(num.strip(), val.strip())
-                time.sleep(0.2)
-            print("typed the --seq values by field number")
+            typed = _headsdown_run_seq(driver, args.seq, method=args.toggle_method, reopen=reopen)
+            print(f"entered by field number (reopen={reopen}): {typed}")
+        else:
+            r = driver.headsdown_toggle(method=args.toggle_method)
+            print(f"headsdown_toggle -> {json.dumps(r)}")
         s = driver.save_screenshot(args.shot)
         print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
         print("\nVERDICT — tell me:")
-        print("  numbers appeared -> Ctrl+N works once a field is ACTIVE; open-screen just")
-        print("     doesn't leave one. Fix = plant a caret before Ctrl+N (one keystroke/click).")
-        print("  still nothing -> synthetic Ctrl+N is rejected no matter what; we pivot to a")
-        print("     persistent heads-down SETTING in Drake, or Ctrl+Home + Enter-order.")
+        if args.seq:
+            print("  each value in its RIGHT box -> heads-down entry works; precision solved.")
+            print("  any cascaded/wrong -> tell me which number got what; likely a timing or")
+            print("     reopen tweak (try --no-reopen to compare).")
+        else:
+            print("  numbers appeared -> read me the number on each field you care about.")
+            print("  nothing -> try --toggle-method vkhold, then pywinauto.")
         return 0
 
     print(f"Opening screen {args.screen!r} by code (Selector — no mouse)…")
@@ -283,39 +303,28 @@ def cmd_headsdown(args) -> int:
         print(f"open_screen failed: {r.get('error')}", file=sys.stderr)
         return 1
     time.sleep(args.settle)
-    print(f"Toggling HEADS-DOWN (Ctrl+N, method={args.toggle_method}) — a NUMBER should appear on every box…")
-    r = driver.headsdown_toggle(method=args.toggle_method)
-    if not r.get("ok"):
-        print(f"headsdown toggle failed: {r.get('error')}", file=sys.stderr)
-        return 1
-    time.sleep(args.settle)
-    typed = []
     if args.seq:
-        for pair in args.seq.split(","):
-            if "=" not in pair:
-                continue
-            num, val = pair.split("=", 1)
-            num, val = num.strip(), val.strip()
-            driver.headsdown_type(num, val)
-            typed.append((num, val))
-            time.sleep(0.2)
-        print(f"Typed by field number, no click: {typed}")
+        print(f"Entering values BY FIELD NUMBER (method={args.toggle_method}, reopen={reopen})…")
+        typed = _headsdown_run_seq(driver, args.seq, method=args.toggle_method, reopen=reopen)
+        print(f"entered by field number: {typed}")
+    else:
+        print(f"Toggling HEADS-DOWN (Ctrl+N, method={args.toggle_method}) — a NUMBER should appear…")
+        r = driver.headsdown_toggle(method=args.toggle_method)
+        if not r.get("ok"):
+            print(f"headsdown toggle failed: {r.get('error')}", file=sys.stderr)
+            return 1
+    time.sleep(args.settle)
     s = driver.save_screenshot(args.shot)
     print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
     print("\nVERDICT — tell me:")
     if not args.seq:
         print("  1) did Ctrl+N make a NUMBER appear on each field? (heads-down works)")
-        print("  2) read me the number shown on: employer EIN, employer name, box 1 wages,")
-        print("     box 2 fed w/h. Those 4 numbers let us drive every field with ZERO pixels.")
-        print("  NO numbers appeared -> the synthetic Ctrl+N didn't register. Retry with a")
-        print("     different injection method, in this order:")
-        print("       --toggle-method vkhold        (pywinauto Ctrl-held)")
-        print("       --toggle-method pywinauto     (high-level ^n)")
-        print("     (default is 'scancode' = low-level hardware keys, usually the best.)")
+        print("  2) read me the number shown on each field. NB: if a code-opened screen")
+        print("     leaves no active caret, Ctrl+N no-ops here — use --manual (click first).")
     else:
         print("  1) did each value land in the RIGHT field (by its number)?")
-        print("  2) any that missed -> tell me which number went where.")
-        print("  all correct -> pixel clicking is retired; heads-down is our precise path.")
+        print("  2) any that missed -> tell me which number went where. If nothing landed,")
+        print("     the code-opened screen had no active caret to bootstrap — use --manual.")
     return 0
 
 
@@ -450,7 +459,7 @@ def main() -> int:
     scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
     sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.add_argument("--grid", action="store_true", help="overlay a labeled pixel grid to read click_xy/ocr_box coordinates by eye"); sst.set_defaults(func=cmd_shoot)
     stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click; a COMMA-separated list cascades through fields (e.g. 11111,22222,33333)"); stt.add_argument("--click-xy", dest="click_xy", help="AGENT clicks this window-relative x,y first (e.g. 420,180), then types — diagnoses whether the programmatic click lands"); stt.add_argument("--advance", default="", help="key pressed between values when --text is a list, e.g. ENTER (default) or TAB"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
-    shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "1=12-3456789,2=ACME,3=52000"'); shd.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected: scancode (low-level hardware keys, default/best for Drake), vkhold (pywinauto Ctrl-held), pywinauto (high-level ^n)"); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.6, help="seconds to wait after open and after Ctrl+N"); shd.add_argument("--manual", action="store_true", help="isolation test: skip open-screen; YOU click a field first, then the agent fires Ctrl+N (proves whether Ctrl+N needs an already-active caret)"); shd.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before Ctrl+N fires, in --manual mode"); shd.set_defaults(func=cmd_headsdown)
+    shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "1=12-3456789,2=ACME,3=52000"'); shd.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected: scancode (low-level hardware keys, default/best for Drake), vkhold (pywinauto Ctrl-held), pywinauto (high-level ^n)"); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.6, help="seconds to wait after open and after Ctrl+N"); shd.add_argument("--manual", action="store_true", help="YOU click a field first (active caret), then the agent drives heads-down by number — the confirmed-working bootstrap"); shd.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before entry fires, in --manual mode"); shd.add_argument("--no-reopen", dest="no_reopen", action="store_true", help="do NOT re-open the heads-down prompt (Ctrl+N) before each field — for comparing against the per-field-reopen default this build needs"); shd.set_defaults(func=cmd_headsdown)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)
