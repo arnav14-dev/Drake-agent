@@ -26,9 +26,11 @@ from typing import Any, Optional
 try:
     from pywinauto import Application
     from pywinauto.keyboard import send_keys
+    from pywinauto.timings import TimeoutError as PWTimeout
 except Exception:  # pragma: no cover - importable on non-Windows for reading only
     Application = None  # type: ignore
     send_keys = None  # type: ignore
+    PWTimeout = TimeoutError  # type: ignore  (valid `except` target off-Windows)
 
 try:
     import pyperclip  # clipboard read-back (Plan B — Drake exposes no UIA field values)
@@ -84,8 +86,14 @@ class DrakeDriver:
         self.tesseract_cmd = binding.get("tesseract_cmd")
         self.key_pause = key_pause
         self.dry_run = dry_run
-        self.app = None
-        self.win = None
+        self.app = None          # backend="uia" connection to the main data-entry frame
+        self.win = None          # the resolved main-frame window
+        self.w32 = None          # SEPARATE backend="win32" connection (same PID) for the
+                                 # heads-down popup dialog — a real HWND Edit the canvas lacks
+        self.main_hwnd = None    # cached main-frame handle (focus/dialog allowlist anchor)
+        # The heads-down popup is a real dialog window we drive directly (title + edit class).
+        self.popup_title_re = self.nav.get("headsdown_popup_title_re", r"Heads.?Down Data Entry")
+        self.popup_edit_class = self.nav.get("headsdown_popup_edit_class", "Edit")
 
     # -- connection ---------------------------------------------------------
 
@@ -99,6 +107,8 @@ class DrakeDriver:
             raise RuntimeError("pywinauto is not available (run on the Windows VM)")
         self.app = Application(backend="uia").connect(title_re=self.title_re, timeout=20)
         self.win = self._resolve_main_window()
+        self.main_hwnd = int(self.win.handle)
+        self._connect_win32_popup()  # second connection for the heads-down dialog
         self._warn_if_elevation_mismatch()
         self._foreground()
 
@@ -324,6 +334,96 @@ class DrakeDriver:
             user32.keybd_event(0, _scan(vk), KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, 0)
             time.sleep(hold)
 
+    # -- heads-down popup: driven as a REAL dialog window (not blind global keys) --------
+
+    def _connect_win32_popup(self) -> None:
+        """Open a SECOND pywinauto connection with backend='win32' to the SAME Drake PID.
+        The heads-down popup ('Drake … Heads Down Data Entry') is a real classic dialog
+        with a focusable Edit control — the win32 backend exposes that native HWND plus
+        message-based control methods (set_edit_text / WM_GETTEXT read-back) that the
+        custom canvas never exposed and the uia backend can't drive. Best-effort: a
+        failure just leaves self.w32 None (heads-down entry then reports it and HALTs)."""
+        if self.dry_run or Application is None or self.win is None:
+            return
+        try:
+            pid = self.win.element_info.process_id
+            self.w32 = Application(backend="win32").connect(process=pid, timeout=20)
+        except Exception:
+            self.w32 = None
+
+    def _focused_hwnd(self):
+        """(hwndFocus, hwndCaret, rcCaret, flags) for Drake's GUI thread — the cross-process
+        truth of which control owns the keyboard/caret RIGHT NOW (no AttachThreadInput).
+        The focus/caret oracle for the guarded-keystroke protocol."""
+        return _gui_thread_info(self.main_hwnd)
+
+    def _find_headsdown_popup(self, timeout: float = 0.5):
+        """The heads-down popup as a win32 WindowSpecification, or None if not present.
+        Re-found each cycle — the dialog is created/destroyed per jump on this build, so a
+        cached wrapper goes stale."""
+        if self.w32 is None:
+            return None
+        try:
+            spec = self.w32.window(title_re=self.popup_title_re)
+            return spec if spec.exists(timeout=timeout) else None
+        except Exception:
+            return None
+
+    def _popup_edit(self, popup):
+        """The popup's text box (its real Edit control)."""
+        try:
+            return popup.child_window(class_name=self.popup_edit_class)
+        except Exception:
+            return popup.child_window(control_type="Edit")
+
+    def _detect_unexpected_dialog(self):
+        """Enumerate Drake's top-level windows; allow ONLY the main frame and the heads-down
+        popup. Anything else (the 'invalid field' modal, any validation/error dialog) is an
+        anomaly → return its identity + text so the caller HALTs for a human. NEVER
+        auto-clicks / dismisses. None means all clear."""
+        if self.w32 is None:
+            return None
+        import re as _re
+        try:
+            for w in self.w32.windows():
+                try:
+                    h = int(w.handle)
+                except Exception:
+                    continue
+                if h == self.main_hwnd:
+                    continue
+                t = w.window_text() or ""
+                if _re.search(self.popup_title_re, t):
+                    continue
+                try:
+                    kids = " ".join((c.window_text() or "") for c in w.descendants())
+                except Exception:
+                    kids = ""
+                return {"title": t, "text": (t + " " + kids).strip()[:400], "handle": h}
+        except Exception:
+            return None
+        return None
+
+    def _ensure_popup_open(self, *, method: str = "scancode", timeout: float = 2.5) -> dict:
+        """IDEMPOTENT open of the heads-down popup. If it's already present, do NOTHING —
+        never a second Ctrl+N (that would TOGGLE the mode back off, the old bug). Else fire
+        Ctrl+N once and WAIT for the popup to become ready (readiness, not a fixed sleep).
+        Ctrl+N only registers when a canvas field is active; if it doesn't open the popup
+        we surface that as a HALT via the wait timeout (the reliable signal)."""
+        popup = self._find_headsdown_popup(timeout=0.3)
+        if popup is not None:
+            return {"ok": True, "opened": False, "popup": popup}
+        if self.w32 is None:
+            return {"ok": False, "reason": "win32 popup connection unavailable (reconnect on the VM)"}
+        self.headsdown_toggle(method=method)  # Ctrl+N (scancode)
+        try:
+            spec = self.w32.window(title_re=self.popup_title_re)
+            spec.wait("visible ready", timeout=timeout)
+            return {"ok": True, "opened": True, "popup": spec}
+        except Exception as e:
+            return {"ok": False, "reason": f"Ctrl+N did not open the heads-down popup "
+                                           f"(is a canvas field active? {e})"}
+
     def headsdown_toggle(self, method: str = "scancode") -> dict:
         """Toggle Drake's HEADS-DOWN data entry (Ctrl+N). In heads-down mode every field
         displays a stable NUMBER; you address a field by typing its number, so NO pixel
@@ -355,39 +455,185 @@ class DrakeDriver:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def headsdown_type(self, field_no, value, *, reopen: bool = True,
-                       method: str = "scancode", settle: float = 0.15) -> dict:
-        """Enter one value BY FIELD NUMBER via Drake's heads-down JUMP prompt.
+    def headsdown_type(self, field_no, value, *, method: str = "scancode") -> dict:
+        """Enter ONE value BY FIELD NUMBER — race-free and VERIFIED — via the heads-down
+        popup. This replaces the old open-loop "fire Ctrl+N, sleep, blind-type" that raced
+        keystrokes between the popup and the canvas (digits into EIN, 'invalid field',
+        cascade). The guarded protocol, every step gated:
 
-        On this Drake build heads-down is a ONE-SHOT jump popup ("enter desired field
-        number…"), NOT a sticky mode: Ctrl+N opens it, you type the field number + Enter
-        to jump the caret to that field, then type the value — but Drake does NOT return
-        to the number prompt afterward (an Enter there just advances the normal form
-        order, cascading every later value into the wrong box — confirmed on the VM). So:
-          reopen=True  -> re-open the prompt with Ctrl+N BEFORE each field (the fix), and
-                          do NOT press Enter after the value (opening the next prompt, or
-                          the caller's final commit, is what leaves the field).
-        Requires an ACTIVE caret in some field before the first call (a click, or a prior
-        jump) — Ctrl+N no-ops with no active field. Coordinate-free; no pixel math."""
+          1. Drake main frame still alive?                         else HALT
+          2. no unexpected/error dialog already up?                else HALT
+          3. ensure the popup is open (IDEMPOTENT — Ctrl+N only if absent, never a
+             second toggle) and READY (wait, not sleep)           else HALT
+          4. focus the popup's real Edit and VERIFY focus == that Edit (GetGUIThreadInfo)
+                                                                   else HALT
+          5. type the field number into the FOCUSED popup edit, then READ IT BACK
+             (WM_GETTEXT) and assert it == the number BEFORE the irreversible Enter
+                                                                   else HALT
+          6. press Enter → the jump; PROVE the popup closed (number accepted)  else HALT
+          7. no error dialog after the jump?                       else HALT
+          8. type the VALUE onto the canvas (global keys, vk_packet=False, NO set_focus,
+             NO trailing Enter — the next field's Ctrl+N is what leaves this field)
+
+        The number can never land on the canvas because we verify the popup edit holds
+        keyboard focus and read the digits back before committing. Returns {ok:True,...}
+        or {ok:False, halt:True, reason:...} — the caller STOPS the batch for a human.
+        Never presses Enter after the value; never auto-dismisses a dialog."""
+        fn = str(field_no)
         try:
             if self.dry_run:
-                print(f"[dry-run] headsdown field {field_no} = {value!r} (reopen={reopen})")
+                print(f"[dry-run] headsdown field {fn} = {value!r}")
                 return {"ok": True}
             import time
-            if reopen:
-                tg = self.headsdown_toggle(method=method)  # re-open the number prompt
-                if not tg.get("ok"):
-                    return {"ok": False, "error": f"could not reopen heads-down prompt: {tg.get('error')}"}
-                time.sleep(max(settle, self.key_pause))  # let the popup take focus
-            # Type the field number into the prompt; Enter jumps the caret to that field.
-            self._keys(str(field_no) + self.nav.get("headsdown_jump_suffix", "{ENTER}"))
-            time.sleep(max(settle, self.key_pause))  # let the jump land before typing
-            # Type the value into the now-focused field. NO trailing Enter — that would
-            # advance the normal tab order instead of letting the next reopen re-address.
+            # 1) app alive?
+            if self.win is None or not self.win.exists():
+                return {"ok": False, "halt": True, "reason": "Drake main frame vanished (app closed)"}
+            # 2) unexpected/error dialog already up?
+            bad = self._detect_unexpected_dialog()
+            if bad:
+                return {"ok": False, "halt": True, "reason": f"unexpected dialog before entry: {bad['title']!r}", "dialog": bad}
+            # 3) idempotent popup open (never a second Ctrl+N if already open)
+            opened = self._ensure_popup_open(method=method, timeout=2.5)
+            if not opened.get("ok"):
+                return {"ok": False, "halt": True, "reason": opened.get("reason")}
+            popup = self._find_headsdown_popup(timeout=1.0)
+            if popup is None:
+                return {"ok": False, "halt": True, "reason": "heads-down popup not found after open"}
+            edit = self._popup_edit(popup)
+            try:
+                edit.wait("ready", timeout=2)
+                eh = int(edit.handle)
+            except Exception as e:
+                return {"ok": False, "halt": True, "reason": f"popup edit not ready / no handle: {e}"}
+            # 4) focus the edit + VERIFY via the ctypes GUI-thread oracle (retry a few times)
+            focused = False
+            for _ in range(6):
+                try:
+                    edit.set_focus()
+                except Exception:
+                    pass
+                try:
+                    if self._focused_hwnd()[0] == eh:
+                        focused = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.05)
+            if not focused:
+                return {"ok": False, "halt": True, "reason": "popup edit never took keyboard focus"}
+            # 5) place the number in the FOCUSED popup edit, then READ IT BACK before Enter.
+            #    Clear first (atomic), then type real keys (Drake honors scan/VK), verify.
+            try:
+                edit.set_edit_text("")  # clear any stale digits (EM_REPLACESEL, atomic)
+            except Exception:
+                pass
+            self._keys(fn)  # real VK/scan keys land in the focused popup edit (focus verified)
+            got = _safe_read_edit(eh)
+            if got != fn:
+                # fallback: place atomically via window message, re-read
+                try:
+                    edit.set_edit_text(fn)
+                except Exception:
+                    pass
+                got = _safe_read_edit(eh)
+                if got != fn:
+                    return {"ok": False, "halt": True,
+                            "reason": f"popup edit shows {got!r}, expected {fn!r} — refusing to press Enter"}
+            # 6) fire the jump, then PROVE the popup consumed it (number accepted)
+            self._keys("{ENTER}")
+            try:
+                popup.wait_not("visible", timeout=3)
+            except Exception:
+                bad = self._detect_unexpected_dialog()
+                reason = "popup still open after Enter — field number likely rejected for this screen"
+                if bad:
+                    reason = f"error dialog after Enter: {bad['title']!r}"
+                return {"ok": False, "halt": True, "reason": reason, "dialog": bad}
+            # 7) error modal after the jump?
+            bad = self._detect_unexpected_dialog()
+            if bad:
+                return {"ok": False, "halt": True, "reason": f"error dialog after jump: {bad['title']!r}", "dialog": bad}
+            # (advisory) did the caret land on a canvas field?
+            landed = None
+            try:
+                landed = bool(self._focused_hwnd()[3] & _GUI_CARETBLINKING)
+            except Exception:
+                pass
+            # 8) type the VALUE onto the canvas — global keys, vk_packet=False, NO set_focus,
+            #    NO trailing Enter (the next field's Ctrl+N leaves this field cleanly).
             self._keys(_escape_keys(str(value)))
-            return {"ok": True}
+            return {"ok": True, "field_no": field_no, "reopened": opened.get("opened"),
+                    "caret_after_jump": landed}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "halt": True, "reason": str(e)}
+
+    def probe_headsdown_popup(self) -> dict:
+        """READ-ONLY diagnostic: with the heads-down popup open, dump its real control tree,
+        test a set_edit_text('4') round-trip, and report whether the popup CLOSES after
+        Enter (per-jump: value goes to the canvas) or STAYS (persistent command-bar: value
+        goes back to the popup). Resolves the exact Edit class + focus handles + model so
+        the entry driver binds correctly. Writes NO field value — the test Enter only moves
+        the caret to field 4 (EIN); nothing is typed into a box."""
+        out = {"ok": True}
+        if self.dry_run or self.w32 is None:
+            return {"ok": False, "reason": "no win32 popup connection (run on the VM after connect)"}
+        try:
+            import time
+            f0 = self._focused_hwnd()
+            out["focus_before"] = {"hwndFocus": f0[0], "hwndCaret": f0[1], "rcCaret": f0[2],
+                                   "caret_blinking": bool(f0[3] & _GUI_CARETBLINKING),
+                                   "main_hwnd": self.main_hwnd}
+            popup = self._find_headsdown_popup(timeout=0.5)
+            out["popup_present_initially"] = popup is not None
+            if popup is None:
+                out["ensure_open"] = self._ensure_popup_open(timeout=2.5)
+                popup = self._find_headsdown_popup(timeout=1.0)
+            if popup is None:
+                out["ok"] = False
+                out["reason"] = "popup not open — click a Drake field first, then re-run"
+                return out
+            out["popup_title"] = popup.window_text()
+            controls = []
+            for c in popup.descendants():
+                try:
+                    r = c.rectangle()
+                    controls.append({"class": c.friendly_class_name(),
+                                     "class_name": getattr(c.element_info, "class_name", None),
+                                     "text": c.window_text(), "rect": [r.left, r.top, r.width(), r.height()],
+                                     "handle": int(c.handle)})
+                except Exception:
+                    continue
+            out["popup_controls"] = controls
+            edit = self._popup_edit(popup)
+            eh = int(edit.handle)
+            out["edit_handle"] = eh
+            out["edit_class_name"] = getattr(edit.element_info, "class_name", None)
+            try:
+                edit.set_focus()
+            except Exception as e:
+                out["set_focus_error"] = str(e)
+            out["focus_is_edit_after_setfocus"] = (self._focused_hwnd()[0] == eh)
+            try:
+                edit.set_edit_text("4")
+                out["set_edit_text_readback"] = _safe_read_edit(eh)
+            except Exception as e:
+                out["set_edit_text_error"] = str(e)
+            try:
+                self._keys("{ENTER}")
+            except Exception as e:
+                out["enter_error"] = str(e)
+            time.sleep(0.4)
+            out["popup_still_open_after_enter"] = self._find_headsdown_popup(timeout=0.5) is not None
+            f1 = self._focused_hwnd()
+            out["focus_after_enter"] = {"hwndFocus": f1[0], "hwndCaret": f1[1], "rcCaret": f1[2],
+                                        "caret_blinking": bool(f1[3] & _GUI_CARETBLINKING)}
+            out["model"] = ("persistent-command-bar (value -> popup)" if out["popup_still_open_after_enter"]
+                            else "per-jump dialog (value -> canvas)")
+            out["unexpected_dialog"] = self._detect_unexpected_dialog()
+        except Exception as e:
+            out["ok"] = False
+            out["reason"] = str(e)
+        return out
 
     def type_text(self, target: dict, text: str, opts: Optional[dict] = None) -> dict:
         opts = opts or {}
@@ -663,6 +909,71 @@ class DrakeDriver:
 
 
 # --- module helpers ---------------------------------------------------------
+
+# Win32 focus/caret + cross-process text oracles for the guarded heads-down protocol.
+# GUITHREADINFO.hwndFocus is the truth of who owns the keyboard, read cross-process WITHOUT
+# AttachThreadInput (which is racy); WM_GETTEXT reads the popup edit's text back out as
+# proof the number landed before we press the irreversible Enter. Windows-only; the whole
+# block degrades to None off-Windows (ctypes.wintypes only imports there) — the callers
+# only run on the VM (dry_run returns before reaching them).
+try:
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wintypes
+
+    class _GTI(_ctypes.Structure):
+        _fields_ = [("cbSize", _wintypes.DWORD), ("flags", _wintypes.DWORD),
+                    ("hwndActive", _wintypes.HWND), ("hwndFocus", _wintypes.HWND),
+                    ("hwndCapture", _wintypes.HWND), ("hwndMenuOwner", _wintypes.HWND),
+                    ("hwndMoveSize", _wintypes.HWND), ("hwndCaret", _wintypes.HWND),
+                    ("rcCaret", _wintypes.RECT)]
+except Exception:  # pragma: no cover - non-Windows
+    _ctypes = None  # type: ignore
+    _wintypes = None  # type: ignore
+    _GTI = None  # type: ignore
+
+_GUI_CARETBLINKING = 0x00000001
+
+
+def _gui_thread_info(any_hwnd):
+    """(hwndFocus, hwndCaret, (l,t,r,b), flags) for the GUI thread owning any_hwnd —
+    Drake's real keyboard-focus/caret state, cross-process, no AttachThreadInput. Handles
+    are returned as ints (0 if null). Windows-only."""
+    u32 = _ctypes.windll.user32
+    tid = u32.GetWindowThreadProcessId(int(any_hwnd), None)
+    g = _GTI()
+    g.cbSize = _ctypes.sizeof(_GTI)
+    if not u32.GetGUIThreadInfo(tid, _ctypes.byref(g)):
+        raise OSError("GetGUIThreadInfo failed")
+    rc = g.rcCaret
+    fh = int(g.hwndFocus) if g.hwndFocus else 0
+    ch = int(g.hwndCaret) if g.hwndCaret else 0
+    return (fh, ch, (rc.left, rc.top, rc.right, rc.bottom), int(g.flags))
+
+
+def _read_edit_text(hedit, timeout_ms: int = 1000) -> str:
+    """Read another process's Edit control text via WM_GETTEXT (hang-safe
+    SendMessageTimeout). GetWindowText does NOT work cross-process for a foreign Edit.
+    Windows-only."""
+    WM_GETTEXT, WM_GETTEXTLENGTH, SMTO_ABORTIFHUNG = 0x000D, 0x000E, 0x0002
+    u32 = _ctypes.windll.user32
+    n = _wintypes.DWORD()
+    u32.SendMessageTimeoutW(int(hedit), WM_GETTEXTLENGTH, 0, 0, SMTO_ABORTIFHUNG, timeout_ms, _ctypes.byref(n))
+    buf = _ctypes.create_unicode_buffer(n.value + 1)
+    res = _wintypes.DWORD()
+    ok = u32.SendMessageTimeoutW(int(hedit), WM_GETTEXT, n.value + 1, buf,
+                                 SMTO_ABORTIFHUNG, timeout_ms, _ctypes.byref(res))
+    if not ok:
+        raise TimeoutError("popup WM_GETTEXT timed out")
+    return buf.value
+
+
+def _safe_read_edit(hedit) -> str:
+    """_read_edit_text, stripped, never raising ('' on any failure)."""
+    try:
+        return (_read_edit_text(hedit) or "").strip()
+    except Exception:
+        return ""
+
 
 def _overlay_grid(img, step: int = 50, label_every: int = 100):
     """Draw a labeled pixel grid over a capture so you can read a field's click_xy /

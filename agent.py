@@ -22,10 +22,14 @@ Modes (run in this order the first time):
   typetest   Proof that the robot can TYPE into Drake: you click a field, the agent types
              a value with genuine foreground synthetic keystrokes (Juno's technique). Run
              this first — it isolates "do our keys land?" from field-map calibration.
-  headsdown  THE precision test: address Drake fields BY NUMBER with NO mouse click.
-             Opens a screen by code, toggles heads-down (Ctrl+N) so every field shows a
-             stable number, screenshots it. With --seq "N=value,..." it types each value
-             into field N by number — coordinate-free, DPI-immune (see PRECISION-PLAN.md).
+  headsdown  THE precision path: address Drake fields BY NUMBER with NO mouse click,
+             race-free + verified. With --seq "N=value,..." it drives the heads-down popup
+             field by field (focus its edit, read the number back before Enter, prove the
+             jump, type the value on the canvas), HALTing on any anomaly. --manual bootstraps
+             by having you click a field first. Coordinate-free (see PRECISION-PLAN.md).
+  probe-popup READ-ONLY: dump the "Heads Down Data Entry" popup's real control tree + test
+             a number round-trip + report whether it closes after Enter. Run ONCE first to
+             lock in the exact edit control the driver binds to. Writes no field value.
   calibrate  Same control dump, formatted to help you fill binding.json (logical field →
              automation_id / field_no / tab_index).
   selftest   Run a local plan file (a list of protocol commands) against Drake and print
@@ -230,47 +234,71 @@ def cmd_typetest(args) -> int:
     return 0
 
 
-def _headsdown_run_seq(driver, seq, *, method, reopen) -> list:
-    """Enter a "N=value,N=value,…" list BY FIELD NUMBER through Drake's heads-down jump
-    prompt. Requires an ACTIVE caret already in a field (a click, or a prior jump) so the
-    first Ctrl+N has something to act on. With reopen=True each field re-opens the prompt
-    (Ctrl+N) before its number — the build's one-shot popup does NOT return to the prompt
-    on its own. A final Enter commits the last field. Returns per-field (num, val, ok)."""
-    import time
-    typed = []
+def _headsdown_run_seq(driver, seq, *, method):
+    """Enter a "N=value,N=value,…" list BY FIELD NUMBER through the heads-down popup, using
+    the race-free VERIFIED driver (each field: focus the popup edit, read the number back
+    before Enter, prove the jump, then type the value). STOPS at the first field that does
+    not return ok — no cascade, nothing committed past the failure. Requires an ACTIVE
+    caret in a field to bootstrap (a click, or a prior jump). Returns
+    (rows, halted, reason) where rows = [(num, val, ok, reason)]."""
+    rows = []
+    halted, reason = False, None
     for pair in seq.split(","):
         if "=" not in pair:
             continue
         num, val = pair.split("=", 1)
         num, val = num.strip(), val.strip()
-        res = driver.headsdown_type(num, val, reopen=reopen, method=method)
-        typed.append((num, val, res.get("ok")))
-        time.sleep(0.25)
-    driver.press(["Enter"])  # commit the last field (values are typed without a trailing Enter)
-    return typed
+        res = driver.headsdown_type(num, val, method=method)
+        rows.append((num, val, bool(res.get("ok")), res.get("reason")))
+        if not res.get("ok"):
+            halted, reason = True, res.get("reason")
+            break
+    # Commit the last field ONLY if every field landed AND no dialog is up — never press
+    # Enter over a corrupted/halted state.
+    if not halted and driver._detect_unexpected_dialog() is None:
+        driver.press(["Enter"])
+    return rows, halted, reason
+
+
+def _print_seq_outcome(rows, halted, reason) -> int:
+    """Print the per-field result of a heads-down --seq run and return an exit code.
+    Every field either landed (ok, verified) or the batch HALTed cleanly at the first
+    failure — there is no silent cascade."""
+    print("\nPer-field result (verified):")
+    for num, val, ok, why in rows:
+        mark = "OK " if ok else "HALT"
+        extra = "" if ok else f"   <-- {why}"
+        print(f"  [{mark}] field {num:<3} = {val!r}{extra}")
+    if halted:
+        print(f"\nSTOP — human needed. The batch halted BEFORE mis-entering: {reason}")
+        print("Nothing was committed past the failure (no trailing Enter). Review Drake,")
+        print("then we adjust. A clean halt is the design working — not a cascade.")
+        return 2
+    print("\nAll fields entered and verified by number — no cascade, no error dialog.")
+    return 0
 
 
 def cmd_headsdown(args) -> int:
     """
     THE precision path: address Drake fields BY NUMBER via heads-down data entry — no
-    pixel clicks. Heads-down here is a one-shot JUMP popup (Ctrl+N -> "enter field number"
-    -> number+Enter jumps the caret -> type value), so --seq re-opens the prompt before
-    each field. Needs one active caret to bootstrap: --manual (you click a field first) is
-    the confirmed-working path; the auto path opens the screen by code but a code-opened
-    screen may not leave an active caret (then Ctrl+N no-ops — use --manual). With no --seq
-    it just toggles Ctrl+N and screenshots so you can read the field numbers off the PNG.
-    Internal proof only; never files.
+    pixel clicks, RACE-FREE and VERIFIED. Each field: focus the popup's real edit box,
+    read the number back before pressing Enter, prove the jump, then type the value on the
+    canvas — HALTing on any anomaly instead of cascading. Needs one active caret to
+    bootstrap: --manual (you click a field first) is the confirmed path; the auto path
+    opens the screen by code but may not leave an active caret (then Ctrl+N no-ops — use
+    --manual). With no --seq it just opens the popup + screenshots so you can read the
+    field numbers off the PNG. Internal proof only; never files.
     """
     import time
-    reopen = not args.no_reopen
     driver = DrakeDriver(load_binding(args.binding))
     driver.connect()
     wi = driver.window_info()
     print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
+    if driver.w32 is None:
+        print("  ⚠ could not open the win32 popup connection — heads-down entry needs it.")
 
-    # --manual: YOU click a field first (active caret), the agent only drives Ctrl+N +
-    # field numbers. No open_screen, no agent foreground — your click owns the focus. This
-    # is the proven path (a code-opened screen may not leave an active caret for Ctrl+N).
+    # --manual: YOU click a field first (active caret), the agent drives the popup. No
+    # open_screen, no agent foreground — your click owns the focus. The proven bootstrap.
     if args.manual:
         print("\nMANUAL-FOCUS — click into any Drake W-2 field NOW so its cursor is blinking")
         print("(an ACTIVE caret), then take your hands off the keyboard.")
@@ -280,21 +308,16 @@ def cmd_headsdown(args) -> int:
             time.sleep(1)
         print()
         if args.seq:
-            typed = _headsdown_run_seq(driver, args.seq, method=args.toggle_method, reopen=reopen)
-            print(f"entered by field number (reopen={reopen}): {typed}")
-        else:
-            r = driver.headsdown_toggle(method=args.toggle_method)
-            print(f"headsdown_toggle -> {json.dumps(r)}")
+            rows, halted, reason = _headsdown_run_seq(driver, args.seq, method=args.toggle_method)
+            code = _print_seq_outcome(rows, halted, reason)
+            s = driver.save_screenshot(args.shot)
+            print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
+            return code
+        r = driver.headsdown_toggle(method=args.toggle_method)
+        print(f"headsdown_toggle -> {json.dumps(r)}")
         s = driver.save_screenshot(args.shot)
         print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
-        print("\nVERDICT — tell me:")
-        if args.seq:
-            print("  each value in its RIGHT box -> heads-down entry works; precision solved.")
-            print("  any cascaded/wrong -> tell me which number got what; likely a timing or")
-            print("     reopen tweak (try --no-reopen to compare).")
-        else:
-            print("  numbers appeared -> read me the number on each field you care about.")
-            print("  nothing -> try --toggle-method vkhold, then pywinauto.")
+        print("\nVERDICT: numbers appeared -> read me the number on each field you care about.")
         return 0
 
     print(f"Opening screen {args.screen!r} by code (Selector — no mouse)…")
@@ -304,28 +327,49 @@ def cmd_headsdown(args) -> int:
         return 1
     time.sleep(args.settle)
     if args.seq:
-        print(f"Entering values BY FIELD NUMBER (method={args.toggle_method}, reopen={reopen})…")
-        typed = _headsdown_run_seq(driver, args.seq, method=args.toggle_method, reopen=reopen)
-        print(f"entered by field number: {typed}")
-    else:
-        print(f"Toggling HEADS-DOWN (Ctrl+N, method={args.toggle_method}) — a NUMBER should appear…")
-        r = driver.headsdown_toggle(method=args.toggle_method)
-        if not r.get("ok"):
-            print(f"headsdown toggle failed: {r.get('error')}", file=sys.stderr)
-            return 1
+        print(f"Entering values BY FIELD NUMBER (method={args.toggle_method})…")
+        rows, halted, reason = _headsdown_run_seq(driver, args.seq, method=args.toggle_method)
+        code = _print_seq_outcome(rows, halted, reason)
+        s = driver.save_screenshot(args.shot)
+        print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
+        if halted and "did not open" in (reason or ""):
+            print("(A code-opened screen may not leave an active caret to bootstrap Ctrl+N — use --manual.)")
+        return code
+    print(f"Toggling HEADS-DOWN (Ctrl+N, method={args.toggle_method}) — a NUMBER should appear…")
+    r = driver.headsdown_toggle(method=args.toggle_method)
     time.sleep(args.settle)
     s = driver.save_screenshot(args.shot)
     print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
-    print("\nVERDICT — tell me:")
-    if not args.seq:
-        print("  1) did Ctrl+N make a NUMBER appear on each field? (heads-down works)")
-        print("  2) read me the number shown on each field. NB: if a code-opened screen")
-        print("     leaves no active caret, Ctrl+N no-ops here — use --manual (click first).")
-    else:
-        print("  1) did each value land in the RIGHT field (by its number)?")
-        print("  2) any that missed -> tell me which number went where. If nothing landed,")
-        print("     the code-opened screen had no active caret to bootstrap — use --manual.")
+    print("\nVERDICT: numbers appeared -> read me the field numbers. Nothing? a code-opened")
+    print("screen may leave no active caret for Ctrl+N — use --manual (click first).")
     return 0
+
+
+def cmd_probe_popup(args) -> int:
+    """READ-ONLY diagnostic that dumps the heads-down popup's real control tree, tests a
+    set_edit_text round-trip, and reports whether the popup closes after Enter (value ->
+    canvas) or persists (value -> popup). Run this ONCE first: it locks in the exact edit
+    control + model so the entry driver binds correctly. Writes no field value."""
+    import time
+    driver = DrakeDriver(load_binding(args.binding))
+    driver.connect()
+    wi = driver.window_info()
+    print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
+    print(f"win32 popup connection: {'OK' if driver.w32 is not None else 'FAILED'}")
+    print("\nCLICK into any Drake W-2 field so its cursor is blinking, then hands off.")
+    print("Probing in ", end="", flush=True)
+    for n in range(max(1, args.delay), 0, -1):
+        print(f"{n}… ", end="", flush=True)
+        time.sleep(1)
+    print()
+    res = driver.probe_headsdown_popup()
+    print("\n===== HEADS-DOWN POPUP PROBE =====")
+    print(json.dumps(res, indent=2, default=str))
+    print("==================================")
+    print("\nPaste this whole block back. It tells me the popup's edit class, whether the")
+    print("number round-trips, and whether the popup closes after Enter (the two things")
+    print("that decide the exact entry loop).")
+    return 0 if res.get("ok") else 2
 
 
 def _values_match(got, exp) -> bool:
@@ -459,7 +503,8 @@ def main() -> int:
     scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
     sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.add_argument("--grid", action="store_true", help="overlay a labeled pixel grid to read click_xy/ocr_box coordinates by eye"); sst.set_defaults(func=cmd_shoot)
     stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click; a COMMA-separated list cascades through fields (e.g. 11111,22222,33333)"); stt.add_argument("--click-xy", dest="click_xy", help="AGENT clicks this window-relative x,y first (e.g. 420,180), then types — diagnoses whether the programmatic click lands"); stt.add_argument("--advance", default="", help="key pressed between values when --text is a list, e.g. ENTER (default) or TAB"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
-    shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "1=12-3456789,2=ACME,3=52000"'); shd.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected: scancode (low-level hardware keys, default/best for Drake), vkhold (pywinauto Ctrl-held), pywinauto (high-level ^n)"); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.6, help="seconds to wait after open and after Ctrl+N"); shd.add_argument("--manual", action="store_true", help="YOU click a field first (active caret), then the agent drives heads-down by number — the confirmed-working bootstrap"); shd.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before entry fires, in --manual mode"); shd.add_argument("--no-reopen", dest="no_reopen", action="store_true", help="do NOT re-open the heads-down prompt (Ctrl+N) before each field — for comparing against the per-field-reopen default this build needs"); shd.set_defaults(func=cmd_headsdown)
+    shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "1=12-3456789,2=ACME,3=52000"'); shd.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected: scancode (low-level hardware keys, default/best for Drake), vkhold (pywinauto Ctrl-held), pywinauto (high-level ^n)"); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.6, help="seconds to wait after open and after Ctrl+N"); shd.add_argument("--manual", action="store_true", help="YOU click a field first (active caret), then the agent drives heads-down by number — the confirmed-working bootstrap"); shd.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before entry fires, in --manual mode"); shd.set_defaults(func=cmd_headsdown)
+    spp = sub.add_parser("probe-popup", parents=[common]); spp.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the read-only probe runs"); spp.set_defaults(func=cmd_probe_popup)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)
