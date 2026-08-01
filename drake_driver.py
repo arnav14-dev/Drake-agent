@@ -259,11 +259,14 @@ class DrakeDriver:
 
     def focus(self, target: dict) -> dict:
         """
-        Plant a caret in the field. On Drake's custom canvas the ONLY reliable way is a
-        physical mouse click at the field's window-relative point (UIA/win32 expose no
-        field element, and the heads-down toggle is a Ctrl chord that breaks focus). So:
-        click_xy (preferred) -> center of ocr_box -> field_no/tab_index (keyboard, for
-        builds where that works) -> unbound. NB: no Ctrl chords here anymore.
+        Plant a caret in the field. Precedence today: automation_id -> click_xy ->
+        ocr_box center -> field_no (heads-down, by field NUMBER) -> tab_index.
+        On Drake's custom canvas UIA/win32 expose no field element, so targeting is
+        either a physical click at the field's point OR Drake's own heads-down field
+        addressing (Ctrl+N + number) — the latter is coordinate/DPI-immune and, once
+        confirmed on the VM, becomes the PRIMARY path over click_xy (see PRECISION-PLAN.md).
+        NB: Ctrl+A / Ctrl+C (clipboard) ARE toxic on the canvas; Ctrl+N (the heads-down
+        mode toggle) is Drake's own documented hotkey and is a different thing entirely.
         """
         screen, field = target["screen"], target["field"]
         try:
@@ -280,9 +283,11 @@ class DrakeDriver:
                 self.win.click_input(coords=(int(click[0]), int(click[1])))
                 return {"ok": True}
             if fb.get("field_no") is not None:
-                # Heads-down jump. The toggle default is now "" (empty) — the old "^n"
-                # was a Ctrl chord that breaks Drake focus; set it in binding only if a
-                # build genuinely needs a non-Ctrl toggle.
+                # Heads-down jump: address the field by its NUMBER — Drake's own
+                # coordinate-free targeting. The toggle defaults to Ctrl+N (Drake's
+                # documented mode hotkey; NOT one of the toxic clipboard chords). If a
+                # field is being entered while already in heads-down mode, set the binding
+                # toggle to "" so we don't flip the mode back off per field.
                 tog = self.nav.get("headsdown_toggle", "")
                 if tog:
                     self._keys(tog)
@@ -294,6 +299,42 @@ class DrakeDriver:
             return {"ok": False,
                     "error": f"{screen}/{field} is not bound — set click_xy or ocr_box "
                              f"(preferred) / field_no / tab_index in binding.json"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def headsdown_toggle(self) -> dict:
+        """Toggle Drake's HEADS-DOWN data entry (Ctrl+N by default). In heads-down mode
+        every field displays a stable NUMBER; you address a field by typing its number, so
+        NO pixel click is needed — this is Drake's own coordinate-free field addressing,
+        immune to DPI / resolution / window position (the exact thing our fragile click_xy
+        is not). The on-screen numbers double as an OCR read-back anchor.
+
+        Ctrl+N is Drake's documented mode hotkey — categorically different from the toxic
+        clipboard chords Ctrl+A / Ctrl+C. Whether it disturbs the canvas caret on a given
+        build is precisely what the `headsdown` VM test checks (see PRECISION-PLAN.md §6).
+        """
+        try:
+            if self.dry_run:
+                print("[dry-run] headsdown toggle (Ctrl+N)")
+                return {"ok": True}
+            self._keys(self.nav.get("headsdown_toggle") or "^n")
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def headsdown_type(self, field_no, value) -> dict:
+        """Enter one value BY FIELD NUMBER while in heads-down mode: type the field number
+        + Enter (caret jumps to that exact field), type the value, commit with Enter (Drake
+        returns to the field-number prompt). Coordinate-free — no click, no pixel math.
+        Assumes heads-down mode is already ON (call headsdown_toggle() once first)."""
+        try:
+            if self.dry_run:
+                print(f"[dry-run] headsdown field {field_no} = {value!r}")
+                return {"ok": True}
+            self._keys(str(field_no) + self.nav.get("headsdown_jump_suffix", "{ENTER}"))
+            self._keys(_escape_keys(str(value)))
+            self._keys(self.nav.get("field_commit", "{ENTER}"))
+            return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 

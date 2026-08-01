@@ -22,6 +22,10 @@ Modes (run in this order the first time):
   typetest   Proof that the robot can TYPE into Drake: you click a field, the agent types
              a value with genuine foreground synthetic keystrokes (Juno's technique). Run
              this first — it isolates "do our keys land?" from field-map calibration.
+  headsdown  THE precision test: address Drake fields BY NUMBER with NO mouse click.
+             Opens a screen by code, toggles heads-down (Ctrl+N) so every field shows a
+             stable number, screenshots it. With --seq "N=value,..." it types each value
+             into field N by number — coordinate-free, DPI-immune (see PRECISION-PLAN.md).
   calibrate  Same control dump, formatted to help you fill binding.json (logical field →
              automation_id / field_no / tab_index).
   selftest   Run a local plan file (a list of protocol commands) against Drake and print
@@ -226,6 +230,59 @@ def cmd_typetest(args) -> int:
     return 0
 
 
+def cmd_headsdown(args) -> int:
+    """
+    THE pivotal precision test: address Drake fields BY NUMBER, with NO mouse click —
+    Drake's own heads-down data entry. Opens the screen by code, toggles heads-down
+    (Ctrl+N) so every field shows a stable NUMBER, and screenshots it so you can read
+    those numbers. With --seq "N=value,..." it then types each value into field N by its
+    number — zero pixels, DPI-immune. This is the coordinate-free path meant to REPLACE
+    fragile click_xy as our primary targeting. Internal proof only; never files.
+    """
+    import time
+    driver = DrakeDriver(load_binding(args.binding))
+    driver.connect()
+    wi = driver.window_info()
+    print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
+    print(f"Opening screen {args.screen!r} by code (Selector — no mouse)…")
+    r = driver.open_screen(args.screen)
+    if not r.get("ok"):
+        print(f"open_screen failed: {r.get('error')}", file=sys.stderr)
+        return 1
+    time.sleep(args.settle)
+    print("Toggling HEADS-DOWN (Ctrl+N) — a field NUMBER should appear on every box…")
+    r = driver.headsdown_toggle()
+    if not r.get("ok"):
+        print(f"headsdown toggle failed: {r.get('error')}", file=sys.stderr)
+        return 1
+    time.sleep(args.settle)
+    typed = []
+    if args.seq:
+        for pair in args.seq.split(","):
+            if "=" not in pair:
+                continue
+            num, val = pair.split("=", 1)
+            num, val = num.strip(), val.strip()
+            driver.headsdown_type(num, val)
+            typed.append((num, val))
+            time.sleep(0.2)
+        print(f"Typed by field number, no click: {typed}")
+    s = driver.save_screenshot(args.shot)
+    print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
+    print("\nVERDICT — tell me:")
+    if not args.seq:
+        print("  1) did Ctrl+N make a NUMBER appear on each field? (heads-down works)")
+        print("  2) read me the number shown on: employer EIN, employer name, box 1 wages,")
+        print("     box 2 fed w/h. Those 4 numbers let us drive every field with ZERO pixels.")
+        print("  no numbers / caret vanished -> Ctrl+N unusable on this build; we fall back")
+        print("     to Ctrl+Home + Enter-order. Tell me which and I adjust.")
+    else:
+        print("  1) did each value land in the RIGHT field (by its number)?")
+        print("  2) any that missed -> tell me which number went where.")
+        print("  all correct -> pixel clicking is retired; heads-down is our precise path.")
+    return 0
+
+
 def _values_match(got, exp) -> bool:
     """Compare a read-back to the expected value, tolerant of OCR/format noise:
     '$52,000' == '52000', '12-3456789' == '123456789'. Alphanumerics only, case-fold."""
@@ -330,9 +387,16 @@ def _set_dpi_aware() -> None:
     try:
         import ctypes
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE (Win 8.1+)
+            # PER_MONITOR_AWARE_V2 (Win10 1703+): the strongest awareness. Screenshots,
+            # window rects, GetCursorPos and click coords ALL share one physical-pixel
+            # space, so a screenshot pixel IS a click pixel — no 125%/150% scaling drift
+            # (the "agent clicks empty space, nothing types" symptom), no LOGPIXELS fudge.
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
         except Exception:
-            ctypes.windll.user32.SetProcessDPIAware()  # fallback (Vista+)
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor v1 (Win 8.1+)
+            except Exception:
+                ctypes.windll.user32.SetProcessDPIAware()  # system aware (Vista+)
     except Exception:
         pass
 
@@ -350,6 +414,7 @@ def main() -> int:
     scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
     sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.add_argument("--grid", action="store_true", help="overlay a labeled pixel grid to read click_xy/ocr_box coordinates by eye"); sst.set_defaults(func=cmd_shoot)
     stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click; a COMMA-separated list cascades through fields (e.g. 11111,22222,33333)"); stt.add_argument("--click-xy", dest="click_xy", help="AGENT clicks this window-relative x,y first (e.g. 420,180), then types — diagnoses whether the programmatic click lands"); stt.add_argument("--advance", default="", help="key pressed between values when --text is a list, e.g. ENTER (default) or TAB"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
+    shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "1=12-3456789,2=ACME,3=52000"'); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.4, help="seconds to wait after open and after Ctrl+N"); shd.set_defaults(func=cmd_headsdown)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)
