@@ -302,23 +302,56 @@ class DrakeDriver:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def headsdown_toggle(self) -> dict:
-        """Toggle Drake's HEADS-DOWN data entry (Ctrl+N by default). In heads-down mode
-        every field displays a stable NUMBER; you address a field by typing its number, so
-        NO pixel click is needed — this is Drake's own coordinate-free field addressing,
-        immune to DPI / resolution / window position (the exact thing our fragile click_xy
-        is not). The on-screen numbers double as an OCR read-back anchor.
+    def _send_key_chord(self, vks) -> None:
+        """Press a chord of virtual-key codes as low-level SCAN-CODE key events (all keys
+        down in order, then all up in reverse, with a hold pause between) — mirroring a
+        real hardware keypress. DOS/legacy-heritage apps like Drake register modifier
+        chords (Ctrl+N) far more reliably this way than via pywinauto's high-level '^n',
+        which fires the combo too fast/loose and Drake drops it (the same class of problem
+        as literal typing needing vk_packet=False — this is the chord equivalent).
+        Windows-only; keybd_event with KEYEVENTF_SCANCODE is the same injection path that
+        made typing land. vks e.g. [0x11, 0x4E] = Ctrl+N."""
+        import ctypes, time
+        user32 = ctypes.windll.user32
+        KEYEVENTF_SCANCODE, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC = 0x0008, 0x0002, 0
+        hold = max(self.key_pause, 0.03)
+        def _scan(vk):
+            return user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
+        for vk in vks:  # press down in order (modifier first)
+            user32.keybd_event(0, _scan(vk), KEYEVENTF_SCANCODE, 0)
+            time.sleep(hold)
+        for vk in reversed(vks):  # release in reverse (modifier last)
+            user32.keybd_event(0, _scan(vk), KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, 0)
+            time.sleep(hold)
+
+    def headsdown_toggle(self, method: str = "scancode") -> dict:
+        """Toggle Drake's HEADS-DOWN data entry (Ctrl+N). In heads-down mode every field
+        displays a stable NUMBER; you address a field by typing its number, so NO pixel
+        click is needed — Drake's own coordinate-free field addressing, immune to DPI /
+        resolution / window position (the exact thing our fragile click_xy is not). The
+        on-screen numbers double as an OCR read-back anchor.
 
         Ctrl+N is Drake's documented mode hotkey — categorically different from the toxic
-        clipboard chords Ctrl+A / Ctrl+C. Whether it disturbs the canvas caret on a given
-        build is precisely what the `headsdown` VM test checks (see PRECISION-PLAN.md §6).
+        clipboard chords Ctrl+A / Ctrl+C.
+
+        method = how Ctrl+N is injected (legacy apps are picky about modifier chords):
+          "scancode"  low-level hardware scan-code down/up via keybd_event — mimics a real
+                      keypress, holds Ctrl while N is pressed. MOST RELIABLE for Drake; the
+                      default, and what to use when high-level '^n' does nothing.
+          "vkhold"    pywinauto explicit {VK_CONTROL down}n{VK_CONTROL up} (Ctrl held).
+          "pywinauto" pywinauto high-level '^n' (fast; Drake ignored it in testing).
         """
         try:
             if self.dry_run:
-                print("[dry-run] headsdown toggle (Ctrl+N)")
-                return {"ok": True}
-            self._keys(self.nav.get("headsdown_toggle") or "^n")
-            return {"ok": True}
+                print(f"[dry-run] headsdown toggle (Ctrl+N, method={method})")
+                return {"ok": True, "method": method}
+            if method == "scancode":
+                self._send_key_chord([0x11, 0x4E])  # VK_CONTROL, VK_N
+            elif method == "vkhold":
+                self._keys("{VK_CONTROL down}n{VK_CONTROL up}")
+            else:
+                self._keys(self.nav.get("headsdown_toggle") or "^n")
+            return {"ok": True, "method": method}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 

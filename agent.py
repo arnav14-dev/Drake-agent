@@ -250,8 +250,8 @@ def cmd_headsdown(args) -> int:
         print(f"open_screen failed: {r.get('error')}", file=sys.stderr)
         return 1
     time.sleep(args.settle)
-    print("Toggling HEADS-DOWN (Ctrl+N) — a field NUMBER should appear on every box…")
-    r = driver.headsdown_toggle()
+    print(f"Toggling HEADS-DOWN (Ctrl+N, method={args.toggle_method}) — a NUMBER should appear on every box…")
+    r = driver.headsdown_toggle(method=args.toggle_method)
     if not r.get("ok"):
         print(f"headsdown toggle failed: {r.get('error')}", file=sys.stderr)
         return 1
@@ -274,8 +274,11 @@ def cmd_headsdown(args) -> int:
         print("  1) did Ctrl+N make a NUMBER appear on each field? (heads-down works)")
         print("  2) read me the number shown on: employer EIN, employer name, box 1 wages,")
         print("     box 2 fed w/h. Those 4 numbers let us drive every field with ZERO pixels.")
-        print("  no numbers / caret vanished -> Ctrl+N unusable on this build; we fall back")
-        print("     to Ctrl+Home + Enter-order. Tell me which and I adjust.")
+        print("  NO numbers appeared -> the synthetic Ctrl+N didn't register. Retry with a")
+        print("     different injection method, in this order:")
+        print("       --toggle-method vkhold        (pywinauto Ctrl-held)")
+        print("       --toggle-method pywinauto     (high-level ^n)")
+        print("     (default is 'scancode' = low-level hardware keys, usually the best.)")
     else:
         print("  1) did each value land in the RIGHT field (by its number)?")
         print("  2) any that missed -> tell me which number went where.")
@@ -414,7 +417,7 @@ def main() -> int:
     scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
     sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.add_argument("--grid", action="store_true", help="overlay a labeled pixel grid to read click_xy/ocr_box coordinates by eye"); sst.set_defaults(func=cmd_shoot)
     stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click; a COMMA-separated list cascades through fields (e.g. 11111,22222,33333)"); stt.add_argument("--click-xy", dest="click_xy", help="AGENT clicks this window-relative x,y first (e.g. 420,180), then types — diagnoses whether the programmatic click lands"); stt.add_argument("--advance", default="", help="key pressed between values when --text is a list, e.g. ENTER (default) or TAB"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
-    shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "1=12-3456789,2=ACME,3=52000"'); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.4, help="seconds to wait after open and after Ctrl+N"); shd.set_defaults(func=cmd_headsdown)
+    shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "1=12-3456789,2=ACME,3=52000"'); shd.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected: scancode (low-level hardware keys, default/best for Drake), vkhold (pywinauto Ctrl-held), pywinauto (high-level ^n)"); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.6, help="seconds to wait after open and after Ctrl+N"); shd.set_defaults(func=cmd_headsdown)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)
