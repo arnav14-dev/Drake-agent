@@ -244,6 +244,39 @@ def cmd_headsdown(args) -> int:
     driver.connect()
     wi = driver.window_info()
     print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
+
+    # MANUAL-FOCUS ISOLATION TEST: does Ctrl+N work when a field is ALREADY active?
+    # (Opening a screen by code may not leave a blinking caret — and heads-down toggles
+    # the field you're IN, so with no active field Ctrl+N no-ops. You click first, exactly
+    # like the typing test that worked; the agent only fires Ctrl+N.) No open_screen, no
+    # agent foreground — your click owns the focus.
+    if args.manual:
+        print("\nMANUAL-FOCUS TEST — click into any Drake W-2 field NOW so its cursor is")
+        print("blinking (an ACTIVE caret), then leave it. Do NOT touch the keyboard.")
+        print(f"Agent fires Ctrl+N (method={args.toggle_method}) in ", end="", flush=True)
+        for n in range(max(1, args.delay), 0, -1):
+            print(f"{n}… ", end="", flush=True)
+            time.sleep(1)
+        print()
+        r = driver.headsdown_toggle(method=args.toggle_method)
+        print(f"headsdown_toggle -> {json.dumps(r)}")
+        if args.seq:
+            for pair in args.seq.split(","):
+                if "=" not in pair:
+                    continue
+                num, val = pair.split("=", 1)
+                driver.headsdown_type(num.strip(), val.strip())
+                time.sleep(0.2)
+            print("typed the --seq values by field number")
+        s = driver.save_screenshot(args.shot)
+        print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
+        print("\nVERDICT — tell me:")
+        print("  numbers appeared -> Ctrl+N works once a field is ACTIVE; open-screen just")
+        print("     doesn't leave one. Fix = plant a caret before Ctrl+N (one keystroke/click).")
+        print("  still nothing -> synthetic Ctrl+N is rejected no matter what; we pivot to a")
+        print("     persistent heads-down SETTING in Drake, or Ctrl+Home + Enter-order.")
+        return 0
+
     print(f"Opening screen {args.screen!r} by code (Selector — no mouse)…")
     r = driver.open_screen(args.screen)
     if not r.get("ok"):
@@ -417,7 +450,7 @@ def main() -> int:
     scl = sub.add_parser("clip", parents=[common]); scl.add_argument("--delay", type=int, default=5, help="seconds to click into a Drake field before the copy fires"); scl.set_defaults(func=cmd_clip)
     sst = sub.add_parser("shoot", parents=[common]); sst.add_argument("--out", default="drake.png", help="where to save the window PNG"); sst.add_argument("--grid", action="store_true", help="overlay a labeled pixel grid to read click_xy/ocr_box coordinates by eye"); sst.set_defaults(func=cmd_shoot)
     stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click; a COMMA-separated list cascades through fields (e.g. 11111,22222,33333)"); stt.add_argument("--click-xy", dest="click_xy", help="AGENT clicks this window-relative x,y first (e.g. 420,180), then types — diagnoses whether the programmatic click lands"); stt.add_argument("--advance", default="", help="key pressed between values when --text is a list, e.g. ENTER (default) or TAB"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
-    shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "1=12-3456789,2=ACME,3=52000"'); shd.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected: scancode (low-level hardware keys, default/best for Drake), vkhold (pywinauto Ctrl-held), pywinauto (high-level ^n)"); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.6, help="seconds to wait after open and after Ctrl+N"); shd.set_defaults(func=cmd_headsdown)
+    shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "1=12-3456789,2=ACME,3=52000"'); shd.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected: scancode (low-level hardware keys, default/best for Drake), vkhold (pywinauto Ctrl-held), pywinauto (high-level ^n)"); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.6, help="seconds to wait after open and after Ctrl+N"); shd.add_argument("--manual", action="store_true", help="isolation test: skip open-screen; YOU click a field first, then the agent fires Ctrl+N (proves whether Ctrl+N needs an already-active caret)"); shd.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before Ctrl+N fires, in --manual mode"); shd.set_defaults(func=cmd_headsdown)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)
