@@ -144,12 +144,14 @@ class SimDriver(DrakeDriver):
     def __init__(self, fake: FakeDrake):
         super().__init__({"navigation": {}, "capabilities": {}})
         self.fake = fake
-        self.main_hwnd = MAIN_HWND
         # A real-enough win32 connection: _ensure_popup_open and _find_headsdown_popup run
         # UNMODIFIED against it (window() -> spec, spec.exists()/.wait()), so the retry
         # logic under test is the production one rather than a stub.
         self.w32 = _FakeW32(fake)
         self.win = _FakeWin()
+        # None so _window_alive skips its Windows-only ctypes IsWindow branch and exercises
+        # the wrapper probe instead — a real hwnd here would be bogus on a real Windows box.
+        self.main_hwnd = None
 
     def _keys(self, chord: str):
         if chord == "{ENTER}":
@@ -186,7 +188,23 @@ def _unescape(s: str) -> str:
 
 
 class _FakeWin:
-    def exists(self):
+    """Drake's main frame as pywinauto actually hands it back: a RESOLVED WRAPPER.
+
+    Deliberately has NO `exists()`. A real UIAWrapper doesn't have one — `exists()` lives
+    on WindowSpecification, the un-resolved query object — and an earlier version of this
+    fake DID provide it, which made the suite pass while the live run died at field 4 with
+    AttributeError. A fake that is more permissive than the real API hides exactly the bugs
+    it exists to catch, so: model the real object model, including what it LACKS.
+
+    No `handle` either, so _window_alive falls through to the is_visible() probe and that
+    path gets exercised on any OS (the ctypes IsWindow branch is Windows-only)."""
+
+    def __init__(self):
+        self.closed = False
+
+    def is_visible(self):
+        if self.closed:
+            raise RuntimeError("window is destroyed")  # what a dead wrapper does
         return True
 
 
@@ -297,6 +315,29 @@ def run_halt_case(name, model, seq, expect_halt_at):
     return ok
 
 
+def run_window_closed_case():
+    """Drake disappearing mid-batch must HALT on the next field, not keep typing into
+    nothing. This also covers the live AttributeError that killed the first VM run:
+    _window_alive replaced `self.win.exists()`, which does not exist on a resolved
+    UIAWrapper."""
+    fake = FakeDrake(model="per-jump", autoadvance_from=None)
+    fake.canvas_focus = 4
+    drake_driver._safe_read_edit = lambda h: fake.popup_text.strip()
+    drv = SimDriver(fake)
+
+    first = drv.headsdown_type("4", "123456789")
+    drv.win.closed = True  # user closed Drake / it crashed
+    second = drv.headsdown_type("5", "TEST EMPLOYER LLC")
+
+    ok = bool(first.get("ok")) and not second.get("ok") and second.get("halt")
+    print(f"\n{'PASS' if ok else 'FAIL'}  Drake closing mid-batch HALTs cleanly  [model=per-jump]")
+    print(f"  field 4 -> ok={first.get('ok')}; after close, field 5 -> "
+          f"halt={second.get('halt')} ({second.get('reason')})")
+    if not ok and first.get("reason"):
+        print(f"  field 4 unexpectedly failed: {first.get('reason')}")
+    return ok
+
+
 def main() -> int:
     # The EXACT sequence that cascaded on the VM: EIN, name, then boxes 1-6.
     seq = [("4", "123456789"), ("5", "TEST EMPLOYER LLC"), ("23", "52000"),
@@ -317,6 +358,7 @@ def main() -> int:
         run_case("no auto-advance at all", "per-jump", seq, expected, autoadvance_from=None),
         run_halt_case("invalid field number HALTs, does not cascade", "per-jump",
                       [("4", "123456789"), ("999", "NOPE"), ("23", "52000")], "999"),
+        run_window_closed_case(),
     ]
     print("\n" + "=" * 72)
     passed = sum(1 for r in results if r)

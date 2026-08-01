@@ -351,6 +351,32 @@ class DrakeDriver:
         except Exception:
             self.w32 = None
 
+    def _window_alive(self) -> bool:
+        """Is Drake's main frame still a live window?
+
+        NOT `self.win.exists()`: `_resolve_main_window` returns a RESOLVED WRAPPER
+        (UIAWrapper), and `exists()` only lives on WindowSpecification — the un-resolved
+        query object. Calling it on a wrapper raises AttributeError, which is what halted
+        the first live run at field 4. Ask Windows directly instead: IsWindow(hwnd) is the
+        actual question ("does this handle still refer to a window?") and it cannot be
+        confused by backend object types."""
+        hwnd = self.main_hwnd
+        if not hwnd and self.win is not None:
+            try:
+                hwnd = int(self.win.handle)
+            except Exception:
+                hwnd = None
+        if hwnd:
+            try:
+                import ctypes
+                return bool(ctypes.windll.user32.IsWindow(int(hwnd)))
+            except Exception:
+                pass  # non-Windows / no ctypes — fall through to the wrapper probe
+        try:
+            return bool(self.win.is_visible())  # raises once the window is destroyed
+        except Exception:
+            return False
+
     def _focused_hwnd(self):
         """(hwndFocus, hwndCaret, rcCaret, flags) for Drake's GUI thread — the cross-process
         truth of which control owns the keyboard/caret RIGHT NOW (no AttachThreadInput).
@@ -557,7 +583,7 @@ class DrakeDriver:
                 return {"ok": True, "field_no": field_no, "model": "dry-run"}
             import time
             # 1) app alive?
-            if self.win is None or not self.win.exists():
+            if self.win is None or not self._window_alive():
                 return {"ok": False, "halt": True, "reason": "Drake main frame vanished (app closed)"}
             # 2) unexpected/error dialog already up?
             bad = self._detect_unexpected_dialog()
