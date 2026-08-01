@@ -94,6 +94,14 @@ class DrakeDriver:
         # The heads-down popup is a real dialog window we drive directly (title + edit class).
         self.popup_title_re = self.nav.get("headsdown_popup_title_re", r"Heads.?Down Data Entry")
         self.popup_edit_class = self.nav.get("headsdown_popup_edit_class", "Edit")
+        # Structural dialog-gate state (see _detect_unexpected_dialog): windows that already
+        # exist at attach are baseline furniture (e.g. the 'Drake Software Chat' overlay) and
+        # can never halt a run by existing; windows classified benign mid-run are remembered
+        # so each is logged once, not re-litigated per field.
+        self.pid = None
+        self._baseline_hwnds: set = set()
+        self._benign_hwnds: set = set()
+        self.benign_notes: list = []
 
     # -- connection ---------------------------------------------------------
 
@@ -108,7 +116,9 @@ class DrakeDriver:
         self.app = Application(backend="uia").connect(title_re=self.title_re, timeout=20)
         self.win = self._resolve_main_window()
         self.main_hwnd = int(self.win.handle)
+        self.pid = int(self.win.element_info.process_id)
         self._connect_win32_popup()  # second connection for the heads-down dialog
+        self._snapshot_baseline()    # pre-existing windows = benign furniture, never a halt
         self._warn_if_elevation_mismatch()
         self._foreground()
 
@@ -402,33 +412,180 @@ class DrakeDriver:
         except Exception:
             return popup.child_window(control_type="Edit")
 
-    def _detect_unexpected_dialog(self):
-        """Enumerate Drake's top-level windows; allow ONLY the main frame and the heads-down
-        popup. Anything else (the 'invalid field' modal, any validation/error dialog) is an
-        anomaly → return its identity + text so the caller HALTs for a human. NEVER
-        auto-clicks / dismisses. None means all clear."""
-        if self.w32 is None:
+    def _window_snapshot(self):
+        """(top-level windows of the Drake process, is-main-frame-enabled) — the raw
+        material for the structural dialog gate. None when there is nothing real to
+        snapshot (dry-run / not connected / not Windows). SimDriver overrides this to
+        drive the gate offline."""
+        if not _WINFN or self.dry_run or self.main_hwnd is None:
             return None
-        import re as _re
         try:
-            for w in self.w32.windows():
-                try:
-                    h = int(w.handle)
-                except Exception:
-                    continue
-                if h == self.main_hwnd:
-                    continue
-                t = w.window_text() or ""
-                if _re.search(self.popup_title_re, t):
-                    continue
-                try:
-                    kids = " ".join((c.window_text() or "") for c in w.descendants())
-                except Exception:
-                    kids = ""
-                return {"title": t, "text": (t + " " + kids).strip()[:400], "handle": h}
+            pid = int(self.pid or self.win.element_info.process_id)
+            wins = _enum_toplevel_windows(pid)
+            enabled = bool(_u32().IsWindowEnabled(int(self.main_hwnd)))
+            return wins, enabled
         except Exception:
             return None
-        return None
+
+    def _snapshot_baseline(self) -> None:
+        """Record every window the Drake process ALREADY has at attach. Pre-existing
+        windows — the 'Drake Software Chat' overlay, tool panels — are Drake's normal
+        furniture: the gate only ever blocks on what APPEARS mid-run or what actually
+        takes modality away from the main frame, never on a window for existing."""
+        snap = self._window_snapshot()
+        if snap is None:
+            return
+        import re as _re
+        wins, _enabled = snap
+        self._baseline_hwnds = {int(w["hwnd"]) for w in wins}
+        extras = [w for w in wins
+                  if int(w["hwnd"]) != int(self.main_hwnd or 0)
+                  and w.get("visible")
+                  and not _re.search(self.popup_title_re, w.get("title") or "")]
+        if extras:
+            names = ", ".join(repr(w.get("title") or w.get("class_name")) for w in extras[:6])
+            print(f"  · {len(extras)} other window(s) in the Drake process at attach — "
+                  f"benign baseline, ignored unless one blocks input: {names}")
+
+    def _note_benign(self, w) -> None:
+        line = (f"ignoring benign window {w.get('title')!r} "
+                f"(class={w.get('class_name')}, hwnd={w.get('hwnd')}) — non-modal, not a dialog")
+        self.benign_notes.append(line)
+        print(f"  · {line}")
+
+    def _input_scope(self, allow_popup: bool = True):
+        """HWND-scoped keystroke gate: (ok, where). ok=True only when the FOREGROUND root
+        window — where SendInput's keys will actually land — is a legitimate Drake entry
+        surface: the bound main frame, the heads-down popup, or another BASELINE window of
+        the Drake process with a real frame size (some builds host data entry in its own
+        top-level window; the frame-size floor is what keeps the ~84x84 chat overlay out).
+        Anything else — another app, the chat window, an unknown new window — blocks the
+        keystroke. Unscoped (always ok) off-Windows and in the simulator."""
+        if not _WINFN or self.dry_run or self.main_hwnd is None:
+            return True, "unscoped"
+        try:
+            kb = _keyboard_target_info()
+            root = int(kb.get("root") or 0)
+            if root == int(self.main_hwnd):
+                return True, "main-frame"
+            if root and kb.get("root_pid") == int(self.pid or 0):
+                import re as _re
+                if allow_popup and _re.search(self.popup_title_re, kb.get("root_title") or ""):
+                    return True, "heads-down-popup"
+                if root in self._baseline_hwnds:
+                    r = _wintypes.RECT()
+                    _u32().GetWindowRect(root, _ctypes.byref(r))
+                    if ((r.right - r.left) >= self.min_main_w
+                            and (r.bottom - r.top) >= self.min_main_h):
+                        return True, "drake-frame"
+            where = kb.get("root_title") or kb.get("root_class") or hex(root)
+            return False, f"{where!r} (hwnd={root})"
+        except Exception as e:  # a scope-oracle hiccup must not brick entry — note it
+            return True, f"scope-check-unavailable: {e}"
+
+    def _detect_unexpected_dialog(self):
+        """STRUCTURAL dialog gate. Decides from a window snapshot whether something is
+        actually BLOCKING data entry — never from a title allowlist. (The old version
+        halted on ANY extra window in the process, so the always-present 'Drake Software
+        Chat' overlay killed every run at the first field.) Structure means:
+
+          • windows already present at attach (chat overlay, tool panels) are baseline —
+            benign by definition, they never halt a run by existing;
+          • a NEW dialog-class window (#32770, or an owned+captioned popup — the shape of
+            every validator/error/prompt) IS a blocker → halt;
+          • the main frame DISABLED while the heads-down popup is NOT up means a modal is
+            pumping somewhere → halt (debounced once — creation/teardown churn disables
+            the frame for a moment) — caught even if the modal can't be enumerated;
+          • anything else that appears (toasts, dropdowns, tooltips, chat expanding) is
+            benign: logged once, remembered, never a halt.
+
+        Returns the blocker {title, summary, text, handle, class, why} or None. NEVER
+        auto-clicks or dismisses anything."""
+        snap = self._window_snapshot()
+        if snap is None:
+            return None
+        wins, main_enabled = snap
+        kw = dict(popup_title_re=self.popup_title_re, main_hwnd=self.main_hwnd,
+                  baseline=self._baseline_hwnds, benign_seen=self._benign_hwnds)
+        blocker, benign_new, _pp = _classify_process_windows(wins, main_enabled=main_enabled, **kw)
+        if blocker is not None and blocker.get("why") == "main-disabled" and not blocker.get("dialogish"):
+            import time as _t
+            _t.sleep(0.12)  # weak evidence — debounce the transient disable once
+            snap = self._window_snapshot()
+            if snap is not None:
+                wins, main_enabled = snap
+                blocker, benign_new, _pp = _classify_process_windows(wins, main_enabled=main_enabled, **kw)
+        for w in benign_new:
+            self._benign_hwnds.add(int(w["hwnd"]))
+            self._note_benign(w)
+        if blocker is None:
+            return None
+        h = int(blocker.get("hwnd") or 0)
+        title = blocker.get("title")
+        text = " ".join(s for s in [title, blocker.get("_text")] if s)
+        if h and _WINFN:
+            try:
+                text = (text + " " + _window_deep_text(h)).strip()
+            except Exception:
+                pass
+        if blocker.get("why") == "main-disabled":
+            who = (f"{title!r} (class {blocker.get('class_name')})" if title
+                   else f"window not identified (visible: {blocker.get('candidates')})")
+            summary = f"main frame DISABLED by a modal — {who}"
+        else:
+            summary = f"new dialog window {title!r} (class {blocker.get('class_name')})"
+        return {"title": title, "summary": summary, "text": text[:400], "handle": h,
+                "class": blocker.get("class_name"), "why": blocker.get("why"),
+                "candidates": blocker.get("candidates")}
+
+    def dump_windows(self) -> dict:
+        """Full window topology of the Drake process + where the keyboard would land —
+        the halt-time diagnostic. Written automatically to env-dump-halt.json whenever a
+        batch halts, and on demand via `agent.py envdump`. Every top-level window carries
+        the gate's verdict (role) so a bad halt is diagnosable from the JSON alone."""
+        if not _WINFN or self.dry_run or self.win is None:
+            return {"ok": False, "error": "env dump runs on Windows with a live connection"}
+        try:
+            import re as _re
+            pid = int(self.pid or self.win.element_info.process_id)
+            wins = _enum_toplevel_windows(pid)
+            blocker, main_enabled = None, None
+            snap = self._window_snapshot()
+            if snap is not None:
+                swins, main_enabled = snap
+                blocker, _b, _p = _classify_process_windows(
+                    swins, popup_title_re=self.popup_title_re, main_hwnd=self.main_hwnd,
+                    baseline=self._baseline_hwnds, benign_seen=self._benign_hwnds,
+                    main_enabled=main_enabled)
+            for w in wins:
+                h = int(w["hwnd"])
+                if self.main_hwnd and h == int(self.main_hwnd):
+                    w["role"] = "main-frame"
+                elif _re.search(self.popup_title_re, w.get("title") or ""):
+                    w["role"] = "heads-down-popup"
+                elif not w.get("visible"):
+                    w["role"] = "hidden"
+                elif (w.get("class_name") or "") in _COSMETIC_CLASSES:
+                    w["role"] = "cosmetic"
+                elif h in self._baseline_hwnds:
+                    w["role"] = "baseline-benign"
+                elif h in self._benign_hwnds:
+                    w["role"] = "benign-seen"
+                else:
+                    w["role"] = "new"
+                w["dialogish"] = _dialogish(w)
+                if blocker and int(blocker.get("hwnd") or 0) == h:
+                    w["role"] = "BLOCKING"
+                if w.get("visible"):
+                    w["children"] = _enum_child_summaries(h)
+            return {"ok": True, "takenAt": _now(), "pid": pid,
+                    "main_hwnd": self.main_hwnd, "main_enabled": main_enabled,
+                    "baseline_hwnds": sorted(int(x) for x in self._baseline_hwnds),
+                    "keyboard_target": _keyboard_target_info(),
+                    "blocker": blocker, "benign_notes": list(self.benign_notes),
+                    "windows": wins}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def _ensure_popup_open(self, *, method: str = "scancode", timeout: float = 1.5,
                            attempts: int = 3) -> dict:
@@ -454,8 +611,15 @@ class DrakeDriver:
                 return {"ok": False, "reason": "win32 popup connection unavailable (reconnect on the VM)"}
             bad = self._detect_unexpected_dialog()
             if bad:  # never fire a chord into a modal we did not expect
-                return {"ok": False, "reason": f"unexpected dialog before Ctrl+N: {bad['title']!r}",
+                return {"ok": False, "reason": f"unexpected dialog before Ctrl+N: {bad['summary']}",
                         "dialog": bad}
+            # HWND-scoped gate: Ctrl+N is a GLOBAL chord — prove the foreground root is
+            # Drake's frame first, or the chord goes into the chat/terminal/whatever.
+            ok_scope, where = self._input_scope(allow_popup=False)
+            if not ok_scope:
+                return {"ok": False,
+                        "reason": f"refusing to send Ctrl+N — the keyboard is in {where}, "
+                                  f"not Drake's frame (click a Drake field, hands off)"}
             self.headsdown_toggle(method=method)  # Ctrl+N (scancode)
             try:
                 spec = self.w32.window(title_re=self.popup_title_re)
@@ -478,7 +642,10 @@ class DrakeDriver:
             except Exception:
                 pass
             try:
-                if self._focused_hwnd()[0] == edit_hwnd:
+                # Two proofs, both required: Drake's GUI thread focuses THIS edit, AND the
+                # foreground root is one of OUR windows (Drake-thread focus is meaningless
+                # if another app owns the foreground — SendInput would go there).
+                if self._focused_hwnd()[0] == edit_hwnd and self._input_scope(allow_popup=True)[0]:
                     return True
             except Exception:
                 pass
@@ -588,7 +755,7 @@ class DrakeDriver:
             # 2) unexpected/error dialog already up?
             bad = self._detect_unexpected_dialog()
             if bad:
-                return {"ok": False, "halt": True, "reason": f"unexpected dialog before entry: {bad['title']!r}", "dialog": bad}
+                return {"ok": False, "halt": True, "reason": f"unexpected dialog before entry: {bad['summary']}", "dialog": bad}
             # 3) idempotent + retrying popup open
             opened = self._ensure_popup_open(method=method)
             if not opened.get("ok"):
@@ -627,17 +794,31 @@ class DrakeDriver:
             model, dlg = self._classify_after_jump(eh, fn, timeout=2.5)
             if model == "error":
                 return {"ok": False, "halt": True,
-                        "reason": f"error dialog after jumping to field {fn}: {dlg['title']!r}", "dialog": dlg}
+                        "reason": f"error dialog after jumping to field {fn}: {dlg['summary']}", "dialog": dlg}
             if model == "rejected":
                 return {"ok": False, "halt": True,
                         "reason": f"Drake did not accept field number {fn} on this screen "
                                   f"(popup still showing it after Enter)"}
             committed = False
             if model == "per-jump":
-                # The caret is on the canvas field. Type the value there — global keys,
-                # vk_packet=False, NO set_focus (that would reset the canvas caret), and NO
-                # trailing Enter: the next field's jump leaves this field cleanly, and not
-                # pressing Enter is precisely what keeps a mis-detected state from cascading.
+                # The caret is on the canvas field. HWND-scoped gate first: after the popup
+                # closes the foreground root must be Drake's frame again — retried briefly
+                # (destroy/refocus transition), then HALT rather than type the value into
+                # whatever else holds the keyboard. No set_focus recovery on purpose: that
+                # would reset the canvas caret and the value would land nowhere.
+                ok_scope, where = True, ""
+                for _ in range(6):
+                    ok_scope, where = self._input_scope(allow_popup=False)
+                    if ok_scope:
+                        break
+                    time.sleep(0.05)
+                if not ok_scope:
+                    return {"ok": False, "halt": True,
+                            "reason": f"after the jump the keyboard is in {where}, "
+                                      f"not Drake — value NOT typed"}
+                # Type the value — global keys, vk_packet=False, NO trailing Enter: the next
+                # field's jump leaves this field cleanly, and not pressing Enter is precisely
+                # what keeps a mis-detected state from cascading.
                 self._keys(_escape_keys(val))
             else:  # persistent command bar — the value goes back INTO the popup, then Enter
                 popup = self._find_headsdown_popup(timeout=0.5)
@@ -675,7 +856,7 @@ class DrakeDriver:
             bad = self._detect_unexpected_dialog()
             if bad:
                 return {"ok": False, "halt": True,
-                        "reason": f"error dialog after entering field {fn}: {bad['title']!r}", "dialog": bad}
+                        "reason": f"error dialog after entering field {fn}: {bad['summary']}", "dialog": bad}
             return {"ok": True, "field_no": field_no, "model": model,
                     "value_committed": committed,
                     "popup_reopened": opened.get("opened"),
@@ -1052,6 +1233,216 @@ except Exception:  # pragma: no cover - non-Windows
     _GTI = None  # type: ignore
 
 _GUI_CARETBLINKING = 0x00000001
+
+# True only where the win32 API actually exists — ctypes.wintypes imports fine on
+# mac/linux (which is how the simulator runs), but windll does not.
+_WINFN = bool(_ctypes is not None and hasattr(_ctypes, "windll"))
+
+_WS_POPUP = 0x80000000
+_WS_CAPTION = 0x00C00000  # WS_BORDER | WS_DLGFRAME — a real titlebar
+_GA_ROOT = 2
+_GWL_STYLE = -16
+_GW_OWNER = 4
+
+# Window classes that are pure UI chrome — never data-entry-relevant, never logged:
+# tooltips, menus/dropdown lists, IME helpers, shadow/ghost effects.
+_COSMETIC_CLASSES = {"tooltips_class32", "#32768", "ComboLBox", "SysShadow",
+                     "IME", "MSCTFIME UI", "Ghost"}
+
+_U32 = None
+
+
+def _u32():
+    """user32 with HWND-returning functions given a proper restype — the default c_int
+    restype can sign-mangle handles on 64-bit, and the structural gate compares handles
+    for identity, so they must round-trip exactly."""
+    global _U32
+    if _U32 is None:
+        u = _ctypes.windll.user32
+        u.GetWindow.restype = _wintypes.HWND
+        u.GetForegroundWindow.restype = _wintypes.HWND
+        u.GetAncestor.restype = _wintypes.HWND
+        _U32 = u
+    return _U32
+
+
+def _enum_toplevel_windows(pid: int) -> list:
+    """Snapshot every top-level window of `pid`: handle, title, class, visibility,
+    enabled state, owner, style bits, rect. Raw ctypes (no pywinauto wrapping) so it is
+    fast enough to run per-field and cannot be fooled by backend quirks. Windows-only."""
+    u32 = _u32()
+    out = []
+
+    @_ctypes.WINFUNCTYPE(_wintypes.BOOL, _wintypes.HWND, _wintypes.LPARAM)
+    def _cb(hwnd, _lparam):
+        wpid = _wintypes.DWORD()
+        u32.GetWindowThreadProcessId(hwnd, _ctypes.byref(wpid))
+        if int(wpid.value) != int(pid):
+            return True
+        title = _ctypes.create_unicode_buffer(256)
+        u32.GetWindowTextW(hwnd, title, 256)
+        cls = _ctypes.create_unicode_buffer(128)
+        u32.GetClassNameW(hwnd, cls, 128)
+        r = _wintypes.RECT()
+        u32.GetWindowRect(hwnd, _ctypes.byref(r))
+        style = int(u32.GetWindowLongW(hwnd, _GWL_STYLE)) & 0xFFFFFFFF
+        out.append({
+            "hwnd": int(hwnd),
+            "title": title.value,
+            "class_name": cls.value,
+            "visible": bool(u32.IsWindowVisible(hwnd)),
+            "enabled": bool(u32.IsWindowEnabled(hwnd)),
+            "owner": int(u32.GetWindow(hwnd, _GW_OWNER) or 0),
+            "style": style,
+            "rect": [r.left, r.top, r.right - r.left, r.bottom - r.top],
+        })
+        return True
+
+    u32.EnumWindows(_cb, 0)
+    return out
+
+
+def _window_pid(hwnd) -> int:
+    pid = _wintypes.DWORD()
+    _u32().GetWindowThreadProcessId(int(hwnd), _ctypes.byref(pid))
+    return int(pid.value)
+
+
+def _keyboard_target_info() -> dict:
+    """Where a synthetic keystroke lands RIGHT NOW: the foreground root window plus the
+    focused control of the foreground THREAD — SendInput's actual destination. This is
+    the oracle behind the HWND-scoped keystroke gate. Windows-only."""
+    u32 = _u32()
+    fg = int(u32.GetForegroundWindow() or 0)
+    root = int(u32.GetAncestor(fg, _GA_ROOT) or 0) if fg else 0
+    root = root or fg
+    focus = 0
+    if fg:
+        try:
+            tid = u32.GetWindowThreadProcessId(fg, None)
+            g = _GTI()
+            g.cbSize = _ctypes.sizeof(_GTI)
+            if u32.GetGUIThreadInfo(tid, _ctypes.byref(g)) and g.hwndFocus:
+                focus = int(g.hwndFocus)
+        except Exception:
+            pass
+    title = _ctypes.create_unicode_buffer(256)
+    cls = _ctypes.create_unicode_buffer(128)
+    if root:
+        u32.GetWindowTextW(root, title, 256)
+        u32.GetClassNameW(root, cls, 128)
+    return {"foreground": fg, "root": root, "focus": focus,
+            "root_title": title.value, "root_class": cls.value,
+            "root_pid": _window_pid(root) if root else 0}
+
+
+def _enum_child_summaries(hwnd, cap: int = 64) -> list:
+    """Children of a window with class/text/rect — the message text of a dialog lives in
+    its Static children. Text via hang-safe WM_GETTEXT (300ms); capped so a huge tree
+    (the chat's embedded browser) can't stall a halt report."""
+    u32 = _u32()
+    out = []
+
+    @_ctypes.WINFUNCTYPE(_wintypes.BOOL, _wintypes.HWND, _wintypes.LPARAM)
+    def _cb(h, _lparam):
+        if len(out) >= cap:
+            return False
+        cls = _ctypes.create_unicode_buffer(128)
+        u32.GetClassNameW(h, cls, 128)
+        r = _wintypes.RECT()
+        u32.GetWindowRect(h, _ctypes.byref(r))
+        try:
+            txt = (_read_edit_text(h, timeout_ms=300) or "").strip()
+        except Exception:
+            txt = ""
+        out.append({"hwnd": int(h), "class_name": cls.value, "text": txt[:120],
+                    "visible": bool(u32.IsWindowVisible(h)),
+                    "rect": [r.left, r.top, r.right - r.left, r.bottom - r.top]})
+        return True
+
+    u32.EnumChildWindows(int(hwnd), _cb, 0)
+    return out
+
+
+def _window_deep_text(hwnd, cap: int = 40) -> str:
+    """Every child's WM_GETTEXT joined — so a halt names WHAT a dialog says, not just
+    that one exists."""
+    parts = []
+    try:
+        for c in _enum_child_summaries(hwnd, cap=cap):
+            if c.get("text"):
+                parts.append(c["text"])
+    except Exception:
+        pass
+    return " ".join(parts)
+
+
+def _dialogish(w) -> bool:
+    """Does this window have the STRUCTURE of a dialog (vs chrome/toast/overlay)?
+    #32770 is THE Windows dialog class (every MessageBox and .rc dialog). Custom popups
+    count only when they look like a framed, owned dialog: WS_POPUP + a real caption +
+    an owner. Captionless popups (dropdown lists, toasts, the chat overlay) do not."""
+    if (w.get("class_name") or "") == "#32770":
+        return True
+    style = int(w.get("style") or 0)
+    return (bool(style & _WS_POPUP)
+            and (style & _WS_CAPTION) == _WS_CAPTION
+            and bool(w.get("owner")))
+
+
+def _classify_process_windows(wins, *, popup_title_re, main_hwnd, baseline, benign_seen,
+                              main_enabled):
+    """The pure decision core of the structural dialog gate — no Windows calls, so it is
+    provable offline (simulate_headsdown.py feeds it synthetic snapshots). Given the
+    process's top-level windows, decide what (if anything) is actually BLOCKING entry:
+
+      rule 1  a NEW dialog-shaped window (not baseline, not already-benign) is a
+              validator/error/prompt → blocker, even if the main frame is still enabled;
+      rule 2  main frame DISABLED with no heads-down popup up → a modal is pumping:
+              blame a new enabled window if there is one, else an enabled dialog-shaped
+              one, else report the modality itself (never blame baseline furniture like
+              the chat overlay by name);
+      else    new non-dialog windows are benign (returned for logging), baseline windows
+              are furniture, cosmetic classes/invisible/zero-area windows are ignored.
+
+    Returns (blocker | None, benign_new, popup_present)."""
+    import re as _re
+    pat = _re.compile(popup_title_re)
+    popup_present = False
+    cands = []
+    for w in wins:
+        h = int(w.get("hwnd") or 0)
+        if main_hwnd is not None and h == int(main_hwnd):
+            continue
+        if pat.search(w.get("title") or ""):
+            popup_present = popup_present or bool(w.get("visible", True))
+            continue
+        if not w.get("visible"):
+            continue
+        r = w.get("rect") or [0, 0, 0, 0]
+        if r[2] <= 0 or r[3] <= 0:
+            continue
+        if (w.get("class_name") or "") in _COSMETIC_CLASSES:
+            continue
+        cands.append(w)
+    new = [w for w in cands
+           if int(w["hwnd"]) not in baseline and int(w["hwnd"]) not in benign_seen]
+    for w in new:  # rule 1
+        if _dialogish(w):
+            b = dict(w)
+            b["why"], b["dialogish"] = "new-dialog", True
+            return b, [], popup_present
+    if main_enabled is False and not popup_present:  # rule 2
+        for pool in ([w for w in new if w.get("enabled")],
+                     [w for w in cands if w.get("enabled") and _dialogish(w)]):
+            if pool:
+                b = dict(pool[0])
+                b["why"], b["dialogish"] = "main-disabled", _dialogish(pool[0])
+                return b, [], popup_present
+        b = {"hwnd": 0, "title": None, "class_name": None, "why": "main-disabled",
+             "dialogish": False, "candidates": [w.get("title") for w in cands]}
+        return b, [], popup_present
+    return None, new, popup_present
 
 
 def _gui_thread_info(any_hwnd):

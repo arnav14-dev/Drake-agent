@@ -30,6 +30,11 @@ Modes (run in this order the first time):
   probe-popup READ-ONLY: dump the "Heads Down Data Entry" popup's real control tree + test
              a number round-trip + report whether it closes after Enter. Run ONCE first to
              lock in the exact edit control the driver binds to. Writes no field value.
+  envdump    READ-ONLY: write the Drake process's full window topology to JSON — every
+             top-level window (class/style/owner/enabled/visible + children), where the
+             keyboard would land, and the structural dialog gate's verdict per window.
+             The halt diagnostic; also written automatically as env-dump-halt.json when
+             a heads-down batch halts.
   write-w2   THE product path: extracted W-2 JSON (the LLM's structured output) -> Drake,
              every field entered BY NUMBER through the verified heads-down loop. Run with
              --dry-run first (works on any machine, touches nothing) to review exactly which
@@ -251,6 +256,20 @@ def _parse_seq(seq: str):
     return out
 
 
+def _write_halt_dump(driver, path: str = "env-dump-halt.json") -> None:
+    """On any halt, capture the full window topology automatically — the artifact that
+    diagnoses a bad halt (which window, what class/style, who owned the keyboard) without
+    a manual env-dump round-trip. Best-effort: a dump failure never masks the halt."""
+    try:
+        dump = driver.dump_windows()
+        if dump.get("ok"):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(dump, f, indent=2, default=str)
+            print(f"  · window topology at halt -> {path} (paste this file if the halt looks wrong)")
+    except Exception:
+        pass
+
+
 def _headsdown_run(driver, entries, *, method, settle_after=0.0):
     """Enter a list of {field_no, value} BY FIELD NUMBER through the heads-down popup, using
     the race-free VERIFIED driver (per field: focus the popup edit, read the number back
@@ -267,6 +286,7 @@ def _headsdown_run(driver, entries, *, method, settle_after=0.0):
                      res.get("reason"), res.get("model")))
         if not res.get("ok"):
             halted, reason = True, res.get("reason")
+            _write_halt_dump(driver)
             break
     # Commit the final field ONLY if every field landed AND no dialog is up — never press
     # Enter over a corrupted/halted state. (In the persistent model each value was already
@@ -458,6 +478,45 @@ def cmd_probe_popup(args) -> int:
     return 0 if res.get("ok") else 2
 
 
+def cmd_envdump(args) -> int:
+    """Dump the FULL window topology of the live Drake process to JSON: every top-level
+    window with class/style/owner/enabled/visible, its children, where the keyboard would
+    land, and the structural gate's verdict (role) per window. This is the env-dump the
+    dialog gate is built on — run it whenever a halt names a window that looks benign, and
+    paste the file. --delay gives you time to arrange the state you want captured (e.g.
+    click a field and open heads-down first)."""
+    import time
+    driver = DrakeDriver(load_binding(args.binding))
+    driver.connect()
+    wi = driver.window_info()
+    print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}  (hwnd={wi.get('handle')})")
+    if args.delay:
+        print("Capturing in ", end="", flush=True)
+        for n in range(args.delay, 0, -1):
+            print(f"{n}… ", end="", flush=True)
+            time.sleep(1)
+        print()
+    dump = driver.dump_windows()
+    if not dump.get("ok"):
+        print(f"dump failed: {dump.get('error')}", file=sys.stderr)
+        return 1
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(dump, f, indent=2, default=str)
+    print(f"\nWrote {args.out}. Top-level windows of the Drake process:")
+    for w in dump["windows"]:
+        if not w.get("visible"):
+            continue
+        r = w.get("rect") or [0, 0, 0, 0]
+        print(f"  [{w.get('role', '?'):>16}] {w.get('title')!r:<48} class={w.get('class_name')}"
+              f"  {r[2]}x{r[3]}  enabled={w.get('enabled')}  dialogish={w.get('dialogish')}")
+    kt = dump.get("keyboard_target") or {}
+    print(f"\nkeyboard lands in: {kt.get('root_title')!r} (class={kt.get('root_class')}, hwnd={kt.get('root')})")
+    blocker = dump.get("blocker")
+    print(f"main frame enabled: {dump.get('main_enabled')}   "
+          f"blocker: {blocker.get('title') if blocker else 'none'}")
+    return 0
+
+
 def _values_match(got, exp) -> bool:
     """Compare a read-back to the expected value, tolerant of OCR/format noise:
     '$52,000' == '52000', '12-3456789' == '123456789'. Alphanumerics only, case-fold."""
@@ -592,6 +651,7 @@ def main() -> int:
     shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "1=12-3456789,2=ACME,3=52000"'); shd.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected: scancode (low-level hardware keys, default/best for Drake), vkhold (pywinauto Ctrl-held), pywinauto (high-level ^n)"); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.6, help="seconds to wait after open and after Ctrl+N"); shd.add_argument("--manual", action="store_true", help="YOU click a field first (active caret), then the agent drives heads-down by number — the confirmed-working bootstrap"); shd.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before entry fires, in --manual mode"); shd.set_defaults(func=cmd_headsdown)
     spp = sub.add_parser("probe-popup", parents=[common]); spp.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the read-only probe runs"); spp.set_defaults(func=cmd_probe_popup)
     sw2 = sub.add_parser("write-w2", parents=[common]); sw2.add_argument("--json", required=True, help="extracted W-2 JSON (the LLM's structured output — see w2_map.W2_SCHEMA_KEYS)"); sw2.add_argument("--dry-run", action="store_true", help="resolve and PRINT the plan without touching Drake — run this first, works anywhere"); sw2.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero (default: skip — a blank box is zero on a tax form)"); sw2.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); sw2.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field (auto-fill/validation)"); sw2.add_argument("--delay", type=int, default=10, help="seconds to click into the W-2 screen before entry fires"); sw2.add_argument("--shot", default="w2-after.png", help="screenshot saved after the run — the verification artifact"); sw2.set_defaults(func=cmd_write_w2)
+    sev = sub.add_parser("envdump", parents=[common]); sev.add_argument("--out", default="env-dump.json", help="where to write the window-topology JSON"); sev.add_argument("--delay", type=int, default=0, help="seconds before capture — time to click a field / open heads-down first"); sev.set_defaults(func=cmd_envdump)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)

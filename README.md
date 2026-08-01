@@ -266,6 +266,37 @@ never sends a keystroke it hasn't verified the destination of:
 5. Any unexpected dialog, rejected number, or read-back mismatch **HALTs** the batch. It
    never auto-dismisses a modal and never writes on past a failure.
 
+### The structural dialog gate (why 'Drake Software Chat' can't halt a run)
+
+The dialog check does **not** use a title allowlist (the old version did, and the
+always-present 'Drake Software Chat' window in the same process halted every run at the
+first field). Windows are judged by **structure**:
+
+- **Baseline**: every window the Drake process already has at attach (the chat overlay,
+  tool panels) is recorded and benign by definition — a window never halts a run by
+  *existing*.
+- **Blocking** means one of two provable states: a **new dialog-shaped window** appeared
+  (`#32770` — every MessageBox/validator — or an owned, captioned popup), or the **main
+  frame got disabled** while the heads-down popup isn't up (something modal is pumping,
+  even if it can't be enumerated; debounced once for creation/teardown churn).
+- Everything else that appears mid-run (toasts, dropdown lists, tooltips, the chat bubble
+  expanding) is **benign**: logged once, remembered, ignored.
+
+On top of that sits an **HWND-scoped keystroke gate** (`_input_scope`): before Ctrl+N and
+before typing a value on the canvas, the driver proves the *foreground root window* — the
+place `SendInput` keys actually land — is Drake's main frame (or the heads-down popup).
+If the chat window, the terminal, or anything else holds the keyboard, the batch HALTs
+with that window's name instead of typing into it.
+
+Whenever a batch halts, the full window topology is written to **`env-dump-halt.json`**
+automatically (every window's class/style/owner/enabled state, its children, where the
+keyboard was, and the gate's verdict per window) — so a wrong halt is diagnosable from
+one file, with no manual capture round-trip. The same dump is available on demand:
+
+```
+python agent.py envdump --binding binding.json --out env-dump.json --delay 5
+```
+
 **The Field-4/EIN exception** (confirmed on Drake 2025): committing the employer EIN
 fires Drake's employer lookup + auto-fill, auto-advances the caret to Box 1, and
 *swallows the next Ctrl+N*. That single eaten chord is what caused the original cascade —
@@ -282,9 +313,12 @@ python simulate_headsdown.py
 
 A fake Drake that reproduces the observed behaviours — including the Field-4 swallowed
 chord — so the state machine can be proven in a second, anywhere, before it touches a
-return. It covers both popup models, auto-advance on other fields, and that an invalid
-field number halts instead of cascading. It fakes *Drake*, not pywinauto: focus and
-window behaviour on the real thing is still VM-verified.
+return. It covers both popup models, auto-advance on other fields, that an invalid
+field number halts instead of cascading, and the structural dialog gate: **every case
+runs with the 'Drake Software Chat' window present** (the live field-4 halt), a benign
+window appearing mid-run is ignored + logged, a disabled main frame halts structurally,
+and the classifier's decision table is unit-checked. It fakes *Drake*, not pywinauto:
+focus and window behaviour on the real thing is still VM-verified.
 
 ## Files
 
