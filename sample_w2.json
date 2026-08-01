@@ -1,0 +1,37 @@
+{
+  "_about": "Example of the EXACT structured output the LLM must produce from a W-2 PDF. Key names are the contract — w2_map.W2_FIELD_MAP resolves each one to a Drake heads-down field number. Keys may be omitted or left empty; empty and zero money fields are skipped (a blank box is zero on a tax form). Any key NOT in the map is reported and ignored, never guessed at. Values may arrive formatted ('$52,000.00', '12-3456789') — sanitization is the driver's job, not the model's. TEST DATA ONLY.",
+
+  "employer_ein": "12-3456789",
+  "employer_name": "TEST EMPLOYER LLC",
+  "employer_street": "123 BUSINESS RD",
+  "employer_city": "DALLAS",
+  "employer_state": "TX",
+  "employer_zip": "75001",
+
+  "employee_ssn": "000-11-2222",
+  "employee_first_name": "JOHN",
+  "employee_last_name": "DOE",
+
+  "box1_wages": "52000.00",
+  "box2_fed_wh": "6000.00",
+  "box3_ss_wages": "52000.00",
+  "box4_ss_wh": "3224.00",
+  "box5_med_wages": "52000.00",
+  "box6_med_wh": "754.00",
+  "box7_ss_tips": "0.00",
+  "box8_alloc_tips": "0.00",
+  "box10_dep_care": "0.00",
+  "box11_nonqual": "0.00",
+
+  "box12a_code": "D",
+  "box12a_amount": "19500.00",
+
+  "box13_statutory": false,
+  "box13_retirement": true,
+  "box13_third_party_sick": false,
+
+  "box15_state": "TX",
+  "box15_state_id": "12345678",
+  "box16_state_wages": "52000.00",
+  "box17_state_wh": "0.00"
+}

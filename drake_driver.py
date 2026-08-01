@@ -404,25 +404,89 @@ class DrakeDriver:
             return None
         return None
 
-    def _ensure_popup_open(self, *, method: str = "scancode", timeout: float = 2.5) -> dict:
-        """IDEMPOTENT open of the heads-down popup. If it's already present, do NOTHING —
-        never a second Ctrl+N (that would TOGGLE the mode back off, the old bug). Else fire
-        Ctrl+N once and WAIT for the popup to become ready (readiness, not a fixed sleep).
-        Ctrl+N only registers when a canvas field is active; if it doesn't open the popup
-        we surface that as a HALT via the wait timeout (the reliable signal)."""
-        popup = self._find_headsdown_popup(timeout=0.3)
-        if popup is not None:
-            return {"ok": True, "opened": False, "popup": popup}
-        if self.w32 is None:
-            return {"ok": False, "reason": "win32 popup connection unavailable (reconnect on the VM)"}
-        self.headsdown_toggle(method=method)  # Ctrl+N (scancode)
-        try:
-            spec = self.w32.window(title_re=self.popup_title_re)
-            spec.wait("visible ready", timeout=timeout)
-            return {"ok": True, "opened": True, "popup": spec}
-        except Exception as e:
-            return {"ok": False, "reason": f"Ctrl+N did not open the heads-down popup "
-                                           f"(is a canvas field active? {e})"}
+    def _ensure_popup_open(self, *, method: str = "scancode", timeout: float = 1.5,
+                           attempts: int = 3) -> dict:
+        """IDEMPOTENT + RETRYING open of the heads-down popup.
+
+        Idempotent: presence is re-checked before EVERY Ctrl+N, so we can never toggle a
+        popup that is already open back OFF (the old double-toggle bug). That is what makes
+        retrying safe.
+
+        Retrying matters because Drake SWALLOWS a modifier chord while it is busy committing
+        a field. Confirmed case — Field 4 (employer EIN): committing the EIN fires Drake's
+        employer lookup + auto-fill and auto-advances the caret to Box 1 (field 23), and the
+        Ctrl+N we send during that work is eaten. One attempt = the popup never opens and the
+        NEXT field number types onto the canvas (the observed cascade: '5' into Box 1, then
+        each value one box further down). Retrying with a settle recovers it deterministically.
+        """
+        import time
+        for i in range(max(1, attempts)):
+            popup = self._find_headsdown_popup(timeout=0.3 if i == 0 else 0.15)
+            if popup is not None:
+                return {"ok": True, "opened": i > 0, "attempts": i, "popup": popup}
+            if self.w32 is None:
+                return {"ok": False, "reason": "win32 popup connection unavailable (reconnect on the VM)"}
+            bad = self._detect_unexpected_dialog()
+            if bad:  # never fire a chord into a modal we did not expect
+                return {"ok": False, "reason": f"unexpected dialog before Ctrl+N: {bad['title']!r}",
+                        "dialog": bad}
+            self.headsdown_toggle(method=method)  # Ctrl+N (scancode)
+            try:
+                spec = self.w32.window(title_re=self.popup_title_re)
+                spec.wait("visible ready", timeout=timeout)
+                return {"ok": True, "opened": True, "attempts": i + 1, "popup": spec}
+            except Exception:
+                time.sleep(0.25 * (i + 1))  # Drake is busy (auto-fill / commit) — let it settle
+        return {"ok": False,
+                "reason": f"Ctrl+N did not open the heads-down popup after {attempts} attempts "
+                          f"(is a canvas field active?)"}
+
+    def _focus_popup_edit(self, edit, edit_hwnd, tries: int = 6) -> bool:
+        """Give the popup's Edit real keyboard focus and PROVE it via GetGUIThreadInfo —
+        the cross-process truth of who owns the keyboard. Returns False rather than let a
+        keystroke go somewhere we did not verify."""
+        import time
+        for _ in range(tries):
+            try:
+                edit.set_focus()
+            except Exception:
+                pass
+            try:
+                if self._focused_hwnd()[0] == edit_hwnd:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.05)
+        return False
+
+    def _classify_after_jump(self, edit_hwnd, number: str, timeout: float = 2.5):
+        """After Enter on a field NUMBER, determine which heads-down model this Drake build
+        uses — BY OBSERVATION, never by assumption. Returns (model, dialog):
+
+          "per-jump"    the popup CLOSED -> the caret is now on the canvas field, so the
+                        value is typed onto the canvas.
+          "persistent"  the popup STAYED but its edit no longer holds the number (Drake
+                        consumed it) -> it is now prompting for the VALUE, which goes back
+                        into the popup followed by Enter.
+          "error"       an unexpected/validation dialog appeared (returned as `dialog`).
+          "rejected"    the popup is still up STILL showing the number -> Drake did not
+                        accept that field number on this screen.
+
+        Detecting instead of hardcoding is the point: the same driver is correct whether the
+        popup is a per-jump dialog or a persistent command bar, so a build (or tax-year)
+        difference can never silently mis-route a keystroke."""
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            bad = self._detect_unexpected_dialog()
+            if bad:
+                return ("error", bad)
+            if self._find_headsdown_popup(timeout=0.05) is None:
+                return ("per-jump", None)
+            if _safe_read_edit(edit_hwnd) != number:
+                return ("persistent", None)
+            time.sleep(0.08)
+        return ("rejected", None)
 
     def headsdown_toggle(self, method: str = "scancode") -> dict:
         """Toggle Drake's HEADS-DOWN data entry (Ctrl+N). In heads-down mode every field
@@ -455,35 +519,42 @@ class DrakeDriver:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def headsdown_type(self, field_no, value, *, method: str = "scancode") -> dict:
-        """Enter ONE value BY FIELD NUMBER — race-free and VERIFIED — via the heads-down
-        popup. This replaces the old open-loop "fire Ctrl+N, sleep, blind-type" that raced
-        keystrokes between the popup and the canvas (digits into EIN, 'invalid field',
-        cascade). The guarded protocol, every step gated:
+    def headsdown_type(self, field_no, value, *, method: str = "scancode",
+                       settle_after: float = 0.0) -> dict:
+        """Enter ONE value BY FIELD NUMBER — race-free, VERIFIED, and model-agnostic — via
+        the heads-down popup. Replaces the old open-loop "fire Ctrl+N, sleep, blind-type"
+        that raced keystrokes between the popup and the canvas (digits into EIN, 'invalid
+        field', cascade). Every step is gated:
 
           1. Drake main frame still alive?                         else HALT
           2. no unexpected/error dialog already up?                else HALT
-          3. ensure the popup is open (IDEMPOTENT — Ctrl+N only if absent, never a
-             second toggle) and READY (wait, not sleep)           else HALT
-          4. focus the popup's real Edit and VERIFY focus == that Edit (GetGUIThreadInfo)
+          3. ensure the popup is open — IDEMPOTENT (presence re-checked before every Ctrl+N,
+             so never a mode-killing double toggle) and RETRYING (Drake eats a chord while
+             it commits a field — the Field-4/EIN auto-advance case)   else HALT
+          4. focus the popup's real Edit and PROVE focus == that Edit (GetGUIThreadInfo)
                                                                    else HALT
           5. type the field number into the FOCUSED popup edit, then READ IT BACK
              (WM_GETTEXT) and assert it == the number BEFORE the irreversible Enter
                                                                    else HALT
-          6. press Enter → the jump; PROVE the popup closed (number accepted)  else HALT
-          7. no error dialog after the jump?                       else HALT
-          8. type the VALUE onto the canvas (global keys, vk_packet=False, NO set_focus,
-             NO trailing Enter — the next field's Ctrl+N is what leaves this field)
+          6. press Enter → then OBSERVE which model this build uses (_classify_after_jump):
+               per-jump   popup closed  → type the value onto the CANVAS (no trailing Enter;
+                          the next field's jump is what leaves this field)
+               persistent popup stayed, prompting for the value → re-focus its edit, type the
+                          value THERE, read it back, then Enter to commit
+             rejected / error dialog                              → HALT
+          7. no error dialog after the value?                      else HALT
 
-        The number can never land on the canvas because we verify the popup edit holds
-        keyboard focus and read the digits back before committing. Returns {ok:True,...}
-        or {ok:False, halt:True, reason:...} — the caller STOPS the batch for a human.
-        Never presses Enter after the value; never auto-dismisses a dialog."""
+        The field number can never land on the canvas: we prove the popup edit owns the
+        keyboard and read the digits back before committing. And because step 6 DETECTS the
+        model rather than assuming one, a build or tax-year difference cannot silently
+        mis-route a value. Returns {ok:True,...} or {ok:False, halt:True, reason:...} — the
+        caller STOPS the batch for a human. Never auto-dismisses a dialog."""
         fn = str(field_no)
+        val = "" if value is None else str(value)
         try:
             if self.dry_run:
-                print(f"[dry-run] headsdown field {fn} = {value!r}")
-                return {"ok": True}
+                print(f"[dry-run] headsdown field {fn} = {val!r}")
+                return {"ok": True, "field_no": field_no, "model": "dry-run"}
             import time
             # 1) app alive?
             if self.win is None or not self.win.exists():
@@ -492,10 +563,11 @@ class DrakeDriver:
             bad = self._detect_unexpected_dialog()
             if bad:
                 return {"ok": False, "halt": True, "reason": f"unexpected dialog before entry: {bad['title']!r}", "dialog": bad}
-            # 3) idempotent popup open (never a second Ctrl+N if already open)
-            opened = self._ensure_popup_open(method=method, timeout=2.5)
+            # 3) idempotent + retrying popup open
+            opened = self._ensure_popup_open(method=method)
             if not opened.get("ok"):
-                return {"ok": False, "halt": True, "reason": opened.get("reason")}
+                return {"ok": False, "halt": True, "reason": opened.get("reason"),
+                        "dialog": opened.get("dialog")}
             popup = self._find_headsdown_popup(timeout=1.0)
             if popup is None:
                 return {"ok": False, "halt": True, "reason": "heads-down popup not found after open"}
@@ -505,65 +577,87 @@ class DrakeDriver:
                 eh = int(edit.handle)
             except Exception as e:
                 return {"ok": False, "halt": True, "reason": f"popup edit not ready / no handle: {e}"}
-            # 4) focus the edit + VERIFY via the ctypes GUI-thread oracle (retry a few times)
-            focused = False
-            for _ in range(6):
-                try:
-                    edit.set_focus()
-                except Exception:
-                    pass
-                try:
-                    if self._focused_hwnd()[0] == eh:
-                        focused = True
-                        break
-                except Exception:
-                    pass
-                time.sleep(0.05)
-            if not focused:
+            # 4) focus the edit + PROVE it via the ctypes GUI-thread oracle
+            if not self._focus_popup_edit(edit, eh):
                 return {"ok": False, "halt": True, "reason": "popup edit never took keyboard focus"}
             # 5) place the number in the FOCUSED popup edit, then READ IT BACK before Enter.
-            #    Clear first (atomic), then type real keys (Drake honors scan/VK), verify.
             try:
-                edit.set_edit_text("")  # clear any stale digits (EM_REPLACESEL, atomic)
+                edit.set_edit_text("")  # clear stale digits (EM_REPLACESEL, atomic)
             except Exception:
                 pass
-            self._keys(fn)  # real VK/scan keys land in the focused popup edit (focus verified)
+            self._keys(fn)  # real VK/scan keys land in the focused popup edit (focus proven)
             got = _safe_read_edit(eh)
             if got != fn:
-                # fallback: place atomically via window message, re-read
                 try:
-                    edit.set_edit_text(fn)
+                    edit.set_edit_text(fn)  # fallback: place atomically via window message
                 except Exception:
                     pass
                 got = _safe_read_edit(eh)
                 if got != fn:
                     return {"ok": False, "halt": True,
-                            "reason": f"popup edit shows {got!r}, expected {fn!r} — refusing to press Enter"}
-            # 6) fire the jump, then PROVE the popup consumed it (number accepted)
+                            "reason": f"popup edit shows {got!r}, expected field number {fn!r} — refusing to press Enter"}
+            # 6) fire the jump, then OBSERVE which model this build uses.
             self._keys("{ENTER}")
-            try:
-                popup.wait_not("visible", timeout=3)
-            except Exception:
-                bad = self._detect_unexpected_dialog()
-                reason = "popup still open after Enter — field number likely rejected for this screen"
-                if bad:
-                    reason = f"error dialog after Enter: {bad['title']!r}"
-                return {"ok": False, "halt": True, "reason": reason, "dialog": bad}
-            # 7) error modal after the jump?
+            model, dlg = self._classify_after_jump(eh, fn, timeout=2.5)
+            if model == "error":
+                return {"ok": False, "halt": True,
+                        "reason": f"error dialog after jumping to field {fn}: {dlg['title']!r}", "dialog": dlg}
+            if model == "rejected":
+                return {"ok": False, "halt": True,
+                        "reason": f"Drake did not accept field number {fn} on this screen "
+                                  f"(popup still showing it after Enter)"}
+            committed = False
+            if model == "per-jump":
+                # The caret is on the canvas field. Type the value there — global keys,
+                # vk_packet=False, NO set_focus (that would reset the canvas caret), and NO
+                # trailing Enter: the next field's jump leaves this field cleanly, and not
+                # pressing Enter is precisely what keeps a mis-detected state from cascading.
+                self._keys(_escape_keys(val))
+            else:  # persistent command bar — the value goes back INTO the popup, then Enter
+                popup = self._find_headsdown_popup(timeout=0.5)
+                if popup is None:
+                    return {"ok": False, "halt": True,
+                            "reason": "popup vanished between the jump and the value"}
+                edit = self._popup_edit(popup)
+                try:
+                    edit.wait("ready", timeout=2)
+                    eh = int(edit.handle)  # re-resolve: a recreated dialog invalidates the old handle
+                except Exception as e:
+                    return {"ok": False, "halt": True, "reason": f"popup edit not ready for the value: {e}"}
+                if not self._focus_popup_edit(edit, eh):
+                    return {"ok": False, "halt": True, "reason": "popup edit never took focus for the value"}
+                try:
+                    edit.set_edit_text("")
+                except Exception:
+                    pass
+                self._keys(_escape_keys(val))
+                got = _safe_read_edit(eh)
+                if not _same_value(got, val):
+                    try:
+                        edit.set_edit_text(val)
+                    except Exception:
+                        pass
+                    got = _safe_read_edit(eh)
+                    if not _same_value(got, val):
+                        return {"ok": False, "halt": True,
+                                "reason": f"popup edit shows {got!r}, expected value {val!r} — refusing to commit"}
+                self._keys("{ENTER}")
+                committed = True
+            # 7) settle, then make sure the value did not trip a validator.
+            if settle_after:
+                time.sleep(settle_after)
             bad = self._detect_unexpected_dialog()
             if bad:
-                return {"ok": False, "halt": True, "reason": f"error dialog after jump: {bad['title']!r}", "dialog": bad}
-            # (advisory) did the caret land on a canvas field?
-            landed = None
-            try:
-                landed = bool(self._focused_hwnd()[3] & _GUI_CARETBLINKING)
-            except Exception:
-                pass
-            # 8) type the VALUE onto the canvas — global keys, vk_packet=False, NO set_focus,
-            #    NO trailing Enter (the next field's Ctrl+N leaves this field cleanly).
-            self._keys(_escape_keys(str(value)))
-            return {"ok": True, "field_no": field_no, "reopened": opened.get("opened"),
-                    "caret_after_jump": landed}
+                return {"ok": False, "halt": True,
+                        "reason": f"error dialog after entering field {fn}: {bad['title']!r}", "dialog": bad}
+            return {"ok": True, "field_no": field_no, "model": model,
+                    "value_committed": committed,
+                    "popup_reopened": opened.get("opened"),
+                    "popup_attempts": opened.get("attempts"),
+                    # False here after a committing field is the Field-4/EIN signature:
+                    # Drake dropped heads-down to auto-advance. The next field's retrying
+                    # _ensure_popup_open re-opens it, so it is informational, not an error.
+                    "popup_after_value": self._find_headsdown_popup(timeout=0.2) is not None}
         except Exception as e:
             return {"ok": False, "halt": True, "reason": str(e)}
 
@@ -973,6 +1067,20 @@ def _safe_read_edit(hedit) -> str:
         return (_read_edit_text(hedit) or "").strip()
     except Exception:
         return ""
+
+
+def _same_value(got, expected) -> bool:
+    """Did the box end up holding the value we meant? Exact first, then tolerant of the
+    cosmetic reformatting a field does as you type — '52,000' vs '52000', '12-3456789' vs
+    '123456789', case. Deliberately NOT tolerant of different digits: this gate is what
+    stops a wrong number being committed, so it only forgives punctuation and case."""
+    if got is None:
+        return False
+    a, b = str(got).strip(), str(expected).strip()
+    if a == b:
+        return True
+    norm = lambda s: "".join(ch for ch in s if ch.isalnum()).lower()
+    return norm(a) == norm(b)
 
 
 def _overlay_grid(img, step: int = 50, label_every: int = 100):

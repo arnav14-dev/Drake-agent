@@ -229,11 +229,72 @@ Fynn's `DrakeDriver` seam exactly (`capabilities`, `openReturn`, `openScreen`,
 `addFormInstance`, `focus`, `type`, `press`, `readField`, `screenshot`). `protocol.py`
 is the single dispatch point, so `selftest` and `connect` drive Drake identically.
 
+## `write-w2` — extracted JSON → Drake, by field number
+
+The product path. The LLM reads the W-2 PDF and emits the schema in `sample_w2.json`;
+`w2_map.py` resolves each key to a Drake **heads-down field number** and sanitizes the
+value; the driver enters every field by number through the verified loop. No model
+decides which box a number lands in — that's a fixed table, which is what makes the
+entry auditable.
+
+```
+python agent.py write-w2 --json sample_w2.json --dry-run        # review first, anywhere
+python agent.py write-w2 --binding binding.json --json sample_w2.json
+```
+
+`--dry-run` touches nothing and needs no Drake, no VM, no binding — it prints the fully
+resolved plan: which box each value goes in, what was skipped (empty/zero boxes are left
+alone), what was **REJECTED** (had content but wasn't valid — e.g. an unrecognized state
+name), and which boxes need a human eye (dropdowns, checkboxes, identity fields). Read
+that before you ever let it type.
+
+### How the entry loop stays precise
+
+Each field is entered through a gated state machine (`drake_driver.headsdown_type`) that
+never sends a keystroke it hasn't verified the destination of:
+
+1. The heads-down popup is a **real Win32 dialog**, not Drake's opaque canvas — so it's
+   driven as one, via a second `backend="win32"` connection.
+2. Its Edit control is focused and focus is **proven** with `GetGUIThreadInfo` before
+   anything is typed.
+3. The field number is typed, then **read back** with `WM_GETTEXT` and asserted equal —
+   *before* the irreversible Enter.
+4. After the jump, the driver **observes** which popup model this build uses rather than
+   assuming: popup closed → the value goes on the canvas; popup still open and prompting
+   → the value goes back into the popup. A build or tax-year difference can't silently
+   mis-route a value.
+5. Any unexpected dialog, rejected number, or read-back mismatch **HALTs** the batch. It
+   never auto-dismisses a modal and never writes on past a failure.
+
+**The Field-4/EIN exception** (confirmed on Drake 2025): committing the employer EIN
+fires Drake's employer lookup + auto-fill, auto-advances the caret to Box 1, and
+*swallows the next Ctrl+N*. That single eaten chord is what caused the original cascade —
+field numbers typing onto the canvas, every value landing one box too far down.
+`_ensure_popup_open` handles it by re-checking popup presence before every Ctrl+N (so it
+can never toggle the mode back off) and retrying with a settle. No per-field special
+case: any auto-advancing field recovers the same way.
+
+### Testing it without the VM
+
+```
+python simulate_headsdown.py
+```
+
+A fake Drake that reproduces the observed behaviours — including the Field-4 swallowed
+chord — so the state machine can be proven in a second, anywhere, before it touches a
+return. It covers both popup models, auto-advance on other fields, and that an invalid
+field number halts instead of cascading. It fakes *Drake*, not pywinauto: focus and
+window behaviour on the real thing is still VM-verified.
+
 ## Files
 
 - `agent.py` — CLI + modes.
 - `drake_driver.py` — the pywinauto driver (focus/type/read). **The parts that depend
   on your Drake build live here and in `binding.json` — expect to iterate on the VM.**
+- `w2_map.py` — extracted-JSON key → Drake field number + value sanitization. Pure
+  functions, no Drake — importable and testable anywhere.
+- `simulate_headsdown.py` — offline proof of the entry state machine.
 - `protocol.py` — the wire protocol + dispatcher.
 - `binding.example.json` — the field-binding template (copy to `binding.json`).
+- `sample_w2.json` — the W-2 extraction schema the LLM must emit (test data).
 - `selftest.plan.json` — the canned W-2 self-test.

@@ -30,6 +30,10 @@ Modes (run in this order the first time):
   probe-popup READ-ONLY: dump the "Heads Down Data Entry" popup's real control tree + test
              a number round-trip + report whether it closes after Enter. Run ONCE first to
              lock in the exact edit control the driver binds to. Writes no field value.
+  write-w2   THE product path: extracted W-2 JSON (the LLM's structured output) -> Drake,
+             every field entered BY NUMBER through the verified heads-down loop. Run with
+             --dry-run first (works on any machine, touches nothing) to review exactly which
+             box each value lands in before a keystroke is sent.
   calibrate  Same control dump, formatted to help you fill binding.json (logical field →
              automation_id / field_no / tab_index).
   selftest   Run a local plan file (a list of protocol commands) against Drake and print
@@ -43,6 +47,8 @@ Examples:
   python agent.py shoot --binding binding.json --out drake.png
   python agent.py calibrate --binding binding.json --screen W2
   python agent.py selftest --binding binding.json --plan selftest.plan.json --shot after.png
+  python agent.py write-w2 --json sample_w2.json --dry-run
+  python agent.py write-w2 --binding binding.json --json sample_w2.json
   python agent.py connect --binding binding.json --url wss://api.fynnalabs.com/drake-agent --token $DRAKE_AGENT_TOKEN
 """
 
@@ -234,47 +240,62 @@ def cmd_typetest(args) -> int:
     return 0
 
 
-def _headsdown_run_seq(driver, seq, *, method):
-    """Enter a "N=value,N=value,…" list BY FIELD NUMBER through the heads-down popup, using
-    the race-free VERIFIED driver (each field: focus the popup edit, read the number back
-    before Enter, prove the jump, then type the value). STOPS at the first field that does
-    not return ok — no cascade, nothing committed past the failure. Requires an ACTIVE
-    caret in a field to bootstrap (a click, or a prior jump). Returns
-    (rows, halted, reason) where rows = [(num, val, ok, reason)]."""
-    rows = []
-    halted, reason = False, None
+def _parse_seq(seq: str):
+    """"N=value,N=value,…" -> [{field_no, value, label}] for the shared entry runner."""
+    out = []
     for pair in seq.split(","):
         if "=" not in pair:
             continue
         num, val = pair.split("=", 1)
-        num, val = num.strip(), val.strip()
-        res = driver.headsdown_type(num, val, method=method)
-        rows.append((num, val, bool(res.get("ok")), res.get("reason")))
+        out.append({"field_no": num.strip(), "value": val.strip(), "label": ""})
+    return out
+
+
+def _headsdown_run(driver, entries, *, method, settle_after=0.0):
+    """Enter a list of {field_no, value} BY FIELD NUMBER through the heads-down popup, using
+    the race-free VERIFIED driver (per field: focus the popup edit, read the number back
+    before Enter, observe which model the popup uses, route the value accordingly). STOPS at
+    the first field that does not return ok — no cascade, nothing committed past the failure.
+    Requires an ACTIVE caret to bootstrap (a click, or a prior jump). Returns
+    (rows, halted, reason) where rows = [(num, val, label, ok, reason, model)]."""
+    rows = []
+    halted, reason = False, None
+    for e in entries:
+        num, val = str(e["field_no"]), str(e["value"])
+        res = driver.headsdown_type(num, val, method=method, settle_after=settle_after)
+        rows.append((num, val, e.get("label", ""), bool(res.get("ok")),
+                     res.get("reason"), res.get("model")))
         if not res.get("ok"):
             halted, reason = True, res.get("reason")
             break
-    # Commit the last field ONLY if every field landed AND no dialog is up — never press
-    # Enter over a corrupted/halted state.
-    if not halted and driver._detect_unexpected_dialog() is None:
+    # Commit the final field ONLY if every field landed AND no dialog is up — never press
+    # Enter over a corrupted/halted state. (In the persistent model each value was already
+    # committed with its own Enter; this closes out the last canvas field in the per-jump one.)
+    if not halted and rows and rows[-1][5] == "per-jump" and driver._detect_unexpected_dialog() is None:
         driver.press(["Enter"])
     return rows, halted, reason
 
 
 def _print_seq_outcome(rows, halted, reason) -> int:
-    """Print the per-field result of a heads-down --seq run and return an exit code.
-    Every field either landed (ok, verified) or the batch HALTed cleanly at the first
-    failure — there is no silent cascade."""
+    """Print the per-field result of a heads-down run and return an exit code. Every field
+    either landed (ok, verified) or the batch HALTed cleanly at the first failure — there
+    is no silent cascade."""
     print("\nPer-field result (verified):")
-    for num, val, ok, why in rows:
+    for num, val, label, ok, why, model in rows:
         mark = "OK " if ok else "HALT"
+        name = f" {label}" if label else ""
         extra = "" if ok else f"   <-- {why}"
-        print(f"  [{mark}] field {num:<3} = {val!r}{extra}")
+        print(f"  [{mark}] field {num:<3}{name:<34} = {val!r}{extra}")
+    models = {m for *_, m in rows if m}
+    if models:
+        print(f"\nheads-down model observed: {', '.join(sorted(models))}")
     if halted:
         print(f"\nSTOP — human needed. The batch halted BEFORE mis-entering: {reason}")
-        print("Nothing was committed past the failure (no trailing Enter). Review Drake,")
-        print("then we adjust. A clean halt is the design working — not a cascade.")
+        print("Nothing was committed past the failure. Review Drake, then we adjust.")
+        print("A clean halt is the design working — not a cascade.")
         return 2
     print("\nAll fields entered and verified by number — no cascade, no error dialog.")
+    print("Values are IN Drake but NOT filed: a human still reviews and executes.")
     return 0
 
 
@@ -308,7 +329,8 @@ def cmd_headsdown(args) -> int:
             time.sleep(1)
         print()
         if args.seq:
-            rows, halted, reason = _headsdown_run_seq(driver, args.seq, method=args.toggle_method)
+            rows, halted, reason = _headsdown_run(driver, _parse_seq(args.seq),
+                                                  method=args.toggle_method)
             code = _print_seq_outcome(rows, halted, reason)
             s = driver.save_screenshot(args.shot)
             print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
@@ -328,7 +350,8 @@ def cmd_headsdown(args) -> int:
     time.sleep(args.settle)
     if args.seq:
         print(f"Entering values BY FIELD NUMBER (method={args.toggle_method})…")
-        rows, halted, reason = _headsdown_run_seq(driver, args.seq, method=args.toggle_method)
+        rows, halted, reason = _headsdown_run(driver, _parse_seq(args.seq),
+                                              method=args.toggle_method)
         code = _print_seq_outcome(rows, halted, reason)
         s = driver.save_screenshot(args.shot)
         print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
@@ -343,6 +366,69 @@ def cmd_headsdown(args) -> int:
     print("\nVERDICT: numbers appeared -> read me the field numbers. Nothing? a code-opened")
     print("screen may leave no active caret for Ctrl+N — use --manual (click first).")
     return 0
+
+
+def cmd_write_w2(args) -> int:
+    """
+    Extracted W-2 JSON -> Drake, end to end. Reads the LLM's structured output, resolves it
+    through the fixed field map (w2_map.py), and enters every field BY NUMBER through the
+    verified heads-down path.
+
+    --dry-run prints the fully-resolved plan and touches nothing — run that FIRST, and on
+    any machine: it shows exactly which box each value goes in, what was skipped, and what
+    needs a human eye, before a single keystroke reaches Drake. Never files.
+    """
+    import time
+    from w2_map import build_plan, format_plan
+
+    with open(args.json, "r", encoding="utf-8-sig") as f:
+        payload = json.load(f)
+
+    binding = load_binding(args.binding) if not args.dry_run else _try_load_binding(args.binding)
+    token = (binding.get("navigation", {}) or {}).get("headsdown_checkbox_true", "X")
+    plan = build_plan(payload, checkbox_token=token, include_zeros=args.include_zeros)
+    print(format_plan(plan))
+
+    if not plan["entries"]:
+        print("Nothing to enter — the payload resolved to zero fields.\n", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print("DRY RUN — nothing was sent to Drake. Re-run without --dry-run to enter these.\n")
+        return 0
+
+    driver = DrakeDriver(binding)
+    driver.connect()
+    wi = driver.window_info()
+    print(f"Bound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
+    if driver.w32 is None:
+        print("  ⚠ could not open the win32 popup connection — heads-down entry needs it.")
+        return 1
+    print(f"\nOpen the W-2 screen for this employer, then CLICK into any field on it so its")
+    print("cursor is blinking (that active caret is what lets Ctrl+N arm heads-down).")
+    print("Then take your hands off the keyboard. Entry starts in ", end="", flush=True)
+    for n in range(max(1, args.delay), 0, -1):
+        print(f"{n}… ", end="", flush=True)
+        time.sleep(1)
+    print()
+
+    rows, halted, reason = _headsdown_run(driver, plan["entries"],
+                                          method=args.toggle_method,
+                                          settle_after=args.settle_after)
+    code = _print_seq_outcome(rows, halted, reason)
+    s = driver.save_screenshot(args.shot)
+    print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
+    print("\nVERIFY THE SCREENSHOT before doing anything else in Drake. This agent has no")
+    print("file/e-file command by design — a human reviews and executes, always.")
+    return code
+
+
+def _try_load_binding(path: str) -> dict:
+    """Binding if it's there, else {} — so --dry-run works on a machine that has no
+    binding.json (it's per-VM and gitignored). Only affects the checkbox token."""
+    try:
+        return load_binding(path)
+    except Exception:
+        return {}
 
 
 def cmd_probe_popup(args) -> int:
@@ -505,6 +591,7 @@ def main() -> int:
     stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click; a COMMA-separated list cascades through fields (e.g. 11111,22222,33333)"); stt.add_argument("--click-xy", dest="click_xy", help="AGENT clicks this window-relative x,y first (e.g. 420,180), then types — diagnoses whether the programmatic click lands"); stt.add_argument("--advance", default="", help="key pressed between values when --text is a list, e.g. ENTER (default) or TAB"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
     shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "1=12-3456789,2=ACME,3=52000"'); shd.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected: scancode (low-level hardware keys, default/best for Drake), vkhold (pywinauto Ctrl-held), pywinauto (high-level ^n)"); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.6, help="seconds to wait after open and after Ctrl+N"); shd.add_argument("--manual", action="store_true", help="YOU click a field first (active caret), then the agent drives heads-down by number — the confirmed-working bootstrap"); shd.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before entry fires, in --manual mode"); shd.set_defaults(func=cmd_headsdown)
     spp = sub.add_parser("probe-popup", parents=[common]); spp.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the read-only probe runs"); spp.set_defaults(func=cmd_probe_popup)
+    sw2 = sub.add_parser("write-w2", parents=[common]); sw2.add_argument("--json", required=True, help="extracted W-2 JSON (the LLM's structured output — see w2_map.W2_SCHEMA_KEYS)"); sw2.add_argument("--dry-run", action="store_true", help="resolve and PRINT the plan without touching Drake — run this first, works anywhere"); sw2.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero (default: skip — a blank box is zero on a tax form)"); sw2.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); sw2.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field (auto-fill/validation)"); sw2.add_argument("--delay", type=int, default=10, help="seconds to click into the W-2 screen before entry fires"); sw2.add_argument("--shot", default="w2-after.png", help="screenshot saved after the run — the verification artifact"); sw2.set_defaults(func=cmd_write_w2)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)
