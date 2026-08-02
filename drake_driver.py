@@ -94,6 +94,16 @@ class DrakeDriver:
         # The heads-down popup is a real dialog window we drive directly (title + edit class).
         self.popup_title_re = self.nav.get("headsdown_popup_title_re", r"Heads.?Down Data Entry")
         self.popup_edit_class = self.nav.get("headsdown_popup_edit_class", "Edit")
+        # How the popup's NUMBER prompt reads, so an inherited popup that is actually armed
+        # for a VALUE can be told apart from one waiting for a field number. Matched against
+        # the popup's child text; on this build: "To begin, enter desired field number and
+        # press enter."
+        self.number_prompt_re = self.nav.get("headsdown_number_prompt_re", r"field\s*number")
+        # Did WE open the popup that is currently up? An inherited popup (left armed by
+        # probe-popup or a halted run) has an UNKNOWN prompt state, and typing a field
+        # number into a box that is waiting for a VALUE commits the number as the value.
+        self._popup_owned = False
+        self._warned_prompt_blind = False
         # Structural dialog-gate state (see _detect_unexpected_dialog): windows that already
         # exist at attach are baseline furniture (e.g. the 'Drake Software Chat' overlay) and
         # can never halt a run by existing; windows classified benign mid-run are remembered
@@ -606,6 +616,9 @@ class DrakeDriver:
         for i in range(max(1, attempts)):
             popup = self._find_headsdown_popup(timeout=0.3 if i == 0 else 0.15)
             if popup is not None:
+                ready = self._popup_ready_for_number(popup)
+                if not ready.get("ok"):
+                    return ready
                 return {"ok": True, "opened": i > 0, "attempts": i, "popup": popup}
             if self.w32 is None:
                 return {"ok": False, "reason": "win32 popup connection unavailable (reconnect on the VM)"}
@@ -624,12 +637,62 @@ class DrakeDriver:
             try:
                 spec = self.w32.window(title_re=self.popup_title_re)
                 spec.wait("visible ready", timeout=timeout)
+                self._popup_owned = True  # WE opened it, so its state is known: number prompt
                 return {"ok": True, "opened": True, "attempts": i + 1, "popup": spec}
             except Exception:
                 time.sleep(0.25 * (i + 1))  # Drake is busy (auto-fill / commit) — let it settle
         return {"ok": False,
                 "reason": f"Ctrl+N did not open the heads-down popup after {attempts} attempts "
                           f"(is a canvas field active?)"}
+
+    def _popup_ready_for_number(self, popup) -> dict:
+        """Is the popup that is ALREADY up waiting for a FIELD NUMBER? {"ok":True} or a halt.
+
+        Presence is not readiness. The popup has two states — asking for a number, and
+        asking for the VALUE of a field it already jumped to — and they look identical from
+        the outside. Typing a field number into one that is armed for a value COMMITS THE
+        NUMBER AS THE VALUE: '23' lands in the employer EIN, and every field after it is
+        one step out of phase.
+
+        That is not hypothetical. `probe-popup` ends by pressing Enter on a field number,
+        which leaves Drake armed for exactly that value, and the agent's own help tells the
+        operator to run it FIRST.
+
+        Two independent checks, so neither has to be perfect:
+          1. OWNERSHIP — if we did not open this popup during this batch, its state is
+             unknown by definition. Halt.
+          2. PROMPT TEXT — if it is readable and does not look like the number prompt, halt
+             no matter who opened it."""
+        if self._popup_owned:
+            prompt = self._popup_prompt(popup)
+            import re as _re
+            if prompt and not _re.search(self.number_prompt_re, prompt, _re.I):
+                return {"ok": False,
+                        "reason": f"the heads-down popup is armed for a VALUE, not a field "
+                                  f"number (prompt reads {prompt[:80]!r}). Refusing to type a "
+                                  f"field number into it — that would commit the number as the "
+                                  f"previous field's value."}
+            return {"ok": True}
+        prompt = self._popup_prompt(popup)
+        import re as _re
+        if prompt and _re.search(self.number_prompt_re, prompt, _re.I):
+            self._popup_owned = True  # inherited, but provably on the number prompt
+            return {"ok": True}
+        detail = (f"its prompt reads {prompt[:80]!r}" if prompt
+                  else "and this build exposes no prompt text, so its state cannot be read")
+        return {"ok": False,
+                "reason": f"a heads-down popup was ALREADY open before this run started — "
+                          f"{detail}. It may be armed for a VALUE (probe-popup and any halted "
+                          f"run leave it that way), and typing a field number into it would "
+                          f"commit that number as a value. Press Esc in Drake to close it, "
+                          f"click a field, and re-run."}
+
+    def begin_batch(self) -> None:
+        """Reset per-batch popup state. Called before a run so a popup inherited from a
+        PREVIOUS run (or from probe-popup) is treated as foreign and challenged, rather
+        than trusted because an earlier batch happened to open one."""
+        self._popup_owned = False
+        self._warned_prompt_blind = False
 
     def _focus_popup_edit(self, edit, edit_hwnd, tries: int = 6) -> bool:
         """Give the popup's Edit real keyboard focus and PROVE it via GetGUIThreadInfo —
@@ -652,34 +715,130 @@ class DrakeDriver:
             time.sleep(0.05)
         return False
 
-    def _classify_after_jump(self, edit_hwnd, number: str, timeout: float = 2.5):
-        """After Enter on a field NUMBER, determine which heads-down model this Drake build
-        uses — BY OBSERVATION, never by assumption. Returns (model, dialog):
+    def _settle_read(self, hedit, expected, *, exact: bool = False,
+                     timeout: float = 1.0, poll: float = 0.04):
+        """Poll the edit until it CONVERGES on `expected` — two consecutive identical reads
+        that both match. Returns (ok, last_read_or_None).
 
-          "per-jump"    the popup CLOSED -> the caret is now on the canvas field, so the
-                        value is typed onto the canvas.
-          "persistent"  the popup STAYED but its edit no longer holds the number (Drake
-                        consumed it) -> it is now prompting for the VALUE, which goes back
-                        into the popup followed by Enter.
-          "error"       an unexpected/validation dialog appeared (returned as `dialog`).
-          "rejected"    the popup is still up STILL showing the number -> Drake did not
-                        accept that field number on this screen.
+        Convergence is a DRAIN PROOF, and it is why the old "read it back, and if it's wrong
+        repair it with set_edit_text" pattern had to go. `self._keys()` POSTS keystrokes to
+        Drake's input queue; WM_GETTEXT and set_edit_text are SENT messages, handled ahead of
+        anything still queued. So the old sequence could read a half-arrived '520', "repair"
+        it to '52000', re-read a clean '52000', pass the gate — and only then would the
+        still-queued '00' arrive and append, committing 5,200,000 while reporting success.
+        Waiting for the box to stop changing means every injected key has already been
+        consumed, so none can land after the check.
 
-        Detecting instead of hardcoding is the point: the same driver is correct whether the
-        popup is a per-jump dialog or a persistent command bar, so a build (or tax-year)
-        difference can never silently mis-route a keystroke."""
+        A failed read (None) is NO EVIDENCE, not agreement — it just keeps polling."""
+        import time
+        cmp = (lambda a, b: a == b) if exact else _same_value
+        deadline = time.time() + timeout
+        prev, last = None, None
+        while time.time() < deadline:
+            cur = _read_edit_or_none(hedit)
+            if cur is not None:
+                last = cur
+                if prev is not None and cur == prev and cmp(cur, expected):
+                    return True, cur
+                prev = cur
+            time.sleep(poll)
+        return False, last
+
+    def _popup_prompt(self, popup, edit_hwnd=None) -> str:
+        """The prompt text of a popup WindowSpecification ('' if unreadable)."""
+        try:
+            return _popup_prompt_text(int(popup.handle), edit_hwnd, self.popup_edit_class)
+        except Exception:
+            return ""
+
+    def _note_prompt_blind(self) -> None:
+        if self._warned_prompt_blind:
+            return
+        self._warned_prompt_blind = True
+        print("  ⚠ this build exposes NO readable prompt text on the heads-down popup, so a "
+              "silently REFUSED field number or value cannot be positively detected. "
+              "Falling back to the weaker 'did the edit box change' test — verify the "
+              "screenshot field by field.")
+
+    def _classify_after_jump(self, edit_hwnd, number: str, base_prompt: str = "",
+                             timeout: float = 2.5):
+        """After Enter on a field NUMBER, determine what Drake ACTUALLY did — by observation,
+        never assumption. Returns (model, info):
+
+          "per-jump"    the popup CLOSED -> the caret is on the canvas field, value goes there.
+          "persistent"  the popup is now prompting for the VALUE -> the value goes back into
+                        the popup, followed by Enter.
+          "error"       an unexpected/validation dialog appeared (returned as `info`).
+          "rejected"    Drake did NOT take the number — still sitting on the number prompt.
+          "unknown"     the popup stayed but nothing could be read -> the caller HALTs.
+
+        WHY THE PROMPT TEXT AND NOT JUST THE EDIT BOX: a REFUSED number clears the edit
+        exactly like an ACCEPTED one does, so "the edit no longer holds the number" cannot
+        tell them apart. Reading a refusal as an acceptance is what makes the NEXT field's
+        number get typed as THIS field's value — after which every value lands one box off,
+        every row reporting OK. That is the cascade, and it is silent.
+
+        With `base_prompt` (the number prompt captured immediately before Enter) the test is
+        "has the prompt moved off the number prompt?", which distinguishes the two. Compared
+        against the CAPTURED baseline rather than a hardcoded English string, so a build that
+        rewords the prompt cannot silently disable the check. If this build exposes no prompt
+        text at all, it degrades to the old edit-changed heuristic and says so out loud."""
         import time
         deadline = time.time() + timeout
         while time.time() < deadline:
             bad = self._detect_unexpected_dialog()
             if bad:
                 return ("error", bad)
-            if self._find_headsdown_popup(timeout=0.05) is None:
+            live = self._find_headsdown_popup(timeout=0.05)
+            if live is None:
                 return ("per-jump", None)
-            if _safe_read_edit(edit_hwnd) != number:
-                return ("persistent", None)
+            if base_prompt:
+                cur = self._popup_prompt(live, edit_hwnd)
+                if cur and cur != base_prompt:
+                    return ("persistent", {"prompt": cur})
+            else:
+                # Blind build: the best available signal is the edit clearing.
+                cur_edit = _read_edit_or_none(edit_hwnd)
+                if cur_edit is not None and cur_edit != number:
+                    self._note_prompt_blind()
+                    return ("persistent", {"prompt": ""})
             time.sleep(0.08)
-        return ("rejected", None)
+        if base_prompt:
+            return ("rejected", None)
+        return ("unknown", None) if _read_edit_or_none(edit_hwnd) is None else ("rejected", None)
+
+    def _verify_value_committed(self, number_prompt: str, value_prompt: str,
+                                timeout: float = 1.2):
+        """After Enter on a VALUE, prove Drake actually took it. Returns (ok, how).
+
+          popup GONE                       -> the confirmed auto-advance (field 4 / EIN). Taken.
+          popup back on the NUMBER prompt  -> taken; it is asking for the next field.
+          popup still on the VALUE prompt  -> REFUSED. Nothing was committed.
+
+        Without this, a value Drake declines (it beeps and stays on the value prompt — no
+        dialog, so the dialog gate sees nothing) was reported ok, and the next field's NUMBER
+        was then consumed as THIS field's value. Same cascade, one layer down. On a build
+        with no readable prompt text there is nothing to compare, so it reports unverified
+        rather than inventing a verdict."""
+        import time
+        deadline = time.time() + timeout
+        last = ""
+        while time.time() < deadline:
+            live = self._find_headsdown_popup(timeout=0.05)
+            if live is None:
+                return True, "popup closed (auto-advance — Drake moved the caret itself)"
+            if not number_prompt:
+                self._note_prompt_blind()
+                return True, "UNVERIFIED (this build exposes no popup prompt text)"
+            cur = self._popup_prompt(live)
+            if cur:
+                last = cur
+                if cur == number_prompt:
+                    return True, "popup returned to the field-number prompt"
+                if value_prompt and cur != value_prompt:
+                    return True, f"prompt moved on ({cur[:60]!r})"
+            time.sleep(0.08)
+        return False, last
 
     def headsdown_toggle(self, method: str = "scancode") -> dict:
         """Toggle Drake's HEADS-DOWN data entry (Ctrl+N). In heads-down mode every field
@@ -726,24 +885,36 @@ class DrakeDriver:
              it commits a field — the Field-4/EIN auto-advance case)   else HALT
           4. focus the popup's real Edit and PROVE focus == that Edit (GetGUIThreadInfo)
                                                                    else HALT
-          5. type the field number into the FOCUSED popup edit, then READ IT BACK
-             (WM_GETTEXT) and assert it == the number BEFORE the irreversible Enter
-                                                                   else HALT
-          6. press Enter → then OBSERVE which model this build uses (_classify_after_jump):
+          5. type the field number into the FOCUSED popup edit and wait for it to SETTLE on
+             exactly that number (convergence, not a single read) BEFORE the irreversible
+             Enter                                                 else HALT
+          6. press Enter → then OBSERVE what Drake did (_classify_after_jump), using the
+             popup's PROMPT TEXT rather than assuming a model:
                per-jump   popup closed  → type the value onto the CANVAS (no trailing Enter;
                           the next field's jump is what leaves this field)
-               persistent popup stayed, prompting for the value → re-focus its edit, type the
-                          value THERE, read it back, then Enter to commit
-             rejected / error dialog                              → HALT
-          7. no error dialog after the value?                      else HALT
+               persistent popup now asking for the value → re-focus its edit, type the value
+                          THERE, wait for it to settle, then Enter to commit
+             rejected / unknown / error dialog                     → HALT
+          7. PROVE the value was accepted (_verify_value_committed) else HALT
+          8. no error dialog after the value?                      else HALT
 
         The field number can never land on the canvas: we prove the popup edit owns the
-        keyboard and read the digits back before committing. And because step 6 DETECTS the
-        model rather than assuming one, a build or tax-year difference cannot silently
-        mis-route a value. Returns {ok:True,...} or {ok:False, halt:True, reason:...} — the
-        caller STOPS the batch for a human. Never auto-dismisses a dialog."""
+        keyboard and watch the digits settle before committing. And because steps 6-7 read
+        Drake's own prompt rather than assuming, neither a silently refused field number nor
+        a silently refused value can be mistaken for success — which is what previously let
+        one bad field push every later value one box out of phase, with every row reporting
+        OK. Returns {ok:True,...} or {ok:False, halt:True, reason:...} — the caller STOPS the
+        batch for a human. Never auto-dismisses a dialog."""
         fn = str(field_no)
         val = "" if value is None else str(value)
+        # A blank commit is not a no-op: it is an Enter on an empty box, which CLEARS
+        # whatever the field already held. `--seq "4="` would have wiped the employer EIN
+        # and reported [OK] field 4 = ''. To leave a box alone, omit it.
+        if not val.strip():
+            return {"ok": False, "halt": True,
+                    "reason": f"refusing to commit an EMPTY value to field {fn} — that would "
+                              f"clear whatever the box already holds. Omit the field to leave "
+                              f"it alone."}
         try:
             if self.dry_run:
                 print(f"[dry-run] headsdown field {fn} = {val!r}")
@@ -773,33 +944,46 @@ class DrakeDriver:
             # 4) focus the edit + PROVE it via the ctypes GUI-thread oracle
             if not self._focus_popup_edit(edit, eh):
                 return {"ok": False, "halt": True, "reason": "popup edit never took keyboard focus"}
-            # 5) place the number in the FOCUSED popup edit, then READ IT BACK before Enter.
+            # 5) place the number in the FOCUSED popup edit, then wait for it to SETTLE.
             try:
                 edit.set_edit_text("")  # clear stale digits (EM_REPLACESEL, atomic)
             except Exception:
                 pass
+            stale = _read_edit_or_none(eh)
+            if stale:  # a digit left over here would PREFIX the number: 2 + 23 -> field 223
+                return {"ok": False, "halt": True,
+                        "reason": f"popup edit still holds {stale!r} before typing field number "
+                                  f"{fn!r} — refusing to type onto residue"}
             self._keys(fn)  # real VK/scan keys land in the focused popup edit (focus proven)
-            got = _safe_read_edit(eh)
-            if got != fn:
-                try:
-                    edit.set_edit_text(fn)  # fallback: place atomically via window message
-                except Exception:
-                    pass
-                got = _safe_read_edit(eh)
-                if got != fn:
-                    return {"ok": False, "halt": True,
-                            "reason": f"popup edit shows {got!r}, expected field number {fn!r} — refusing to press Enter"}
-            # 6) fire the jump, then OBSERVE which model this build uses.
+            # EXACT comparison for the number: _same_value's cosmetic tolerance is for money
+            # and must never bless a field number ('4' vs '4.0' is a different box).
+            settled, got = self._settle_read(eh, fn, exact=True, timeout=1.0)
+            if not settled:
+                return {"ok": False, "halt": True,
+                        "reason": f"popup edit never settled on field number {fn!r} "
+                                  f"(last read {got!r}) — refusing to press Enter"}
+            # Baseline the NUMBER prompt while it is still showing, so step 6 can tell
+            # "Drake took the number" from "Drake silently refused it".
+            base_prompt = self._popup_prompt(popup, eh)
+            # 6) fire the jump, then OBSERVE what Drake actually did.
             self._keys("{ENTER}")
-            model, dlg = self._classify_after_jump(eh, fn, timeout=2.5)
+            model, dlg = self._classify_after_jump(eh, fn, base_prompt=base_prompt, timeout=2.5)
             if model == "error":
                 return {"ok": False, "halt": True,
                         "reason": f"error dialog after jumping to field {fn}: {dlg['summary']}", "dialog": dlg}
             if model == "rejected":
                 return {"ok": False, "halt": True,
-                        "reason": f"Drake did not accept field number {fn} on this screen "
-                                  f"(popup still showing it after Enter)"}
-            committed = False
+                        "reason": f"Drake did NOT accept field number {fn} on this screen — it "
+                                  f"stayed on the field-number prompt. Nothing was entered. "
+                                  f"(Is that number right for this screen? Boxes that are "
+                                  f"greyed out or foreign-address-only decline silently.)"}
+            if model == "unknown":
+                return {"ok": False, "halt": True,
+                        "reason": f"could not read the popup at all after jumping to field {fn} "
+                                  f"— refusing to type a value blind"}
+            # read_back stays None on the per-jump path: the canvas exposes no value to read,
+            # which is exactly why that path types no trailing Enter.
+            committed, commit_evidence, read_back = False, None, None
             if model == "per-jump":
                 # The caret is on the canvas field. HWND-scoped gate first: after the popup
                 # closes the foreground root must be Drake's frame again — retried briefly
@@ -837,20 +1021,32 @@ class DrakeDriver:
                     edit.set_edit_text("")
                 except Exception:
                     pass
+                value_prompt = self._popup_prompt(popup, eh)  # the VALUE prompt, for step 7
                 self._keys(_escape_keys(val))
-                got = _safe_read_edit(eh)
-                if not _same_value(got, val):
-                    try:
-                        edit.set_edit_text(val)
-                    except Exception:
-                        pass
-                    got = _safe_read_edit(eh)
-                    if not _same_value(got, val):
-                        return {"ok": False, "halt": True,
-                                "reason": f"popup edit shows {got!r}, expected value {val!r} — refusing to commit"}
+                # Wait for the box to SETTLE on the value. No set_edit_text "repair": that
+                # is a SENT message that jumps ahead of still-queued keystrokes, so it can
+                # make a half-typed box look correct and let the rest of the keys land
+                # AFTER the gate passes (52000 -> read '520' -> "repair" -> queued '00'
+                # arrives -> 5,200,000 committed, reported OK).
+                settled, read_back = self._settle_read(eh, val, timeout=1.2)
+                if not settled:
+                    return {"ok": False, "halt": True,
+                            "reason": f"popup edit never settled on value {val!r} for field {fn} "
+                                      f"(last read {read_back!r}) — refusing to commit"}
                 self._keys("{ENTER}")
+                # 7) PROVE Drake took the value — a refusal is silent (it just stays on the
+                # value prompt), and treating that as success feeds the next field's NUMBER
+                # in as this field's value.
+                took, how = self._verify_value_committed(base_prompt, value_prompt)
+                if not took:
+                    return {"ok": False, "halt": True,
+                            "reason": f"Drake did not accept {val!r} for field {fn} — it is still "
+                                      f"asking for that field's value. NOTHING was committed; the "
+                                      f"refused text is still on screen. Enter this box by hand.",
+                            "prompt_after_value": how}
                 committed = True
-            # 7) settle, then make sure the value did not trip a validator.
+                commit_evidence = how
+            # 8) settle, then make sure the value did not trip a validator.
             if settle_after:
                 time.sleep(settle_after)
             bad = self._detect_unexpected_dialog()
@@ -859,6 +1055,8 @@ class DrakeDriver:
                         "reason": f"error dialog after entering field {fn}: {bad['summary']}", "dialog": bad}
             return {"ok": True, "field_no": field_no, "model": model,
                     "value_committed": committed,
+                    "commit_evidence": commit_evidence,
+                    "read_back": read_back,
                     "popup_reopened": opened.get("opened"),
                     "popup_attempts": opened.get("attempts"),
                     # False here after a committing field is the Field-4/EIN signature:
@@ -868,14 +1066,22 @@ class DrakeDriver:
         except Exception as e:
             return {"ok": False, "halt": True, "reason": str(e)}
 
-    def probe_headsdown_popup(self) -> dict:
-        """READ-ONLY diagnostic: with the heads-down popup open, dump its real control tree,
-        test a set_edit_text('4') round-trip, and report whether the popup CLOSES after
-        Enter (per-jump: value goes to the canvas) or STAYS (persistent command-bar: value
-        goes back to the popup). Resolves the exact Edit class + focus handles + model so
-        the entry driver binds correctly. Writes NO field value — the test Enter only moves
-        the caret to field 4 (EIN); nothing is typed into a box."""
-        out = {"ok": True}
+    def probe_headsdown_popup(self, probe_field: str = "6") -> dict:
+        """Calibration probe for the heads-down popup: dump its real control tree, round-trip
+        a field number, and record the popup's PROMPT TEXT at each of three states — waiting
+        for a number, waiting for a value, and after disarm. Those three strings are what the
+        entry driver's refusal detection compares against, so this is the run that makes
+        `headsdown_type` able to tell acceptance from silent refusal.
+
+        NOT read-only, and the docstring used to claim otherwise: pressing Enter on a field
+        number ARMS Drake for that field's value. It probed field **4** — the employer EIN,
+        an auto-fill field that already holds a real value and is the one box flagged
+        do-not-touch — and then walked away leaving Drake armed, so the next run's first
+        field number was committed as the EIN. It now probes field 6 (employer "Name cont.",
+        normally empty and inert) and DISARMS with a focus-proven Esc before returning.
+
+        Still writes no field value: the value prompt is answered with Esc, never text."""
+        out = {"ok": True, "probe_field": probe_field}
         if self.dry_run or self.w32 is None:
             return {"ok": False, "reason": "no win32 popup connection (run on the VM after connect)"}
         try:
@@ -914,8 +1120,12 @@ class DrakeDriver:
             except Exception as e:
                 out["set_focus_error"] = str(e)
             out["focus_is_edit_after_setfocus"] = (self._focused_hwnd()[0] == eh)
+            # STATE 1 — waiting for a FIELD NUMBER. This string is the baseline every
+            # later refusal check compares against; if it is empty, this build exposes no
+            # prompt text and refusal detection degrades (the driver says so at runtime).
+            out["prompt_at_number"] = self._popup_prompt(popup, eh)
             try:
-                edit.set_edit_text("4")
+                edit.set_edit_text(probe_field)
                 out["set_edit_text_readback"] = _safe_read_edit(eh)
             except Exception as e:
                 out["set_edit_text_error"] = str(e)
@@ -924,17 +1134,63 @@ class DrakeDriver:
             except Exception as e:
                 out["enter_error"] = str(e)
             time.sleep(0.4)
-            out["popup_still_open_after_enter"] = self._find_headsdown_popup(timeout=0.5) is not None
+            live = self._find_headsdown_popup(timeout=0.5)
+            out["popup_still_open_after_enter"] = live is not None
+            # STATE 2 — waiting for the VALUE (persistent build only).
+            out["prompt_at_value"] = self._popup_prompt(live, eh) if live is not None else ""
+            out["prompt_changed"] = bool(out["prompt_at_number"]
+                                         and out["prompt_at_value"]
+                                         and out["prompt_at_number"] != out["prompt_at_value"])
             f1 = self._focused_hwnd()
             out["focus_after_enter"] = {"hwndFocus": f1[0], "hwndCaret": f1[1], "rcCaret": f1[2],
                                         "caret_blinking": bool(f1[3] & _GUI_CARETBLINKING)}
             out["model"] = ("persistent-command-bar (value -> popup)" if out["popup_still_open_after_enter"]
                             else "per-jump dialog (value -> canvas)")
+            out["refusal_detection"] = (
+                "AVAILABLE — the prompt changes between the number and value states, so a "
+                "silently refused number or value can be detected" if out["prompt_changed"] else
+                "DEGRADED — the popup prompt is unreadable or does not change, so a silent "
+                "refusal cannot be positively detected; verify every box on the screenshot")
+            out["disarm"] = self._disarm_popup()
+            # STATE 3 — after disarm. Drake must be back to a normal, unarmed screen.
+            after = self._find_headsdown_popup(timeout=0.3)
+            out["popup_open_after_disarm"] = after is not None
+            out["prompt_after_disarm"] = self._popup_prompt(after, eh) if after is not None else ""
             out["unexpected_dialog"] = self._detect_unexpected_dialog()
         except Exception as e:
             out["ok"] = False
             out["reason"] = str(e)
         return out
+
+    def _disarm_popup(self) -> dict:
+        """Send Esc to the heads-down popup so Drake is not left ARMED for a value.
+
+        The Esc is deliberately NOT blind. `nav.to_data_entry_selector` is also Esc, and an
+        Esc that lands on the canvas instead of the popup EXITS the W-2 screen. So: re-find
+        the popup, prove its edit owns the keyboard, and only then send the key."""
+        popup = self._find_headsdown_popup(timeout=0.5)
+        if popup is None:
+            self._popup_owned = False
+            return {"ok": True, "note": "popup already closed — nothing to disarm"}
+        try:
+            edit = self._popup_edit(popup)
+            edit.wait("ready", timeout=2)
+            eh = int(edit.handle)
+        except Exception as e:
+            return {"ok": False, "note": f"could not resolve the popup edit to disarm: {e}"}
+        if not self._focus_popup_edit(edit, eh):
+            return {"ok": False,
+                    "note": "popup edit never took focus — did NOT send Esc, because an Esc on "
+                            "Drake's canvas exits the data-entry screen. Press Esc by hand."}
+        self._keys("{ESC}")
+        import time
+        time.sleep(0.25)
+        still = self._find_headsdown_popup(timeout=0.3) is not None
+        self._popup_owned = False
+        return {"ok": not still,
+                "note": ("popup closed — Drake is no longer armed" if not still else
+                         "Esc did not close the popup; press Esc in Drake by hand before the "
+                         "next run, or it will be armed for a value")}
 
     def type_text(self, target: dict, text: str, opts: Optional[dict] = None) -> dict:
         opts = opts or {}
@@ -1486,16 +1742,97 @@ def _safe_read_edit(hedit) -> str:
         return ""
 
 
+def _read_edit_or_none(hedit):
+    """The edit's text, or None if the READ ITSELF failed.
+
+    Distinct from _safe_read_edit, which collapses failure into '' — and '' is a
+    meaningful answer here ("Drake cleared the box"). The WM_GETTEXT timeout fires
+    precisely when Drake is busy, which is precisely when a fabricated '' would be
+    believed. Callers must treat None as NO EVIDENCE, never as agreement."""
+    try:
+        return (_read_edit_text(hedit) or "").strip()
+    except Exception:
+        return None
+
+
+def _popup_prompt_text(popup_hwnd, edit_hwnd=None, edit_class: str = "Edit") -> str:
+    """The heads-down popup's PROMPT — its child text minus the box you type into.
+
+    On this build the number prompt reads "To begin, enter desired field number and press
+    enter."; once Drake has taken the number it asks for the value instead. Comparing this
+    against a baseline captured just before Enter is the ONLY way to tell "Drake consumed
+    the number" from "Drake silently refused it" — both leave the edit empty. Returns ''
+    when nothing is readable, which callers must treat as no evidence."""
+    parts = []
+    try:
+        for c in _enum_child_summaries(int(popup_hwnd), cap=24):
+            if edit_hwnd and int(c.get("hwnd") or 0) == int(edit_hwnd):
+                continue
+            if (c.get("class_name") or "") == edit_class:
+                continue
+            t = (c.get("text") or "").strip()
+            if t:
+                parts.append(t)
+    except Exception:
+        return ""
+    return " ".join(parts)
+
+
+def _as_number(s):
+    """Decimal value of a money-ish string, or None if it is not cleanly numeric.
+    Accepts a leading sign, '$', thousands commas, spaces and accounting parens. Rejects
+    anything else (hyphens mid-string, exponents, nan/inf) so EINs and ZIPs fall through
+    to the textual comparison rather than being mangled into numbers."""
+    from decimal import Decimal, InvalidOperation
+    t = str(s).strip().replace("$", "").replace(",", "").replace(" ", "")
+    if not t:
+        return None
+    neg = t.startswith("(") and t.endswith(")")
+    if neg:
+        t = t[1:-1]
+    if t[:1] in ("+", "-"):
+        neg = neg or t[0] == "-"
+        t = t[1:]
+    if not t or t == "." or t.count(".") > 1:
+        return None
+    if not all(ch.isdigit() or ch == "." for ch in t):
+        return None
+    try:
+        d = Decimal(t)
+    except InvalidOperation:
+        return None
+    return -d if neg else d
+
+
 def _same_value(got, expected) -> bool:
-    """Did the box end up holding the value we meant? Exact first, then tolerant of the
-    cosmetic reformatting a field does as you type — '52,000' vs '52000', '12-3456789' vs
-    '123456789', case. Deliberately NOT tolerant of different digits: this gate is what
-    stops a wrong number being committed, so it only forgives punctuation and case."""
+    """Did the box end up holding the value we meant?
+
+    This is the LAST gate before an irreversible Enter, on a surface with no read-back, so
+    it forgives only COSMETIC differences — the reformatting a field does as you type —
+    and never a difference in what the number MEANS.
+
+    Forgives: thousands separators and currency ('52,000' == '52000'), the hyphens Drake
+    inserts into an EIN or ZIP ('12-3456789' == '123456789'), trailing cents ('52000.00'
+    == '52000'), and case.
+
+    Never forgives: a moved decimal point or a flipped sign. '322450' is not '3224.50' (a
+    100x error) and '5000' is not '-5000'. Both were silently APPROVED before, because the
+    old normalization deleted '.', '-' and '()' from both sides before comparing — so the
+    one gate protecting a tax return blessed exactly the two ways a money value goes
+    catastrophically wrong."""
     if got is None:
         return False
     a, b = str(got).strip(), str(expected).strip()
     if a == b:
         return True
+    na, nb = _as_number(a), _as_number(b)
+    if na is not None and nb is not None:
+        return na == nb  # Decimal equality: 52000.00 == 52000, 3224.50 != 322450
+    # Not a clean numeric pair. If either side carries a decimal point or a leading sign,
+    # the difference is arithmetic rather than cosmetic — refuse instead of normalizing it
+    # away. (An EIN/ZIP hyphen sits mid-string, so those still reach the fallback.)
+    if any(("." in s) or s[:1] in ("-", "+", "(") for s in (a, b)):
+        return False
     norm = lambda s: "".join(ch for ch in s if ch.isalnum()).lower()
     return norm(a) == norm(b)
 

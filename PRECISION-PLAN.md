@@ -63,7 +63,8 @@ isolation is the pivotal experiment (§6).
     (`employer_ein=0 → employer_name=1 → box1_wages=2 → box2_fed_wh=3`).
 
 Macro-string form (aspirational, if we stand up Drake's macro engine):
-`W2>[FJ:1]12-3456789[FJ:2]ACME[FJ:3]52000[FJ:4]6000~`  (`>`=Enter, `~`=save+exit).
+`W2>[FJ:5]ACME[FJ:23]52000[FJ:24]6000~`  (`>`=Enter, `~`=save+exit).
+(Field numbers are Drake's own — 5=employer name, 23=Box 1, 24=Box 2. NOT 1/2/3/4: 1/2/3 are the TS, F and Special-tax-treatment header controls and 4 is the EIN. `w2_map.W2_FIELD_MAP` is the single authority.)
 Tabbed screens renumber per tab — use `[NEXTTAB]`.
 
 ### Fallback: image-anchored click (not absolute pixels)
@@ -186,11 +187,12 @@ That opens the W-2 screen by code, presses **Ctrl+N**, and screenshots. Then tel
 1. Did a **number** appear on each field? (heads-down works)
 2. Read me the number on: **employer EIN**, **employer name**, **box 1 wages**, **box 2 fed w/h**.
 
-Then validate entry by those numbers (substitute the 4 numbers you read):
+Then validate entry by those numbers (the map in `w2_map.W2_FIELD_MAP` is authoritative;
+never guess a number, and never use 4 — the EIN auto-fills and auto-advances):
 
 ```
 python agent.py headsdown --binding binding.json --screen W2 \
-  --seq "1=12-3456789,2=TEST EMPLOYER,3=52000,4=6000" --shot heads_typed.png
+  --seq "5=TEST EMPLOYER,23=52000,24=6000" --shot heads_typed.png
 ```
 
 **Pass = the four values land in the right boxes with NO click.** If Ctrl+N breaks focus,

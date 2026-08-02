@@ -297,6 +297,37 @@ one file, with no manual capture round-trip. The same dump is available on deman
 python agent.py envdump --binding binding.json --out env-dump.json --delay 5
 ```
 
+### The confirmed protocol, and what proves each step
+
+Drake 2025 uses the **persistent command bar**: the popup stays up and alternates
+`number → Enter → value → Enter → number`, with the value typed *into the popup*. The
+driver detects this at runtime rather than assuming it, so a build that behaves differently
+still routes correctly.
+
+Two things make that safe, and both are new:
+
+**Drake's own prompt is the source of truth.** A field number Drake *refuses* clears the
+edit box exactly like one it *accepts* — so "the box changed" cannot tell them apart.
+Boxes that are greyed out (box 9) or foreign-address-only (11/12/13) decline **silently**:
+no dialog, no complaint, the caret simply doesn't move. Believing that refusal was an
+acceptance is what makes the next field's *number* get typed as this field's *value*, after
+which every value lands one box off and every row still reports OK. The driver now
+baselines the popup's prompt text before Enter and requires it to *change* — and after the
+value, requires it to come *back* to the number prompt. Compared against the captured
+baseline, never a hardcoded English string, so a reworded build can't silently disable it.
+
+**Read-backs must converge, not just match once.** Keystrokes are *posted* to Drake's queue;
+`WM_GETTEXT` and `set_edit_text` are *sent* and jump ahead of it. The old "read it back, and
+repair it with set_edit_text if it's wrong" could therefore read a half-arrived `520`,
+repair it to `52000`, re-read clean, pass the gate — and only then have the queued `00`
+arrive and append, committing **5,200,000** while reporting success. The repair is gone;
+the driver now waits for two consecutive identical reads, which proves every injected key
+has already been consumed.
+
+The comparator was loosened in the same direction and is now strict: it forgives Drake's
+cosmetic reformatting (`52,000` = `52000`, `12-3456789` = `123456789`, `52000.00` = `52000`)
+but never a moved decimal point or a flipped sign. `322450` is not `3224.50`.
+
 **The Field-4/EIN exception** (confirmed on Drake 2025): committing the employer EIN
 fires Drake's employer lookup + auto-fill, auto-advances the caret to Box 1, and
 *swallows the next Ctrl+N*. That single eaten chord is what caused the original cascade —
@@ -311,14 +342,37 @@ case: any auto-advancing field recovers the same way.
 python simulate_headsdown.py
 ```
 
-A fake Drake that reproduces the observed behaviours — including the Field-4 swallowed
-chord — so the state machine can be proven in a second, anywhere, before it touches a
-return. It covers both popup models, auto-advance on other fields, that an invalid
-field number halts instead of cascading, and the structural dialog gate: **every case
-runs with the 'Drake Software Chat' window present** (the live field-4 halt), a benign
-window appearing mid-run is ignored + logged, a disabled main frame halts structurally,
-and the classifier's decision table is unit-checked. It fakes *Drake*, not pywinauto:
-focus and window behaviour on the real thing is still VM-verified.
+A fake Drake reproducing the observed behaviours — the persistent protocol, the Field-4
+swallowed chord, silent refusals, and a popup left armed by a previous run — so the state
+machine is provable in seconds, anywhere, before it touches a return. 23 cases: both popup
+models, the EIN-skipped batch shape, an inert box that declines silently (in both variants:
+leaving the number in the edit, and clearing it), a silently refused value, corrupted and
+late-arriving keystrokes, an empty value, an inherited armed popup, a build with no readable
+prompt text, and the structural dialog gate — **every case runs with the 'Drake Software
+Chat' window present** (the live field-4 halt).
+
+It fakes *Drake*, not pywinauto: focus and window behaviour on the real thing is still
+verified on the Windows machine.
+
+**Every guard is mutation-tested.** A green suite proved nothing the last two times — the
+first fake gave `_FakeWin` an `exists()` that real `UIAWrapper` lacks, so 9/9 passed while
+the live run died at field 4; the second made read-back an identity function, so every
+read-back gate was dead code that could be deleted with the suite still green. So each
+guard is now broken *in the source*, in an isolated copy, and the suite must go red:
+
+| guard broken | suite result |
+|---|---|
+| comparator back to alnum-only (deletes `.` and `-`) | 22/23 |
+| comparator drops the decimal/sign refusal | 22/23 |
+| single read instead of convergence (the old repair) | 20/23 |
+| empty-value guard removed | 22/23 |
+| inherited-popup ownership check removed | 22/23 |
+| prompt baseline removed (classify by the edit box alone) | 21/23 |
+| commit proof removed (assume the value was accepted) | 22/23 |
+| Ctrl+N keyboard-scope gate removed | 22/23 |
+| structural dialog gate blinded | 20/23 |
+
+A guard whose mutant survives has no test, whatever the suite says.
 
 ## Files
 

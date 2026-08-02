@@ -1,6 +1,12 @@
 {
   "_about": "Example of the EXACT structured output the LLM must produce from a W-2 PDF. Key names are the contract — w2_map.W2_FIELD_MAP resolves each one to a Drake heads-down field number. Keys may be omitted or left empty; empty and zero money fields are skipped (a blank box is zero on a tax form). Any key NOT in the map is reported and ignored, never guessed at. Values may arrive formatted ('$52,000.00', '12-3456789') — sanitization is the driver's job, not the model's. TEST DATA ONLY.",
 
+  "_employee_ssn_note": "employee_ssn is kept here deliberately and is NOT entered: the W-2 screen has no SSN box (the employee block is captioned 'if different from screen 1' because the SSN lives on screen 1). It used to be mapped to field 13, which is the EMPLOYER's foreign postal code — so it typed the SSN into the wrong box, on a domestic employer, with no read-back to catch it. It now appears under NOT ON THIS SCREEN in the plan. Leave it here: it is the regression fixture proving the key is diverted rather than typed.",
+
+  "_ts_note": "Whose W-2 this is (field 1, T or S) is NOT in this file on purpose — it is an operator fact, not something a PDF states, so pass --ts T|S. Left unset, Drake defaults to T, which on a joint return files a spouse's W-2 under the taxpayer.",
+
+  "_scope_note": "This sample deliberately covers only fields CONFIRMED by entry. The map also supports box 12 year columns (36/39/42/45), box 14 (49-56) and state/local rows 2-4 (64-84) — those are mapped but never yet entered on a live build, so they are not exercised here.",
+
   "employer_ein": "12-3456789",
   "employer_name": "TEST EMPLOYER LLC",
   "employer_street": "123 BUSINESS RD",
