@@ -26,6 +26,12 @@ python -m pip install -r requirements.txt
 copy binding.example.json binding.json
 ```
 
+**Install Tesseract too.** It is not a Python package — get the UB-Mannheim Windows build,
+and if it isn't on `PATH` set `tesseract_cmd` in `binding.json`. This is not optional on
+Drake 2025: the heads-down popup owns no child window, so screen-reading is the only channel
+that can confirm a keystroke before Enter, and without it every field halts unverified. Check
+with `agent.py probe-popup` — it prints each read channel and what it returned.
+
 Run everything in the **interactive, unlocked** Windows session (UI Automation can't
 drive the GUI from a locked screen or a service). Don't touch the keyboard/mouse
 while a run is in progress.
@@ -255,10 +261,11 @@ never sends a keystroke it hasn't verified the destination of:
 
 1. The heads-down popup is a **real Win32 dialog**, not Drake's opaque canvas — so it's
    driven as one, via a second `backend="win32"` connection.
-2. Its Edit control is focused and focus is **proven** with `GetGUIThreadInfo` before
-   anything is typed.
-3. The field number is typed, then **read back** with `WM_GETTEXT` and asserted equal —
-   *before* the irreversible Enter.
+2. Its typing box is focused and focus is **proven** with `GetGUIThreadInfo` before anything
+   is typed. On this build that box *is the popup* — it owns no child window (see below).
+3. The field number is typed, then **read back** and asserted equal — *before* the
+   irreversible Enter. `WM_GETTEXT` when there's a child Edit; otherwise the popup is read
+   as a whole through the accessibility tree or OCR.
 4. After the jump, the driver **observes** which popup model this build uses rather than
    assuming: popup closed → the value goes on the canvas; popup still open and prompting
    → the value goes back into the popup. A build or tax-year difference can't silently
@@ -394,6 +401,67 @@ reports what is in there. Nothing is ever typed blind.
 `WM_SETTEXT` is refused on a target that is not a text box: on a non-edit window it rewrites
 the **caption**, which on the popup itself would rename the very window we find it by.
 
+### The popup has no child window at all — Drake paints it
+
+Confirmed on the live build: `EnumChildWindows` on the heads-down popup returns **`[]`**, and
+`GetGUIThreadInfo().hwndFocus` **is the popup itself**. There is no Edit control because there
+is no control — Drake draws the box onto the dialog, the same way it draws the data-entry
+grid. So the popup *is* the keyboard target, and it is typed into directly.
+
+That removes the foundation every safety gate was standing on. `WM_GETTEXT` on the popup
+returns its **caption** (`Drake 2025 - Heads Down Data Entry`) — a constant that has nothing
+to do with what was typed, and reading it as "the box" would report every silent refusal as
+an acceptance. So the box is read *as a whole*, through the first channel that answers:
+
+| channel | what it is | when it works |
+|---|---|---|
+| `win32` | `WM_GETTEXT` on a child Edit | only on builds that have one |
+| `uia` | the accessibility tree, addressed by handle | if Drake exposes anything at all |
+| `ocr` | screenshot the popup, Tesseract | always — a painted box is still a picture |
+
+A reading contains the prompt *and* whatever has been typed, in one string, so verification
+changed shape:
+
+- **Token runs, not substrings.** `5` must not match inside `52000`, but `TEST EMPLOYER LLC`
+  is three tokens and Drake renders `52,000` as two. A match is a run of consecutive tokens
+  whose concatenation is exactly right — it can span punctuation but cannot start or end
+  mid-token.
+- **Counting, not presence.** Drake's value prompt names the field (*"Enter the value for
+  field 1…"*). A presence test would pass on the prompt's own `1` when nothing was typed, and
+  would refuse the legitimate entry of the value `1`. So the count must *exceed* what the
+  same popup showed before we typed.
+- **Stability on the normalised reading.** Two consecutive readings of an unchanged popup are
+  not byte-identical when they come from OCR — spacing and punctuation move. Comparing raw
+  text would time out on keystrokes that had in fact landed; comparing alphanumerics-only
+  keeps the drain proof without failing on a stray comma.
+- **The baseline is not exempt.** Every refusal check compares later readings against a
+  prompt captured *before* Enter, so that capture has to converge too. The simulator's
+  character-noise case caught this in this driver: one corrupted frame taken as the baseline
+  inverts the logic — every *clean* frame afterwards differs from it, a silently refused
+  field reads as accepted, and the value gets typed at the number prompt. `_stable_prompt`
+  requires the baseline to be seen twice, and returns `''` (→ halt, on a painted popup)
+  rather than hand back a reading it could not confirm.
+
+If **no** channel can read the popup, entry halts before the first Enter rather than typing
+blind, and says that installing Tesseract is what enables the only read-back a painted box
+allows. `probe-popup` reports each channel by name, what it returned, and whether it could
+see the probe number — that verdict is `read_back: AVAILABLE via … / UNAVAILABLE`.
+
+### One dialog may be answered automatically — by clicking a named button
+
+Drake raises *"There are fields on this screen that must contain data if you are planning to
+e-file this return"* whenever the screen is left with e-file-required boxes empty, which is
+the normal state of a W-2 halfway through being keyed. It blocks entry, so it is on a short
+allowlist (`navigation.auto_dismiss`, matched on the dialog's **text** — `Drake 2025 - Data
+Entry` captions several different dialogs).
+
+It is answered by **finding the button named `OK` and clicking that button**, never by
+sending Enter. Enter presses whichever button is the dialog's default, unseen; here the two
+answers are *stay on this screen and finish entering* and *leave the screen anyway*, and the
+second silently moves Drake off the W-2 mid-batch, after which every remaining field number
+addresses something else. No button with that name, no keystroke — it halts and lists the
+buttons it did find. Every dialog not on the list still halts for a human.
+
 **The Field-4/EIN exception** (confirmed on Drake 2025): committing the employer EIN
 fires Drake's employer lookup + auto-fill, auto-advances the caret to Box 1, and
 *swallows the next Ctrl+N*. That single eaten chord is what caused the original cascade —
@@ -410,16 +478,26 @@ python simulate_headsdown.py
 
 A fake Drake reproducing the observed behaviours — the persistent protocol, the Field-4
 swallowed chord, silent refusals, and a popup left armed by a previous run — so the state
-machine is provable in seconds, anywhere, before it touches a return. 28 cases: both popup
+machine is provable in seconds, anywhere, before it touches a return. 34 cases: both popup
 models, the EIN-skipped batch shape, an inert box that declines silently (in both variants:
 leaving the number in the edit, and clearing it), a silently refused value, corrupted and
 late-arriving keystrokes, an empty value, an inherited armed popup, a build with no readable
-prompt text, a popup whose text box is a `TEdit`/`WindowsForms10.EDIT…`/`RichEdit20W`, a
-popup with no typing box at all, and the structural dialog gate — **every case runs with the
-'Drake Software Chat' window present** (the live field-4 halt).
+prompt text, a popup whose text box is a `TEdit`/`WindowsForms10.EDIT…`/`RichEdit20W`, **the
+confirmed painted popup with no child window** (entering a full W-2, under screen-read
+jitter, refusing a silent decline, and halting when nothing can read it), the e-file warning
+being dismissed by name, and the structural dialog gate — **every case runs with the 'Drake
+Software Chat' window present** (the live field-4 halt).
 
 It fakes *Drake*, not pywinauto: focus and window behaviour on the real thing is still
 verified on the Windows machine.
+
+**A fake that is easier than the real thing hides the bugs it exists to catch** — twice now.
+`_FakeWin` once had an `exists()` that real `UIAWrapper` lacks, so the suite was green while
+the live run died. Then the "painted" popup was modelled with a `Static` child still holding
+the prompt, which quietly fed the driver clean text through a path the real build does not
+have; the painted cases passed while the screen-reading path they existed to exercise was
+barely used. Making the fake report `[]`, as the live probe does, failed a case immediately —
+and that failure was a real defect in the driver, not in the test.
 
 **Every guard is mutation-tested.** A green suite proved nothing the last two times — the
 first fake gave `_FakeWin` an `exists()` that real `UIAWrapper` lacks, so 9/9 passed while
@@ -429,19 +507,33 @@ guard is now broken *in the source*, in an isolated copy, and the suite must go 
 
 | guard broken | suite result |
 |---|---|
-| comparator back to alnum-only (deletes `.` and `-`) | 27/28 |
-| comparator drops the decimal/sign refusal | 27/28 |
-| single read instead of convergence (the old repair) | 25/28 |
-| empty-value guard removed | 27/28 |
-| inherited-popup ownership check removed | 27/28 |
-| prompt baseline removed (classify by the edit box alone) | 26/28 |
-| commit proof removed (assume the value was accepted) | 27/28 |
-| Ctrl+N keyboard-scope gate removed | 27/28 |
-| popup edit matched by exact class name only (the live halt) | 27/28 |
-| popup edit ranking accepts any child (a label becomes the target) | 26/28 |
-| no children → type at the popup itself (blind entry) | 27/28 |
-| prompt baseline lets edit-shaped children leak in | 27/28 |
-| structural dialog gate blinded | 25/28 |
+| comparator back to alnum-only (deletes `.` and `-`) | 37/38 |
+| comparator drops the decimal/sign refusal | 37/38 |
+| single read instead of convergence (the old repair) | 35/38 |
+| empty-value guard removed | 37/38 |
+| inherited-popup ownership check removed | 37/38 |
+| prompt baseline removed (classify by the edit box alone) | 33/38 |
+| commit proof removed (assume the value was accepted) | 37/38 |
+| Ctrl+N keyboard-scope gate removed | 37/38 |
+| popup edit matched by exact class name only (the live halt) | 37/38 |
+| popup edit ranking accepts any child (a label becomes the target) | 37/38 |
+| no children → type at the popup itself (blind entry) | 33/38 |
+| painted popup: commit a value without confirming the keystroke | 37/38 |
+| painted popup: Enter on an unconfirmed field number | 36/38 |
+| painted popup: presence instead of counting (prompt's own digits) | 36/38 |
+| prompt change accepted from a single jittery frame | 37/38 |
+| prompt **baseline** taken from a single frame | 37/38 |
+| auto-dismiss presses Enter blind instead of a named button | 37/38 |
+| auto-dismiss treats every dialog as dismissable | 37/38 |
+| prompt baseline lets edit-shaped children leak in | 37/38 |
+| structural dialog gate blinded | 33/38 |
+
+Two mutants are documented in the harness as **not** gaps rather than papered over with a
+test that cannot exist: the `target.startswith(acc)` early-break in `_surface_count` is an
+*equivalent* mutant (checked against the guard-free version over 200k random pairs — zero
+behavioural differences; it is a speed guard), and `_is_surface_hwnd` in
+`_classify_after_jump`'s final fallback chooses between two outcomes that **both halt**, so
+it buys a truthful message rather than a different result.
 
 A guard whose mutant survives has no test, whatever the suite says.
 

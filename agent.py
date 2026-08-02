@@ -626,13 +626,20 @@ def cmd_probe_popup(args) -> int:
         # The box could not be identified — nothing was typed. popup_controls (above) is the
         # answer: it lists what the popup actually contains, class names included.
         print("\n⚠ the popup's TEXT BOX could not be identified, so nothing was typed.")
-        print("  popup_controls above lists the children Drake really has. Set")
-        print("  navigation.headsdown_popup_edit_class in binding.json to the class of the")
-        print("  box (the one that is not a Static label) and re-run this probe.")
+        print(f"  {(res.get('edit_resolution') or {}).get('why')}")
+        print("  popup_controls above lists the children Drake really has. If there are")
+        print("  some, set navigation.headsdown_popup_edit_class to the class of the box")
+        print("  (the one that is not a Static label). If the list is empty, Drake paints")
+        print("  the box and the popup must hold the keyboard — click into Drake first.")
         return 2
     print(f"\nmodel:            {res.get('model')}")
     print(f"edit control:     {res.get('edit_class_name')!r} "
           f"(hwnd={res.get('edit_handle')}, matched by {res.get('edit_resolved_by')})")
+    for name, r in (res.get("read_channels") or {}).items():
+        t = r.get("text")
+        print(f"  channel {name:<6} {'-> ' + repr(t[:70]) if t else '(nothing)'}"
+              f"{'  [' + r['error'][:80] + ']' if r.get('error') else ''}")
+    print(f"read-back:        {res.get('read_back')}")
     print(f"number prompt:    {res.get('prompt_at_number')!r}")
     print(f"value prompt:     {res.get('prompt_at_value')!r}")
     print(f"refusal detection: {res.get('refusal_detection')}")

@@ -25,6 +25,22 @@ import re as _re
 from types import SimpleNamespace as _SimpleNamespace
 from typing import Any, Optional
 
+# Dialogs a run may close by itself, by clicking a button IDENTIFIED BY NAME. Override with
+# navigation.auto_dismiss in binding.json; set it to [] to make every dialog halt.
+#
+# Only one entry, and it earns its place: Drake raises this warning when the screen is left
+# with e-file-required boxes still empty, which is the normal state of a W-2 halfway through
+# being keyed. Clicking OK is the answer that KEEPS US ON THE SCREEN — the message itself
+# says "To enter this data now, click OK" — so the remaining field numbers still address the
+# W-2. The other answer leaves the screen, and every field after it would land somewhere
+# else. If this build's buttons are named differently, change "button" here rather than
+# letting the driver guess.
+_DEFAULT_AUTO_DISMISS = [
+    {"match": r"must contain data if you are planning to e-?file",
+     "button": "OK",
+     "why": "Drake's e-file completeness warning — OK stays on this screen to finish keying it."},
+]
+
 try:
     from pywinauto import Application
     from pywinauto.keyboard import send_keys
@@ -107,6 +123,17 @@ class DrakeDriver:
         self._popup_owned = False
         self._warned_prompt_blind = False
         self._warned_popup_foreign = False
+        self._warned_surface_blind = False
+        self._last_ocr_error = None   # why the screen-reading channel came back empty
+        # How the heads-down popup is READ when it owns no child window (CONFIRMED on Drake
+        # 2025: EnumChildWindows returns [] — Drake paints the box itself). Order matters:
+        # UIA is exact if Drake exposes anything, OCR is approximate but cannot be refused.
+        # Set to [] to force the run to prove nothing can be read and stop.
+        self.popup_read_channels = list(self.nav.get("headsdown_read_channels", ["uia", "ocr"]))
+        # Dialogs the run may close BY ITSELF, each by clicking a NAMED button. Everything
+        # else still halts for a human. Keep this list short and specific: an entry here is
+        # permission to answer a question about a tax return without being asked.
+        self.auto_dismiss = list(self.nav.get("auto_dismiss", _DEFAULT_AUTO_DISMISS))
         self._popup_hwnd = None  # last resolved popup handle (exact; see _find_popup_hwnd)
         # Last popup-edit resolution ({hwnd, class_name, how, children}) — kept so a halt
         # dump can report the popup's real control tree instead of just "timed out".
@@ -507,6 +534,229 @@ class DrakeDriver:
             self._popup_hwnd = None
             return None
 
+    # -- reading a popup Drake paints itself ---------------------------------
+
+    def _read_popup_uia(self, popup_hwnd) -> Optional[str]:
+        """The popup's text via UI Automation, addressed by HANDLE.
+
+        Worth trying even though Drake's grid exposes nothing: UIA bridges MSAA/IAccessible,
+        so an owner-drawn control with any accessibility support surfaces here even with no
+        child HWND. Returns None when the channel is unavailable or silent — never ''.
+        '' is a claim ("the box is empty") and this must not make claims it cannot support."""
+        if self.app is None:
+            return None
+        try:
+            spec = self.app.window(handle=int(popup_hwnd))
+            parts = []
+            for el in spec.descendants():
+                try:
+                    t = (el.window_text() or "").strip()
+                except Exception:
+                    t = ""
+                if t:
+                    parts.append(t)
+                for getter in ("get_value", "legacy_properties"):
+                    try:
+                        v = getattr(el, getter)()
+                    except Exception:
+                        continue
+                    if isinstance(v, dict):
+                        v = v.get("Value")
+                    v = (str(v).strip() if v is not None else "")
+                    if v and v not in parts:
+                        parts.append(v)
+            return " ".join(parts) or None
+        except Exception:
+            return None
+
+    def _read_popup_ocr(self, popup_hwnd) -> Optional[str]:
+        """The popup's text read off the SCREEN — the channel that cannot be refused.
+
+        Drake paints this box, so a picture of it is the same evidence a human has. The
+        popup is small, high-contrast and single-line-ish, which is the case OCR is most
+        reliable on — unlike the dense grid behind it. Whole-window grab (psm 6): the caller
+        looks for a token, not an exact string."""
+        if pytesseract is None:
+            self._last_ocr_error = ("pytesseract/Pillow not installed — pip install "
+                                    "pytesseract pillow")
+            return None
+        try:
+            from PIL import ImageGrab
+            if self.tesseract_cmd:
+                pytesseract.pytesseract.tesseract_cmd = self.tesseract_cmd
+            # A screen grab reads whatever PIXELS are there, so it is only evidence about
+            # the popup while the popup is what is on top. If something else has come
+            # forward, the crop shows that window instead — and a token found in it would
+            # be read as our own keystroke. No foreground, no reading.
+            if int(_keyboard_target_info().get("root") or 0) != int(popup_hwnd):
+                self._last_ocr_error = "the popup is not the foreground window — grab skipped"
+                return None
+            r = _wintypes.RECT()
+            _u32().GetWindowRect(int(popup_hwnd), _ctypes.byref(r))
+            if r.right <= r.left or r.bottom <= r.top:
+                return None
+            box = (r.left, r.top, r.right, r.bottom)
+            try:
+                # all_screens: GetWindowRect is in VIRTUAL desktop coordinates, so a popup on
+                # a second monitor has an origin outside the primary screen — without this
+                # the grab silently returns the wrong region (or a negative-origin crop).
+                img = ImageGrab.grab(bbox=box, all_screens=True)
+            except TypeError:      # Pillow < 9.2 has no all_screens
+                img = ImageGrab.grab(bbox=box)
+            if img.width < 8 or img.height < 8:
+                return None
+            # 3x upscale + greyscale: Drake's popup font is small, and Tesseract's accuracy
+            # falls off a cliff below ~20px of x-height.
+            img = img.convert("L").resize((img.width * 3, img.height * 3))
+            txt = (pytesseract.image_to_string(img, config="--psm 6") or "").strip()
+            self._last_ocr_error = None
+            return " ".join(txt.split()) or None
+        except Exception as e:
+            # Kept, not swallowed: the Python package installs cleanly while the Tesseract
+            # BINARY is missing, and that failure ("tesseract is not installed or it's not
+            # in your PATH") is the single most useful line the probe can print.
+            self._last_ocr_error = f"{type(e).__name__}: {e}"
+            return None
+
+    def _read_popup_surface(self, popup_hwnd, edit_hwnd=None):
+        """(text, channel) for the heads-down popup — everything it is showing right now.
+
+        Channels in order of trustworthiness. A child Edit's WM_GETTEXT is exact; UIA is
+        exact when Drake exposes anything; OCR is approximate but is the only one that works
+        on a box the application paints itself. (None, "none") means NO channel could read
+        it — which callers must treat as no evidence, never as agreement.
+
+        Note this returns the WHOLE popup (prompt + whatever has been typed), not a field
+        value, because with no child window there is nothing finer to address."""
+        if edit_hwnd and int(edit_hwnd) != int(popup_hwnd):
+            t = _read_edit_or_none(edit_hwnd)
+            if t is not None:
+                return t, "win32"
+        # EVERY enabled channel, joined — not first-wins. A channel that answers with
+        # something useless but non-empty (a constant caption, say) would otherwise shadow
+        # one that actually sees the typed text, and the run would halt on every field with
+        # a working read-back sitting unused behind it. Extra text is harmless: matching
+        # counts tokens, so more haystack cannot manufacture a match.
+        parts, names = [], []
+        for name, fn in (("uia", self._read_popup_uia), ("ocr", self._read_popup_ocr)):
+            if name not in self.popup_read_channels:
+                continue
+            t = fn(popup_hwnd)
+            if t is not None:
+                parts.append(t)
+                names.append(name)
+        if parts:
+            return " ".join(parts), "+".join(names)
+        return None, "none"
+
+    def _surface_count(self, text, expected) -> int:
+        """How many times this popup reading shows `expected` — as WHOLE TOKENS, in order.
+
+        Substring matching is not enough: '5' is inside '52000', and on a surface read the
+        prompt shares one string with whatever has been typed. Whole-token matching alone is
+        not enough either — 'TEST EMPLOYER LLC' is three tokens, and Drake renders 52000 as
+        '52,000', which is two. So both sides are reduced to a token list and the match is a
+        RUN of consecutive tokens whose concatenation equals the expected concatenation.
+        That accepts every cosmetic split OCR or Drake can introduce while still refusing a
+        match that starts or ends mid-token."""
+        hay, want = _tokens(text), _tokens(expected)
+        if not hay or not want:
+            return 0
+        target = "".join(want)
+        n, i, hits = len(hay), 0, 0
+        while i < n:
+            acc, j = "", i
+            while j < n and len(acc) < len(target):
+                acc += hay[j]
+                j += 1
+                if acc == target:
+                    hits += 1
+                    break
+                if not target.startswith(acc):
+                    break
+            i = j if acc == target else i + 1
+        return hits
+
+    def _surface_shows(self, text, expected) -> bool:
+        return self._surface_count(text, expected) > 0
+
+    def _settle_surface(self, popup_hwnd, expected, baseline, *, timeout=3.5, poll=0.12):
+        """Wait until the popup SHOWS `expected` and has stopped changing. (ok, text, channel).
+
+        The surface equivalent of _settle_read, carrying the same drain proof: two consecutive
+        identical readings mean every posted keystroke has already been consumed, so none can
+        arrive after the check passes.
+
+        The extra condition is `baseline` — what the popup showed BEFORE we typed. We require
+        one MORE occurrence of the token than the baseline had, not merely its presence:
+        Drake's own value prompt names the field ("Enter the value for field 1…"), so a
+        presence test would pass on the prompt's own '1' when the value 'T' never landed, and
+        would also refuse the legitimate entry of the value '1'. Counting distinguishes them."""
+        import time
+        base_n = self._surface_count(baseline, expected)
+        deadline = time.time() + timeout
+        prev, last, chan = None, None, "none"
+        while time.time() < deadline:
+            text, chan = self._read_popup_surface(popup_hwnd)
+            if text is not None:
+                last = text
+                # Stability is compared on the NORMALISED reading. A screen read of an
+                # unchanged popup is not byte-identical twice running — spacing and
+                # punctuation move — and demanding that would make every OCR build time out
+                # on a keystroke that had in fact landed.
+                cur = _norm_prompt(text)
+                if (prev is not None and cur == prev
+                        and self._surface_count(text, expected) > base_n):
+                    return True, text, chan
+                prev = cur
+            time.sleep(poll)
+        return False, last, chan
+
+    def _surface_halt_reason(self, what, got, chan, tail) -> str:
+        if chan == "none" or got is None:
+            return (f"NOTHING can read the heads-down popup on this build — it owns no child "
+                    f"window (Drake paints it), UI Automation returned nothing, and OCR said: "
+                    f"{self._last_ocr_error or 'no answer'}. {what} was typed but could not be "
+                    f"verified, so the driver {tail}. Install Tesseract (and set "
+                    f"navigation.tesseract_cmd if it is not on PATH) to enable the "
+                    f"screen-reading channel — it is the only read-back this build allows.")
+        return (f"the popup never showed {what} (last read via {chan}: {got!r}) — {tail}")
+
+    def _clear_target(self, edit) -> dict:
+        """Empty the popup's box before typing, and return what it reads as afterwards.
+
+        {"ok": True, "baseline": <text>} or {"ok": False, "reason": …}. Residue is not
+        cosmetic: a digit left in the box PREFIXES the next number, turning field 23 into
+        field 223 — a different box, silently.
+
+        A real Edit is cleared with WM_SETTEXT (atomic) and then proven empty. A painted
+        surface has nothing to set, so it is cleared with Backspaces and its remaining text
+        becomes the baseline the settle check counts against."""
+        if not edit.surface:
+            try:
+                edit.set_edit_text("")   # EM_REPLACESEL, atomic
+            except Exception:
+                pass
+            stale = _read_edit_or_none(edit.handle)
+            if stale:
+                return {"ok": False,
+                        "reason": f"popup edit still holds {stale!r} before typing — refusing "
+                                  f"to type onto residue"}
+            return {"ok": True, "baseline": ""}
+        # Painted box: no WM_SETTEXT target. Backspace is the only clear, and it is safe on
+        # an empty box. Deliberately not Ctrl+A/Delete — Ctrl chords are toxic on this app.
+        self._keys("{BACKSPACE 16}")
+        import time
+        time.sleep(0.15)
+        text, chan = self._read_popup_surface(edit.handle)
+        if text is None and chan == "none" and not self._warned_surface_blind:
+            self._warned_surface_blind = True
+            print(f"  ⚠ the heads-down popup owns no child window and NOTHING can read it "
+                  f"(UIA silent; OCR: {self._last_ocr_error or 'no answer'}). Entry cannot "
+                  f"verify a keystroke before committing it, so it will halt rather than "
+                  f"type blind.")
+        return {"ok": True, "baseline": text or ""}
+
     def _popup_edit_children(self, popup_hwnd, timeout: float = 2.0) -> list:
         """The popup's child windows, polled until it has some.
 
@@ -542,10 +792,20 @@ class DrakeDriver:
             focused = None
         hwnd, how = _rank_popup_edit(kids, preferred_class=self.popup_edit_class,
                                      focused_hwnd=focused)
+        # CONFIRMED on Drake 2025: the heads-down popup owns NO child windows at all
+        # (EnumChildWindows returns []) — Drake paints the box onto the dialog's own canvas,
+        # exactly as it does on the data-entry grid. The window that HOLDS THE KEYBOARD is
+        # then the popup itself, and that is the only surface keystrokes can go to. Accepting
+        # it requires that proof, not an assumption: if something else owns focus, the keys
+        # would land there instead and we must not type.
+        surface = False
+        if hwnd is None and focused is not None and int(focused) == int(popup_hwnd):
+            hwnd, how, surface = int(popup_hwnd), "the popup itself (it owns no child windows)", True
         cls = next((c.get("class_name") for c in kids
                     if hwnd is not None and int(c["hwnd"]) == hwnd), None)
         return {"hwnd": hwnd, "class_name": cls, "how": how if hwnd is not None else None,
                 "why": None if hwnd is not None else how,
+                "surface": surface,
                 "popup_hwnd": int(popup_hwnd), "children": kids,
                 "focused_hwnd": focused}
 
@@ -566,6 +826,14 @@ class DrakeDriver:
         self._last_edit_info = info
         if info["hwnd"] is None:
             raise PopupEditNotFound(info)
+        if info.get("surface"):
+            # No child window, so no WM_GETTEXT target: reading this box means reading the
+            # popup as a picture/accessibility tree, which _read_popup_surface does.
+            try:
+                w = self.w32.window(handle=info["hwnd"]).wrapper_object()
+            except Exception:
+                w = None
+            return _EditTarget(info["hwnd"], None, info["how"], wrapper=w, surface=True)
         wrapper = None
         try:
             # By handle: exact, and immune to both the exact-class-name and the anchored
@@ -701,6 +969,75 @@ class DrakeDriver:
                 "class": blocker.get("class_name"), "why": blocker.get("why"),
                 "candidates": blocker.get("candidates")}
 
+    def _dismiss_rule_for(self, dlg) -> Optional[dict]:
+        """The auto-dismiss rule matching this dialog, or None. Matching is on the dialog's
+        TEXT, never its title alone — 'Drake 2025 - Data Entry' is the caption of several
+        different dialogs, and they do not want the same answer."""
+        blob = " ".join(str(dlg.get(k) or "") for k in ("title", "text"))
+        import re as _r
+        for rule in self.auto_dismiss:
+            try:
+                if _r.search(rule.get("match", r"(?!)"), blob, _r.I):
+                    return rule
+            except Exception:
+                continue
+        return None
+
+    def _dismiss_dialog(self, dlg, rule) -> dict:
+        """Close a KNOWN dialog by clicking a button we identified by name.
+
+        Deliberately not the requested blind Enter/Space. Enter presses whatever the dialog's
+        DEFAULT button happens to be — unseen, and different per dialog. On this particular
+        warning the two answers are 'go back and enter the data' and 'leave the screen
+        anyway', and the second one silently moves Drake off the W-2 mid-batch, after which
+        every remaining field number addresses a different screen. So: find the named button,
+        click that button, and prove the dialog is gone. No button, no keystroke."""
+        h = int(dlg.get("handle") or 0)
+        want = str(rule.get("button") or "OK")
+        if not h:
+            return {"ok": False, "reason": "the dialog has no window handle to click into"}
+        want_n = _norm_prompt(want)
+        found = []
+        for c in _enum_child_summaries(h, cap=32):
+            cls, txt = (c.get("class_name") or ""), (c.get("text") or "")
+            if "button" not in cls.lower():
+                continue
+            found.append(txt)
+            if _norm_prompt(txt.replace("&", "")) == want_n:
+                try:
+                    self.w32.window(handle=int(c["hwnd"])).wrapper_object().click()
+                except Exception as e:
+                    return {"ok": False, "reason": f"clicking {txt!r} failed: {e}"}
+                import time
+                time.sleep(0.35)
+                still = self._detect_unexpected_dialog()
+                if still and int(still.get("handle") or 0) == h:
+                    return {"ok": False, "reason": f"clicked {txt!r} but the dialog is still up"}
+                self.benign_notes.append(
+                    f"auto-dismissed {dlg.get('title')!r} by clicking {txt!r} ({rule.get('why', '')})")
+                print(f"  ⚠ auto-dismissed {dlg.get('title')!r} — clicked {txt!r}. "
+                      f"{rule.get('why', '')}")
+                return {"ok": True, "clicked": txt}
+        return {"ok": False,
+                "reason": f"no button named {want!r} on this dialog (buttons: {found or 'none found'}) "
+                          f"— refusing to press Enter blind, because the default button is "
+                          f"unknown and one of the answers leaves the data-entry screen"}
+
+    def _clear_blocking_dialog(self):
+        """Detect a blocker and auto-dismiss it if it is one we have a rule for.
+        Returns the blocker still standing, or None if the way is clear."""
+        dlg = self._detect_unexpected_dialog()
+        if dlg is None:
+            return None
+        rule = self._dismiss_rule_for(dlg)
+        if rule is None:
+            return dlg
+        res = self._dismiss_dialog(dlg, rule)
+        if not res.get("ok"):
+            dlg["dismiss_attempt"] = res.get("reason")
+            return dlg
+        return self._detect_unexpected_dialog()
+
     def dump_windows(self) -> dict:
         """Full window topology of the Drake process + where the keyboard would land —
         the halt-time diagnostic. Written automatically to env-dump-halt.json whenever a
@@ -785,8 +1122,10 @@ class DrakeDriver:
                 return {"ok": True, "opened": i > 0, "attempts": i, "popup": popup}
             if self.w32 is None:
                 return {"ok": False, "reason": "win32 popup connection unavailable (reconnect on the VM)"}
-            bad = self._detect_unexpected_dialog()
-            if bad:  # never fire a chord into a modal we did not expect
+            # Clear a KNOWN dialog (the e-file completeness warning) by clicking its named
+            # button; anything else still halts. Never fire a chord into a modal.
+            bad = self._clear_blocking_dialog()
+            if bad:
                 return {"ok": False, "reason": f"unexpected dialog before Ctrl+N: {bad['summary']}",
                         "dialog": bad}
             # HWND-scoped gate: Ctrl+N is a GLOBAL chord — prove the foreground root is
@@ -840,7 +1179,7 @@ class DrakeDriver:
           2. PROMPT TEXT — if it is readable and does not look like the number prompt, halt
              no matter who opened it."""
         if self._popup_owned:
-            prompt = self._popup_prompt(popup)
+            prompt = self._stable_prompt(popup)
             import re as _re
             if prompt and not _re.search(self.number_prompt_re, prompt, _re.I):
                 return {"ok": False,
@@ -849,7 +1188,7 @@ class DrakeDriver:
                                   f"field number into it — that would commit the number as the "
                                   f"previous field's value."}
             return {"ok": True}
-        prompt = self._popup_prompt(popup)
+        prompt = self._stable_prompt(popup)
         import re as _re
         if prompt and _re.search(self.number_prompt_re, prompt, _re.I):
             self._popup_owned = True  # inherited, but provably on the number prompt
@@ -933,9 +1272,48 @@ class DrakeDriver:
             except Exception:
                 return ""
         try:
-            return _popup_prompt_text(hwnd, edit_hwnd, self.popup_edit_class)
+            t = _popup_prompt_text(hwnd, edit_hwnd, self.popup_edit_class)
         except Exception:
-            return ""
+            t = ""
+        if t:
+            return t
+        # No child windows to harvest text from (the confirmed Drake 2025 shape). Fall back
+        # to reading the popup as a whole. That reading INCLUDES anything typed, which is
+        # correct here: every caller baselines this string and watches it change, and "the
+        # number is still showing" is exactly the evidence that Drake refused it.
+        if edit_hwnd is None or int(edit_hwnd) == int(hwnd):
+            text, _chan = self._read_popup_surface(hwnd)
+            return text or ""
+        return ""
+
+    def _stable_prompt(self, popup, edit_hwnd=None, *, timeout: float = 1.5,
+                       poll: float = 0.1) -> str:
+        """A prompt reading that has been seen TWICE — '' if it never settles.
+
+        Every refusal check compares later readings against a baseline captured here, and a
+        baseline is not exempt from the noise the comparisons are guarded against. Take one
+        corrupted frame as the baseline and the logic inverts: every CLEAN frame afterwards
+        differs from it, so a field Drake silently refused reads as accepted, and the value
+        gets typed at the number prompt. That is not hypothetical — it is what the
+        character-noise case caught in this driver.
+
+        '' when it cannot converge, which callers already treat as "this build exposes no
+        prompt" and degrade (on a painted popup: halt) rather than trusting noise."""
+        import time
+        deadline = time.time() + timeout
+        prev = None
+        while True:
+            t = self._popup_prompt(popup, edit_hwnd)
+            n = _norm_prompt(t)
+            if n and prev == n:
+                return t
+            # Only pause once the two readings actually disagreed: on a build with a real
+            # Edit the second read is identical, so this costs a function call, not a wait.
+            if prev is not None:
+                if time.time() >= deadline:
+                    return ""
+                time.sleep(poll)
+            prev = n
 
     def _note_prompt_blind(self) -> None:
         if self._warned_prompt_blind:
@@ -971,6 +1349,7 @@ class DrakeDriver:
         text at all, it degrades to the old edit-changed heuristic and says so out loud."""
         import time
         deadline = time.time() + timeout
+        base_norm, prev_norm = _norm_prompt(base_prompt), None
         while time.time() < deadline:
             bad = self._detect_unexpected_dialog()
             if bad:
@@ -980,9 +1359,15 @@ class DrakeDriver:
                 return ("per-jump", None)
             if base_prompt:
                 cur = self._popup_prompt(live, edit_hwnd)
-                if cur and cur != base_prompt:
+                cur_norm = _norm_prompt(cur)
+                # Normalised, and STABLE across two readings. On a screen-read channel the
+                # raw text jitters by a character or two between frames, and a single
+                # "it differs" would call a refusal an acceptance — the cascade this
+                # function exists to prevent.
+                if cur and cur_norm != base_norm and cur_norm == prev_norm:
                     return ("persistent", {"prompt": cur})
-            else:
+                prev_norm = cur_norm
+            elif not self._is_surface_hwnd(edit_hwnd):
                 # Blind build: the best available signal is the edit clearing.
                 cur_edit = _read_edit_or_none(edit_hwnd)
                 if cur_edit is not None and cur_edit != number:
@@ -991,7 +1376,20 @@ class DrakeDriver:
             time.sleep(0.08)
         if base_prompt:
             return ("rejected", None)
+        # No prompt text AND no child box: WM_GETTEXT on the popup returns its CAPTION, a
+        # constant that has nothing to do with what Drake is asking — reading it as "the box
+        # changed" would report every refusal as an acceptance. Unknown is the honest answer.
+        if self._is_surface_hwnd(edit_hwnd):
+            return ("unknown", None)
         return ("unknown", None) if _read_edit_or_none(edit_hwnd) is None else ("rejected", None)
+
+    def _is_surface_hwnd(self, edit_hwnd) -> bool:
+        """Is this 'edit' handle actually the popup itself (a box Drake paints)?"""
+        try:
+            return (self._popup_hwnd is not None
+                    and int(edit_hwnd) == int(self._popup_hwnd))
+        except Exception:
+            return False
 
     def _verify_value_committed(self, number_prompt: str, value_prompt: str,
                                 timeout: float = 1.2):
@@ -1008,7 +1406,7 @@ class DrakeDriver:
         rather than inventing a verdict."""
         import time
         deadline = time.time() + timeout
-        last = ""
+        last, prev_norm = "", None
         while time.time() < deadline:
             live = self._find_headsdown_popup(timeout=0.05)
             if live is None:
@@ -1019,10 +1417,15 @@ class DrakeDriver:
             cur = self._popup_prompt(live)
             if cur:
                 last = cur
-                if cur == number_prompt:
+                cur_norm = _norm_prompt(cur)
+                if cur_norm == _norm_prompt(number_prompt):
                     return True, "popup returned to the field-number prompt"
-                if value_prompt and cur != value_prompt:
+                # Same stability requirement as _classify_after_jump: one differing frame
+                # from a screen read is jitter, and calling that "Drake took the value"
+                # feeds the next field's number in as this one's value.
+                if value_prompt and cur_norm != _norm_prompt(value_prompt) and cur_norm == prev_norm:
                     return True, f"prompt moved on ({cur[:60]!r})"
+                prev_norm = cur_norm
             time.sleep(0.08)
         return False, last
 
@@ -1109,8 +1512,9 @@ class DrakeDriver:
             # 1) app alive?
             if self.win is None or not self._window_alive():
                 return {"ok": False, "halt": True, "reason": "Drake main frame vanished (app closed)"}
-            # 2) unexpected/error dialog already up?
-            bad = self._detect_unexpected_dialog()
+            # 2) unexpected/error dialog already up? (a known one is cleared by clicking its
+            #    named button — see _dismiss_dialog; everything else halts)
+            bad = self._clear_blocking_dialog()
             if bad:
                 return {"ok": False, "halt": True, "reason": f"unexpected dialog before entry: {bad['summary']}", "dialog": bad}
             # 3) idempotent + retrying popup open
@@ -1131,26 +1535,30 @@ class DrakeDriver:
             if not self._focus_popup_edit(edit, eh):
                 return {"ok": False, "halt": True, "reason": "popup edit never took keyboard focus"}
             # 5) place the number in the FOCUSED popup edit, then wait for it to SETTLE.
-            try:
-                edit.set_edit_text("")  # clear stale digits (EM_REPLACESEL, atomic)
-            except Exception:
-                pass
-            stale = _read_edit_or_none(eh)
-            if stale:  # a digit left over here would PREFIX the number: 2 + 23 -> field 223
-                return {"ok": False, "halt": True,
-                        "reason": f"popup edit still holds {stale!r} before typing field number "
-                                  f"{fn!r} — refusing to type onto residue"}
+            pre = self._clear_target(edit)
+            if not pre.get("ok"):
+                return {"ok": False, "halt": True, "reason": pre["reason"]}
             self._keys(fn)  # real VK/scan keys land in the focused popup edit (focus proven)
-            # EXACT comparison for the number: _same_value's cosmetic tolerance is for money
-            # and must never bless a field number ('4' vs '4.0' is a different box).
-            settled, got = self._settle_read(eh, fn, exact=True, timeout=1.0)
-            if not settled:
-                return {"ok": False, "halt": True,
-                        "reason": f"popup edit never settled on field number {fn!r} "
-                                  f"(last read {got!r}) — refusing to press Enter"}
+            if edit.surface:
+                # No child window: verify against what the popup SHOWS. Same drain proof,
+                # different channel — see _settle_surface.
+                settled, got, chan = self._settle_surface(eh, fn, pre.get("baseline"))
+                if not settled:
+                    return {"ok": False, "halt": True,
+                            "reason": self._surface_halt_reason(
+                                f"field number {fn!r}", got, chan,
+                                "refusing to press Enter on a number it cannot confirm")}
+            else:
+                # EXACT comparison for the number: _same_value's cosmetic tolerance is for
+                # money and must never bless a field number ('4' vs '4.0' is a different box).
+                settled, got = self._settle_read(eh, fn, exact=True, timeout=1.0)
+                if not settled:
+                    return {"ok": False, "halt": True,
+                            "reason": f"popup edit never settled on field number {fn!r} "
+                                      f"(last read {got!r}) — refusing to press Enter"}
             # Baseline the NUMBER prompt while it is still showing, so step 6 can tell
             # "Drake took the number" from "Drake silently refused it".
-            base_prompt = self._popup_prompt(popup, eh)
+            base_prompt = self._stable_prompt(popup, eh)
             # 6) fire the jump, then OBSERVE what Drake actually did.
             self._keys("{ENTER}")
             model, dlg = self._classify_after_jump(eh, fn, base_prompt=base_prompt, timeout=2.5)
@@ -1203,22 +1611,29 @@ class DrakeDriver:
                     return {"ok": False, "halt": True, "reason": f"popup edit not ready for the value: {e}"}
                 if not self._focus_popup_edit(edit, eh):
                     return {"ok": False, "halt": True, "reason": "popup edit never took focus for the value"}
-                try:
-                    edit.set_edit_text("")
-                except Exception:
-                    pass
-                value_prompt = self._popup_prompt(popup, eh)  # the VALUE prompt, for step 7
+                pre = self._clear_target(edit)
+                if not pre.get("ok"):
+                    return {"ok": False, "halt": True, "reason": pre["reason"]}
+                value_prompt = self._stable_prompt(popup, eh)  # the VALUE prompt, for step 7
                 self._keys(_escape_keys(val))
                 # Wait for the box to SETTLE on the value. No set_edit_text "repair": that
                 # is a SENT message that jumps ahead of still-queued keystrokes, so it can
                 # make a half-typed box look correct and let the rest of the keys land
                 # AFTER the gate passes (52000 -> read '520' -> "repair" -> queued '00'
                 # arrives -> 5,200,000 committed, reported OK).
-                settled, read_back = self._settle_read(eh, val, timeout=1.2)
-                if not settled:
-                    return {"ok": False, "halt": True,
-                            "reason": f"popup edit never settled on value {val!r} for field {fn} "
-                                      f"(last read {read_back!r}) — refusing to commit"}
+                if edit.surface:
+                    settled, read_back, chan = self._settle_surface(eh, val, value_prompt)
+                    if not settled:
+                        return {"ok": False, "halt": True,
+                                "reason": self._surface_halt_reason(
+                                    f"value {val!r} for field {fn}", read_back, chan,
+                                    "refusing to commit a value it cannot confirm")}
+                else:
+                    settled, read_back = self._settle_read(eh, val, timeout=1.2)
+                    if not settled:
+                        return {"ok": False, "halt": True,
+                                "reason": f"popup edit never settled on value {val!r} for field {fn} "
+                                          f"(last read {read_back!r}) — refusing to commit"}
                 self._keys("{ENTER}")
                 # 7) PROVE Drake took the value — a refusal is silent (it just stays on the
                 # value prompt), and treating that as success feeds the next field's NUMBER
@@ -1321,15 +1736,41 @@ class DrakeDriver:
             except Exception as e:
                 out["set_focus_error"] = str(e)
             out["focus_is_edit_after_setfocus"] = (self._focused_hwnd()[0] == eh)
+            out["surface_mode"] = edit.surface
+            # Which READ CHANNELS work on this popup, one by one and by name. With no child
+            # window there is nothing to WM_GETTEXT, so this is the measurement that decides
+            # whether entry can verify a keystroke at all — every gate downstream is built
+            # on being able to read this box.
+            out["read_channels"] = self._probe_read_channels(eh, edit)
             # STATE 1 — waiting for a FIELD NUMBER. This string is the baseline every
             # later refusal check compares against; if it is empty, this build exposes no
             # prompt text and refusal detection degrades (the driver says so at runtime).
             out["prompt_at_number"] = self._popup_prompt(popup, eh)
-            try:
-                edit.set_edit_text(probe_field)
-                out["set_edit_text_readback"] = _safe_read_edit(eh)
-            except Exception as e:
-                out["set_edit_text_error"] = str(e)
+            # Put the probe number in the box the way the entry path does, then read it back
+            # through every channel. A channel that can see it is a channel that can gate a
+            # real field number before the irreversible Enter.
+            pre = self._clear_target(edit)
+            out["baseline_before_typing"] = pre.get("baseline")
+            if edit.surface:
+                # Compare each channel against ITSELF either side of the keystroke — the
+                # same before/after count the entry gate uses, so this verdict means what
+                # it says rather than approximating it.
+                before = self._probe_read_channels(eh, edit)
+                out["channels_after_clear"] = before
+                self._keys(probe_field)
+                time.sleep(0.35)
+                out["after_typing"] = self._probe_read_channels(eh, edit)
+                out["channels_that_saw_the_typed_number"] = [
+                    name for name, r in out["after_typing"].items()
+                    if r.get("text") and self._surface_count(r["text"], probe_field)
+                    > self._surface_count((before.get(name) or {}).get("text"), probe_field)]
+            else:
+                try:
+                    edit.set_edit_text(probe_field)
+                    out["set_edit_text_readback"] = _safe_read_edit(eh)
+                except Exception as e:
+                    out["set_edit_text_error"] = str(e)
+                out["channels_that_saw_the_typed_number"] = ["win32"]
             try:
                 self._keys("{ENTER}")
             except Exception as e:
@@ -1352,6 +1793,15 @@ class DrakeDriver:
                 "silently refused number or value can be detected" if out["prompt_changed"] else
                 "DEGRADED — the popup prompt is unreadable or does not change, so a silent "
                 "refusal cannot be positively detected; verify every box on the screenshot")
+            saw = out.get("channels_that_saw_the_typed_number") or []
+            out["read_back"] = (
+                f"AVAILABLE via {', '.join(saw)} — a keystroke can be confirmed BEFORE the "
+                f"irreversible Enter" if saw else
+                "UNAVAILABLE — no channel could see the probe number, so entry cannot verify "
+                "what it typed and will halt rather than commit blind. Install Tesseract "
+                "(and set navigation.tesseract_cmd if it is not on PATH) to enable the "
+                "screen-reading channel — on a popup Drake paints itself, that is the only "
+                "read-back there is")
             out["disarm"] = self._disarm_popup()
             # STATE 3 — after disarm. Drake must be back to a normal, unarmed screen.
             after = self._find_headsdown_popup(timeout=0.3)
@@ -1361,6 +1811,24 @@ class DrakeDriver:
         except Exception as e:
             out["ok"] = False
             out["reason"] = str(e)
+        return out
+
+    def _probe_read_channels(self, edit_hwnd, edit) -> dict:
+        """Try EVERY read channel against the popup and report each one's answer by name.
+
+        Not a fallback chain — the point is to learn which channels exist on this build, so
+        the run afterwards is not a guess. `null` text means the channel returned nothing;
+        `error` means it is not installed or blew up."""
+        out = {}
+        if edit is not None and not edit.surface:
+            out["win32"] = {"text": _read_edit_or_none(edit_hwnd)}
+        for name, fn in (("uia", self._read_popup_uia), ("ocr", self._read_popup_ocr)):
+            try:
+                out[name] = {"text": fn(edit_hwnd)}
+            except Exception as e:
+                out[name] = {"text": None, "error": str(e)}
+        if out.get("ocr", {}).get("text") is None and self._last_ocr_error:
+            out.setdefault("ocr", {})["error"] = self._last_ocr_error
         return out
 
     def _disarm_popup_blind(self) -> dict:
@@ -1873,6 +2341,21 @@ def _editish(class_name: str) -> bool:
     return bool(_EDITISH_CLASS.search(class_name or ""))
 
 
+def _tokens(s) -> list:
+    """A reading split into comparable tokens: alphanumeric runs, lowercased. Punctuation,
+    case and spacing are dropped because they are exactly what varies between two readings
+    of one unchanged screen."""
+    return [t.lower() for t in _re.split(r"[^0-9A-Za-z]+", str(s or "")) if t]
+
+
+def _norm_prompt(s) -> str:
+    """A prompt reading reduced to what it MEANS, so two readings of the same screen state
+    compare equal. Alphanumerics only, lowercased: OCR and Drake both vary punctuation,
+    spacing and case between frames, and prompt comparison decides whether a value was
+    accepted — it must not turn on a stray comma."""
+    return "".join(ch for ch in str(s or "") if ch.isalnum()).lower()
+
+
 def _rank_popup_edit(children, *, preferred_class="Edit", focused_hwnd=None):
     """Pick the popup's typing box out of its children. Returns (hwnd, how) or (None, why).
 
@@ -1935,14 +2418,20 @@ class PopupEditNotFound(Exception):
                 f"{(' text=' + repr(c.get('text'))) if c.get('text') else ''}"
                 for c in kids[:12])
             detail = f"its {len(kids)} child window(s) are: {rows}"
+            fix = ("Send this line (or env-dump-halt.json) — the class name above is what "
+                   "`headsdown_popup_edit_class` must be set to.")
         else:
-            detail = ("it reports NO child windows — the box is drawn by Drake itself, so "
-                      "there is no HWND to focus, type into or read back")
+            # The confirmed Drake 2025 shape. Reaching here means the popup is painted AND
+            # something other than the popup holds the keyboard, so there is no safe target
+            # at all — not even the popup itself.
+            detail = (f"it reports NO child windows (Drake paints the box), and the keyboard "
+                      f"is held by hwnd={info.get('focused_hwnd')}, not the popup")
+            fix = ("Click into Drake and re-run. If the keyboard really is in the popup and "
+                   "this still fires, send env-dump-halt.json.")
         super().__init__(
             f"could not identify the heads-down popup's text box ({info.get('why')}). "
             f"The popup IS open (hwnd={info.get('popup_hwnd')}) and {detail}. "
-            f"Nothing was typed. Send this line (or env-dump-halt.json) — the class name "
-            f"above is what `headsdown_popup_edit_class` must be set to.")
+            f"Nothing was typed. {fix}")
 
 
 class _EditTarget:
@@ -1955,11 +2444,14 @@ class _EditTarget:
     (GetGUIThreadInfo) and by watching the digits settle, which are facts about this
     window rather than pywinauto's opinion of it."""
 
-    def __init__(self, hwnd, class_name, how, wrapper=None):
+    def __init__(self, hwnd, class_name, how, wrapper=None, surface=False):
         self.handle = int(hwnd)
         self.class_name = class_name
         self.how = how
-        self.is_edit = _editish(class_name) or (class_name or "") == "Edit"
+        # surface=True: the popup itself, painted by Drake with no child window. There is
+        # nothing to WM_GETTEXT (that returns the CAPTION) and nothing to WM_SETTEXT.
+        self.surface = bool(surface)
+        self.is_edit = (not surface) and (_editish(class_name) or (class_name or "") == "Edit")
         self._wrapper = wrapper
         self.element_info = _SimpleNamespace(class_name=class_name, handle=int(hwnd))
 

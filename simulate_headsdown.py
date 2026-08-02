@@ -75,16 +75,26 @@ class FakeDrake:
     def __init__(self, model: str = "persistent", autoadvance_from: int | None = 4,
                  *, echo=None, value_validator=None, prompts: bool = True,
                  inert_fields=None, inert_clears: bool = False,
-                 edit_class: str = "Edit", popup_has_edit: bool = True):
+                 edit_class: str = "Edit", popup_has_edit: bool = True,
+                 surface_readable: bool = True, surface_jitter: bool = False):
         self.model = model
         # What the toolkit NAMES the popup's text box. "Edit" is plain Win32; a Delphi build
         # says "TEdit", .NET says "WindowsForms10.EDIT.app.0.378734a". The driver must find
         # the box by shape, because asking pywinauto for class_name="Edit" is exact-match and
         # found nothing on the live machine ("popup edit not ready / no handle: timed out").
         self.edit_class = edit_class
-        # False models a popup that owns no child controls at all — nothing to focus, type
-        # into or read back. The driver must HALT with the topology, never type blind.
+        # False models the CONFIRMED Drake 2025 shape: the popup owns no child controls at
+        # all — EnumChildWindows returns [] — because Drake paints the box onto the dialog.
+        # The popup itself is then the keyboard target, and the only way to read it is UIA
+        # (if Drake exposes anything) or OCR of the screen.
         self.popup_has_edit = popup_has_edit
+        # Can any channel read a painted popup on this build? False = every read returns
+        # nothing, which must make entry HALT rather than commit a keystroke it never saw.
+        self.surface_readable = surface_readable
+        # Model a screen-read channel: the text is right but the punctuation/spacing jitters
+        # frame to frame, exactly as OCR does. Nothing may turn on a stray comma.
+        self.surface_jitter = surface_jitter
+        self._jitter_n = 0
         self.autoadvance_from = autoadvance_from  # the confirmed Field-4/EIN exception
         # echo(text) -> what ACTUALLY lands in the box. The hook that makes read-back a real
         # gate: a test can drop characters, append late ones, or substitute a value, and the
@@ -112,10 +122,14 @@ class FakeDrake:
         self.values: dict[int, str] = {}
         self.committed: set[int] = set()
         self.error_dialog: str | None = None
+        # The buttons that dialog offers. Named, because the driver clicks a button BY NAME
+        # rather than pressing Enter on an unseen default.
+        self.dialog_buttons: list[str] = ["OK"]
         self.extra_windows: list[dict] = []  # windows appearing MID-RUN (chat expand, toasts)
         self.swallowed_ctrl_n = 0
         self.advanced: set[int] = set()  # auto-advance fires once per field, on commit
         self.log: list[str] = []
+        self.typed: list[str] = []   # every string the driver sent, in order
 
     # -- what the operator sees ---------------------------------------------
 
@@ -125,6 +139,56 @@ class FakeDrake:
         if self.awaiting_value_for is not None:
             return VALUE_PROMPT(self.awaiting_value_for)
         return NUMBER_PROMPT
+
+    def render(self) -> str:
+        """The popup AS SEEN — prompt and typed text in one string, which is all a screen
+        read or an accessibility read of a painted window can offer. There is no separate
+        'edit contents' to ask for; that is the whole difficulty."""
+        if not self.popup_open:
+            return ""
+        text = " ".join(p for p in (self.prompt(), self.popup_text) if p)
+        if not self.surface_jitter:
+            return text
+        self._jitter_n += 1
+        if self.surface_jitter == "chars":
+            # The noise OCR actually makes: every third frame a LETTER comes back wrong.
+            # Normalising punctuation does not absorb this, so it is what proves the
+            # "two consecutive identical readings" rule is load-bearing — one bad frame
+            # must never be read as "Drake changed what it is asking".
+            return text.replace("enter", "entcr", 1) if self._jitter_n % 3 == 0 else text
+        # Punctuation/spacing noise: same words, unstable layout.
+        return (text.replace(".", ",") if self._jitter_n % 2 else text.replace(" ", "  "))
+
+    def children(self, hwnd: int) -> list:
+        """The popup's child windows as EnumChildWindows would report them."""
+        if int(hwnd) == ERROR_HWND and self.error_dialog:
+            # A real Drake modal: the message in a Static, the answers as named Buttons.
+            return [{"hwnd": 0xB000, "class_name": "Static", "text": self.error_dialog,
+                     "visible": True, "enabled": True, "rect": [8, 8, 340, 40]}] + [
+                {"hwnd": 0xB001 + i, "class_name": "Button", "text": b,
+                 "visible": True, "enabled": True, "rect": [8 + 90 * i, 60, 80, 24]}
+                for i, b in enumerate(self.dialog_buttons)]
+        if int(hwnd) != POPUP_HWND or not self.popup_open:
+            return []
+        if not self.popup_has_edit:
+            # A painted popup has NO children AT ALL — not even a Static holding the prompt.
+            # That is what the live probe reported (popup_controls: []), and it matters: an
+            # earlier version of this fake left the Static in place, which quietly fed the
+            # driver clean prompt text through a path the real build does not have. Every
+            # painted case passed while the screen-reading path it was meant to exercise
+            # was barely used.
+            return []
+        return [{"hwnd": POPUP_STATIC_HWND, "class_name": "Static", "text": self.prompt(),
+                 "visible": True, "enabled": True, "rect": [8, 8, 300, 18]},
+                {"hwnd": POPUP_EDIT_HWND, "class_name": self.edit_class,
+                 "text": self.popup_text, "visible": True, "enabled": True,
+                 "rect": [8, 30, 300, 22]}]
+
+    def backspace(self, n: int = 1):
+        if self.awaiting_value_for is not None or self.popup_open:
+            self.popup_text = self.popup_text[:-n] if n < len(self.popup_text) else ""
+        elif self.pending_canvas_text:
+            self.pending_canvas_text = self.pending_canvas_text[:-n]
 
     # -- what the driver's primitives are wired to ---------------------------
 
@@ -158,6 +222,11 @@ class FakeDrake:
     def type(self, text: str):
         if self.error_dialog:
             return
+        # Every string the driver ever sent, in order. Asserting on the OUTCOME is not
+        # enough: a driver that mistakes a refusal for an acceptance types the value anyway
+        # and still ends up halting — on the invalid-field modal its own mistake raised.
+        # The interesting question is what it TYPED, not just how it finished.
+        self.typed.append(text)
         landed = self.echo(text)
         if self.popup_open:
             self.popup_text += landed
@@ -282,6 +351,9 @@ class SimDriver(DrakeDriver):
             self.fake.enter()
         elif chord == "{ESC}":
             self.fake.esc()
+        elif chord.startswith("{BACKSPACE"):
+            n = chord.rstrip("}").split()
+            self.fake.backspace(int(n[1]) if len(n) > 1 else 1)
         else:
             self.fake.type(chord.replace("{", "").replace("}", "")
                            if chord.startswith("{") and chord.endswith("}") and len(chord) == 3
@@ -297,24 +369,16 @@ class SimDriver(DrakeDriver):
         handle=...) -> spec — under test, which is where the anchored-regex bug lived."""
         return (POPUP_HWND, "pid") if self.fake.popup_open else (None, "")
 
-    def _popup_edit_children(self, popup_hwnd, timeout: float = 2.0) -> list:
-        """The popup's control tree as ctypes would enumerate it. Faking THIS rather than
-        _popup_edit keeps the real resolver (_resolve_popup_edit -> _rank_popup_edit ->
-        w32.window(handle=...)) in the tested path — it is the piece that failed live."""
-        if not self.fake.popup_open:
-            return []
-        kids = [{"hwnd": POPUP_STATIC_HWND, "class_name": "Static", "text": self.fake.prompt(),
-                 "visible": True, "enabled": True, "rect": [8, 8, 300, 18]}]
-        if self.fake.popup_has_edit:
-            kids.append({"hwnd": POPUP_EDIT_HWND, "class_name": self.fake.edit_class,
-                         "text": self.fake.popup_text, "visible": True, "enabled": True,
-                         "rect": [8, 30, 300, 22]})
-        return kids
+    def _read_popup_uia(self, popup_hwnd):
+        """The accessibility channel. Overriding the CHANNEL rather than
+        _read_popup_surface keeps the driver's real channel ordering, its (text, channel)
+        contract and every gate built on them in the tested path."""
+        if not self.fake.popup_open or int(popup_hwnd) != POPUP_HWND:
+            return None
+        return self.fake.render() if self.fake.surface_readable else None
 
-    def _popup_prompt(self, popup, edit_hwnd=None) -> str:
-        if popup is None:
-            return ""
-        return self.fake.prompt()
+    def _read_popup_ocr(self, popup_hwnd):
+        return None      # Tesseract absent unless a case says otherwise
 
     def _focused_hwnd(self):
         if not self.fake.popup_open:
@@ -338,6 +402,9 @@ def _install_readers(fake):
 
     drake_driver._read_edit_or_none = _or_none
     drake_driver._safe_read_edit = _safe
+    # The child enumeration itself, so the REAL _popup_prompt_text / _resolve_popup_edit /
+    # _rank_popup_edit run — including the prompt filter that must drop edit-shaped children.
+    drake_driver._enum_child_summaries = lambda h, cap=64: fake.children(int(h))
 
 
 def _unescape(s: str) -> str:
@@ -377,9 +444,13 @@ class _FakeW32:
         self.fake = fake
 
     def window(self, **kwargs):
-        # Handle-addressed, exactly as the driver resolves both the popup and its edit.
-        if int(kwargs.get("handle") or 0) == POPUP_EDIT_HWND:
+        # Handle-addressed, exactly as the driver resolves the popup, its edit and a
+        # dialog's buttons.
+        h = int(kwargs.get("handle") or 0)
+        if h == POPUP_EDIT_HWND:
             return _FakeEdit(self.fake)
+        if 0xB001 <= h <= 0xB00F:
+            return _FakeButton(self.fake, h)
         return _FakePopup(self.fake)
 
     def windows(self):
@@ -412,6 +483,25 @@ class _FakePopup:
 
     def child_window(self, **kwargs):
         return _FakeEdit(self.fake)
+
+
+class _FakeButton:
+    """A dialog button. Clicking the FIRST one closes the dialog; clicking any other is
+    modelled as 'the dialog is still up', because a wrong button is not a dismissal."""
+
+    def __init__(self, fake, hwnd):
+        self.fake = fake
+        self.handle = hwnd
+
+    def wrapper_object(self):
+        return self
+
+    def click(self):
+        idx = self.handle - 0xB001
+        if 0 <= idx < len(self.fake.dialog_buttons):
+            self.fake.log.append(f"clicked dialog button {self.fake.dialog_buttons[idx]!r}")
+            if idx == 0:
+                self.fake.error_dialog = None
 
 
 class _FakeEdit:
@@ -824,26 +914,187 @@ def case_edit_class_is_not_literally_edit():
     return _check("popup edit is found by SHAPE, not by the literal class name 'Edit'", ok)
 
 
-def case_popup_with_no_typing_box():
-    """A popup that owns no child controls: nothing to focus, nothing to read back.
+def case_painted_popup_enters(label="", **kw):
+    """CONFIRMED Drake 2025: the heads-down popup owns NO child windows — EnumChildWindows
+    returns [] because Drake paints the box onto the dialog itself, exactly as it does the
+    data-entry grid. So the popup IS the keyboard target, and the box can only be read as a
+    whole (accessibility tree or screen).
 
-    The only safe move is to HALT — and to halt with the topology, because "timed out" costs
-    a round trip to the Windows laptop while the real class names answer the question in the
-    same run. Nothing may be typed."""
-    fake, drv = _new("persistent", popup_has_edit=False)
+    A full W-2 must still land in the right boxes, with every commit still verified."""
+    fake, drv = _new("persistent", popup_has_edit=False, **kw)
+    rows = _run_seq(drv, SEQ)
+    fake._commit_canvas()
+    ok = fake.values == EXPECTED and all(r[2].get("ok") for r in rows)
+    return _check(f"painted popup (no child HWND) enters a full W-2{label}", ok,
+                  f"expected {EXPECTED}\ngot      {fake.values}\n"
+                  + "\n".join(f"HALT at {n}: {r.get('reason')}" for n, v, r in rows if not r.get("ok")))
+
+
+def case_painted_popup_unreadable():
+    """The same painted popup on a build where NOTHING can read it — no accessibility text,
+    no OCR installed.
+
+    Every gate in this driver is built on reading the box back before the irreversible
+    Enter. With no channel there is no gate, so the only honest move is to stop — and to
+    name the one thing that would fix it, because "cannot verify" with no remedy reads as a
+    dead end when it is an install away."""
+    fake, drv = _new("persistent", popup_has_edit=False, surface_readable=False)
     res = drv.headsdown_type("23", "52000")
     reason = str(res.get("reason") or "")
     checks = [
         ("halts instead of typing blind", res.get("ok") is False and res.get("halt") is True),
-        ("nothing was committed", fake.values == {} and fake.popup_text == ""),
-        ("names the popup handle", str(POPUP_HWND) in reason or hex(POPUP_HWND) in reason),
-        ("reports the child classes it DID see", "Static" in reason),
-        ("says which binding key to fix", "headsdown_popup_edit_class" in reason),
+        ("NOTHING was committed", fake.values == {} and fake.committed == set()),
+        ("no Enter was pressed on the unverified number",
+         not any("ENTER" in l for l in fake.log)),
+        ("says the popup owns no child window", "no child window" in reason),
+        ("names the remedy (Tesseract / the screen-reading channel)",
+         "Tesseract" in reason and "tesseract_cmd" in reason),
     ]
     ok = all(v for _, v in checks)
-    _check("popup with no typing box halts and reports its real control tree", ok, reason)
+    _check("painted popup that nothing can read -> HALT before Enter, with the remedy", ok, reason)
     for name, v in checks:
         print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_painted_popup_silent_refusal(label="", **kw):
+    """An inert box on a painted popup. The number is typed and shown, Drake declines it
+    silently, and the ONLY tell is that the popup's text never moves off the number prompt.
+    A screen read has to be good enough to catch that, or the value goes in one box late.
+
+    Run again with character-level screen noise: one frame in three comes back with a letter
+    wrong, which LOOKS like the prompt changing. Reading a single differing frame as "Drake
+    took the number" would type the value into a field Drake never moved to."""
+    fake, drv = _new("persistent", popup_has_edit=False, **kw)
+    res = drv.headsdown_type("13", "SOME FOREIGN POSTAL")
+    # The value must never be TYPED, not merely never committed. A driver that reads one
+    # noisy frame as "the prompt moved" types the value at the number prompt and then still
+    # halts — on the invalid-field modal its own mistake raised. Asserting only on the halt
+    # cannot tell that apart from getting it right.
+    ok = (res.get("ok") is False and res.get("halt") is True
+          and fake.values == {} and 13 not in fake.committed
+          and "SOME FOREIGN POSTAL" not in fake.typed)
+    return _check(f"painted popup: a silently refused field number still HALTs{label}", ok,
+                  f"{res.get('reason')}\nvalues={fake.values}\ntyped={fake.typed}")
+
+
+def case_painted_popup_keystrokes_vanish():
+    """The keys never arrive — Drake ignored the injection, or the popup lost focus between
+    the check and the keystroke. The popup still SHOWS its prompt, and that prompt names the
+    field number ("Enter the value for field 1…"), so "is the number visible?" is not the
+    question. What must be true is that the popup shows it ONE MORE TIME than before we
+    typed. Nothing typed, nothing showing, no Enter."""
+    fake, drv = _new("persistent", popup_has_edit=False, echo=lambda t: "")
+    res = drv.headsdown_type("23", "52000")
+    ok = (res.get("ok") is False and res.get("halt") is True
+          and fake.values == {} and not any("ENTER" in l for l in fake.log))
+    return _check("painted popup: vanished keystrokes -> HALT, Enter never pressed", ok,
+                  f"{res.get('reason')}\nvalues={fake.values}\nlog:\n"
+                  + "\n".join("  " + l for l in fake.log))
+
+
+def case_painted_popup_value_corrupted():
+    """What lands in a painted popup is not what we typed. The field NUMBER is fine, so the
+    jump happens and Drake is armed for the value — the corruption has to be caught by
+    reading the popup back, in the window between typing the value and the Enter that
+    commits it."""
+    fake, drv = _new("persistent", popup_has_edit=False,
+                     echo=lambda t: "9999" if t == "52000" else t)
+    res = drv.headsdown_type("23", "52000")
+    ok = (res.get("ok") is False and res.get("halt") is True
+          and fake.values.get(23) is None)
+    return _check("painted popup: value corrupted in flight -> HALT before commit", ok,
+                  f"{res.get('reason')}\nvalues={fake.values}")
+
+
+def case_surface_token_counting():
+    """Reading a painted popup returns the PROMPT and the typed text in one string, so
+    "does it contain the value" is not a test: Drake's value prompt names the field
+    ("Enter the value for field 1…"). Presence would pass on the prompt's own '1' when
+    nothing was typed, and would refuse the legitimate entry of the value '1'. Counting
+    occurrences against the pre-typing baseline distinguishes them."""
+    fake, drv = _new("persistent", popup_has_edit=False)
+    base = "Enter the value for field 1 and press enter."
+    rows = [
+        ("the prompt's own '1' is not proof the value landed", base, "1", 1),
+        ("typing '1' into that prompt IS visible as one more", base + " 1", "1", 2),
+        ("'5' does not match inside '52000'", "prompt 52000", "5", 0),
+        ("'52000' matches as a whole token", "prompt 52000", "52000", 1),
+        # Drake renders money with thousands commas and OCR adds punctuation of its own, so
+        # a match may span several tokens — as long as their concatenation is exactly right.
+        ("Drake's '52,000' matches the typed 52000", "value: 52,000.", "52000", 1),
+        ("a multi-word value matches across its tokens",
+         "Enter the value for field 5 and press enter. TEST EMPLOYER LLC",
+         "TEST EMPLOYER LLC", 1),
+        ("a run may not START mid-token", "value 152000", "52000", 0),
+        ("a run may not END mid-token", "value 520005", "52000", 0),
+    ]
+    ok = True
+    for name, text, tok, want in rows:
+        got = drv._surface_count(text, tok)
+        good = got == want
+        ok = ok and good
+        print(f"    {'ok  ' if good else 'FAIL'}: {name} (count {got}, want {want})")
+    # And the gate built on it: a settle that only sees the baseline's own token fails.
+    settled, _t, _c = drv._settle_surface(POPUP_HWND, "1", base, timeout=0.3)
+    good = not settled
+    ok = ok and good
+    print(f"    {'ok  ' if good else 'FAIL'}: settle refuses when the token was already there")
+    return _check("painted popup: token counting, not substring matching", ok)
+
+
+WARNING = ("There are fields on this screen that must contain data if you are planning to "
+           "e-file this return. To enter this data now, click OK.")
+
+
+def case_known_dialog_dismissed_by_name():
+    """Drake's e-file completeness warning is the normal state of a half-keyed W-2, and it
+    blocks entry. It may be answered automatically — but by CLICKING A NAMED BUTTON, never
+    by pressing Enter on whichever button happens to be the default: one of the answers
+    leaves the data-entry screen, after which every remaining field number addresses
+    something else."""
+    fake, drv = _new("persistent")
+    fake.error_dialog = WARNING
+    fake.dialog_buttons = ["OK", "Cancel"]
+    res = drv.headsdown_type("23", "52000")
+    clicked = [l for l in fake.log if "clicked dialog button" in l]
+    checks = [
+        ("the field was entered after the warning cleared",
+         res.get("ok") is True and fake.values.get(23) == "52000"),
+        ("it clicked OK, by name", clicked == ["clicked dialog button 'OK'"]),
+        ("it is recorded, not silent", any("auto-dismissed" in n for n in drv.benign_notes)),
+    ]
+    ok = all(v for _, v in checks)
+    _check("known warning dialog is dismissed by clicking its NAMED button", ok,
+           f"{res.get('reason')}\nlog:\n" + "\n".join("  " + l for l in fake.log))
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_unknown_dialog_still_halts():
+    """Auto-dismissal is a list of specific dialogs, not a policy. Anything else — a
+    validator rejecting a value, a question about the return — still stops for a human, and
+    a known dialog whose button is missing gets no keystroke either."""
+    fake, drv = _new("persistent")
+    fake.error_dialog = "Invalid entry: this field requires a numeric value."
+    res = drv.headsdown_type("23", "52000")
+    a = (res.get("ok") is False and res.get("halt") is True
+         and not any("clicked" in l for l in fake.log))
+
+    fake2, drv2 = _new("persistent")
+    fake2.error_dialog = WARNING
+    fake2.dialog_buttons = ["Continue", "Abandon"]   # named differently on this build
+    res2 = drv2.headsdown_type("23", "52000")
+    reason2 = str((res2.get("dialog") or {}).get("dismiss_attempt") or "")
+    b = (res2.get("ok") is False and not any("clicked" in l for l in fake2.log)
+         and "Continue" in reason2 and "Enter" in reason2)
+
+    ok = a and b
+    _check("unknown dialogs still halt, and a missing button is never a blind Enter", ok,
+           f"unknown: {res.get('reason')}\nno-button: {reason2}")
+    print(f"    {'ok  ' if a else 'FAIL'}: an unrecognised dialog halts, nothing clicked")
+    print(f"    {'ok  ' if b else 'FAIL'}: known dialog + no matching button -> halt, buttons listed")
     return ok
 
 
@@ -1004,7 +1255,18 @@ def main() -> int:
     case_focus_never_taken()
     case_anchored_title_regex()
     case_edit_class_is_not_literally_edit()
-    case_popup_with_no_typing_box()
+    case_painted_popup_enters()
+    case_painted_popup_enters(label=" [punctuation jitter]", surface_jitter="punct")
+    case_painted_popup_enters(label=" [character-level OCR noise]", surface_jitter="chars")
+    case_painted_popup_unreadable()
+    case_painted_popup_keystrokes_vanish()
+    case_painted_popup_value_corrupted()
+    case_painted_popup_silent_refusal()
+    case_painted_popup_silent_refusal(label=" [character-level OCR noise]",
+                                      surface_jitter="chars")
+    case_surface_token_counting()
+    case_known_dialog_dismissed_by_name()
+    case_unknown_dialog_still_halts()
     case_edit_ranking_table()
     case_prompt_excludes_the_typing_box()
     case_classifier_table()
