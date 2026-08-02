@@ -104,6 +104,8 @@ class DrakeDriver:
         # number into a box that is waiting for a VALUE commits the number as the value.
         self._popup_owned = False
         self._warned_prompt_blind = False
+        self._warned_popup_foreign = False
+        self._popup_hwnd = None  # last resolved popup handle (exact; see _find_popup_hwnd)
         # Structural dialog-gate state (see _detect_unexpected_dialog): windows that already
         # exist at attach are baseline furniture (e.g. the 'Drake Software Chat' overlay) and
         # can never halt a run by existing; windows classified benign mid-run are remembered
@@ -123,7 +125,7 @@ class DrakeDriver:
             return
         if Application is None:
             raise RuntimeError("pywinauto is not available (run on the Windows VM)")
-        self.app = Application(backend="uia").connect(title_re=self.title_re, timeout=20)
+        self.app = self._connect_uia()
         self.win = self._resolve_main_window()
         self.main_hwnd = int(self.win.handle)
         self.pid = int(self.win.element_info.process_id)
@@ -131,6 +133,40 @@ class DrakeDriver:
         self._snapshot_baseline()    # pre-existing windows = benign furniture, never a halt
         self._warn_if_elevation_mismatch()
         self._foreground()
+
+    def _connect_uia(self):
+        """Attach to Drake's process, tolerating pywinauto's ANCHORED title matching.
+
+        `connect(title_re=...)` matches with `re.match`, so `app_title_re` only works if it
+        matches from the very first character of the title. The live data-entry frame is
+        titled 'Drake 2025 - Data Entry (…)', which the default pattern 'Drake \\d{4} Tax
+        Software' cannot match — the same trap that made the heads-down popup unfindable.
+
+        So: try pywinauto's way first (it works when some window does start with the
+        pattern), and on failure find the process ourselves with `re.search` over every
+        top-level window title and connect by PID."""
+        try:
+            return Application(backend="uia").connect(title_re=self.title_re, timeout=20)
+        except Exception as first:
+            if not _WINFN:
+                raise
+            import re as _re
+            pat = _re.compile(self.title_re, _re.I)
+            best = None
+            for w in _enum_toplevel_windows(None):
+                if not w.get("visible") or not pat.search(w.get("title") or ""):
+                    continue
+                area = (w["rect"][2] or 0) * (w["rect"][3] or 0)
+                if best is None or area > best[1]:
+                    best = (int(w["pid"]), area)
+            if best is None:
+                raise RuntimeError(
+                    f"no visible window matches app_title_re {self.title_re!r} "
+                    f"(searched every process; pywinauto's own anchored match also failed: "
+                    f"{first})")
+            print(f"  · app_title_re only matched mid-title — connected by process id "
+                  f"{best[0]} instead (pywinauto's title_re is anchored at the start).")
+            return Application(backend="uia").connect(process=best[0], timeout=20)
 
     def _warn_if_elevation_mismatch(self) -> None:
         """If Drake runs elevated (as Admin) and this agent does not, Windows UIPI
@@ -403,16 +439,67 @@ class DrakeDriver:
         The focus/caret oracle for the guarded-keystroke protocol."""
         return _gui_thread_info(self.main_hwnd)
 
+    def _find_popup_hwnd(self, timeout: float = 0.0):
+        """The heads-down popup's HWND, by OUR OWN enumeration + `re.search`.
+        Returns (hwnd, scope) with scope "pid" or "global"; (None, "") if absent.
+
+        Deliberately NOT pywinauto's `title_re`. pywinauto matches it with
+        `re.compile(pattern).match(title)` — ANCHORED AT THE START (findwindows.py:274-281)
+        — so the pattern 'Heads.?Down Data Entry' never matched the real window title
+        'Drake 2025 - Heads Down Data Entry'. Every popup lookup silently returned None
+        while `_input_scope` and the dialog classifier, which use `re.search`, saw the same
+        window perfectly well. That disagreement is what made `probe-popup` report "popup
+        not open — click a Drake field first" about a popup that was on screen AND focused,
+        and it also silently broke `_ensure_popup_open`'s core promise: presence could never
+        be detected, so the "never toggle an open popup back off" guarantee did not hold and
+        the retry loop could fire Ctrl+N repeatedly.
+
+        Falls back to a process-wide sweep because a popup hosted by a DIFFERENT process
+        would have been equally invisible to an Application connected by process=pid."""
+        if not _WINFN or self.dry_run:
+            return None, ""
+        import re as _re
+        import time
+        pat = _re.compile(self.popup_title_re, _re.I)
+        deadline = time.time() + max(0.0, float(timeout))
+        while True:
+            for scope, pid in (("pid", int(self.pid or 0)), ("global", None)):
+                if scope == "pid" and not pid:
+                    continue
+                try:
+                    wins = _enum_toplevel_windows(pid)
+                except Exception:
+                    continue
+                for w in wins:
+                    if w.get("visible") and pat.search(w.get("title") or ""):
+                        return int(w["hwnd"]), scope
+            if time.time() >= deadline:
+                return None, ""
+            time.sleep(0.05)
+
     def _find_headsdown_popup(self, timeout: float = 0.5):
         """The heads-down popup as a win32 WindowSpecification, or None if not present.
         Re-found each cycle — the dialog is created/destroyed per jump on this build, so a
         cached wrapper goes stale."""
         if self.w32 is None:
             return None
+        hwnd, scope = self._find_popup_hwnd(timeout=timeout)
+        if hwnd is None:
+            self._popup_hwnd = None
+            return None
+        if scope == "global" and not self._warned_popup_foreign:
+            self._warned_popup_foreign = True
+            print(f"  · the heads-down popup (hwnd={hwnd}) is NOT owned by the Drake process "
+                  f"we attached to — driving it by handle.")
         try:
-            spec = self.w32.window(title_re=self.popup_title_re)
-            return spec if spec.exists(timeout=timeout) else None
+            # By HANDLE: find_elements returns the element directly for a handle criterion,
+            # short-circuiting every other filter (title matching, process). Exact, and
+            # immune to the anchored-regex trap above.
+            spec = self.w32.window(handle=hwnd)
+            self._popup_hwnd = hwnd
+            return spec
         except Exception:
+            self._popup_hwnd = None
             return None
 
     def _popup_edit(self, popup):
@@ -628,19 +715,32 @@ class DrakeDriver:
                         "dialog": bad}
             # HWND-scoped gate: Ctrl+N is a GLOBAL chord — prove the foreground root is
             # Drake's frame first, or the chord goes into the chat/terminal/whatever.
+            # allow_popup stays False on purpose: we only get here when the popup was NOT
+            # found, and firing Ctrl+N into a focused popup would toggle heads-down OFF.
             ok_scope, where = self._input_scope(allow_popup=False)
             if not ok_scope:
+                import re as _re
+                if _re.search(self.popup_title_re, where, _re.I):
+                    # The popup is focused, yet the lookup above said it does not exist.
+                    # That contradiction is a bug in window resolution, not something the
+                    # operator can fix by clicking — say so instead of blaming them.
+                    return {"ok": False,
+                            "reason": f"the heads-down popup is focused ({where}) but could "
+                                      f"not be resolved as a window — window lookup is "
+                                      f"broken, not your focus. Run `agent.py envdump` and "
+                                      f"send the JSON."}
                 return {"ok": False,
                         "reason": f"refusing to send Ctrl+N — the keyboard is in {where}, "
                                   f"not Drake's frame (click a Drake field, hands off)"}
             self.headsdown_toggle(method=method)  # Ctrl+N (scancode)
-            try:
-                spec = self.w32.window(title_re=self.popup_title_re)
-                spec.wait("visible ready", timeout=timeout)
+            # Wait for the popup by HANDLE resolution, not pywinauto's anchored title_re
+            # (see _find_popup_hwnd) — the old `window(title_re=...).wait(...)` here could
+            # never succeed, so this loop always fell through to another Ctrl+N.
+            spec = self._find_headsdown_popup(timeout=timeout)
+            if spec is not None:
                 self._popup_owned = True  # WE opened it, so its state is known: number prompt
                 return {"ok": True, "opened": True, "attempts": i + 1, "popup": spec}
-            except Exception:
-                time.sleep(0.25 * (i + 1))  # Drake is busy (auto-fill / commit) — let it settle
+            time.sleep(0.25 * (i + 1))  # Drake is busy (auto-fill / commit) — let it settle
         return {"ok": False,
                 "reason": f"Ctrl+N did not open the heads-down popup after {attempts} attempts "
                           f"(is a canvas field active?)"}
@@ -745,9 +845,19 @@ class DrakeDriver:
         return False, last
 
     def _popup_prompt(self, popup, edit_hwnd=None) -> str:
-        """The prompt text of a popup WindowSpecification ('' if unreadable)."""
+        """The prompt text of a popup WindowSpecification ('' if unreadable).
+
+        Prefers the handle `_find_popup_hwnd` already resolved: reading `.handle` off a
+        WindowSpecification re-runs pywinauto's search criteria, which is both slower and
+        the layer that produced the anchored-title_re failure in the first place."""
+        hwnd = self._popup_hwnd
+        if hwnd is None:
+            try:
+                hwnd = int(popup.handle)
+            except Exception:
+                return ""
         try:
-            return _popup_prompt_text(int(popup.handle), edit_hwnd, self.popup_edit_class)
+            return _popup_prompt_text(hwnd, edit_hwnd, self.popup_edit_class)
         except Exception:
             return ""
 
@@ -1090,6 +1200,7 @@ class DrakeDriver:
             out["focus_before"] = {"hwndFocus": f0[0], "hwndCaret": f0[1], "rcCaret": f0[2],
                                    "caret_blinking": bool(f0[3] & _GUI_CARETBLINKING),
                                    "main_hwnd": self.main_hwnd}
+            self.begin_batch()  # a popup already up is foreign until proven otherwise
             popup = self._find_headsdown_popup(timeout=0.5)
             out["popup_present_initially"] = popup is not None
             if popup is None:
@@ -1098,6 +1209,15 @@ class DrakeDriver:
             if popup is None:
                 out["ok"] = False
                 out["reason"] = "popup not open — click a Drake field first, then re-run"
+                return out
+            # An INHERITED popup may be armed for a VALUE, not a field number. Typing the
+            # probe number into that state commits it as some field's value — the precise
+            # accident this probe used to cause on field 4. Refuse instead.
+            ready = self._popup_ready_for_number(popup)
+            out["popup_ready_for_number"] = ready
+            if not ready.get("ok"):
+                out["ok"] = False
+                out["reason"] = ready.get("reason")
                 return out
             out["popup_title"] = popup.window_text()
             controls = []
@@ -1522,10 +1642,12 @@ def _u32():
     return _U32
 
 
-def _enum_toplevel_windows(pid: int) -> list:
-    """Snapshot every top-level window of `pid`: handle, title, class, visibility,
-    enabled state, owner, style bits, rect. Raw ctypes (no pywinauto wrapping) so it is
-    fast enough to run per-field and cannot be fooled by backend quirks. Windows-only."""
+def _enum_toplevel_windows(pid=None) -> list:
+    """Snapshot top-level windows: handle, pid, title, class, visibility, enabled state,
+    owner, style bits, rect. `pid=None` enumerates EVERY process (used to locate a popup
+    that turns out not to be owned by the process we attached to). Raw ctypes (no pywinauto
+    wrapping) so it is fast enough to run per-field and cannot be fooled by backend
+    quirks — notably pywinauto's anchored title_re. Windows-only."""
     u32 = _u32()
     out = []
 
@@ -1533,7 +1655,7 @@ def _enum_toplevel_windows(pid: int) -> list:
     def _cb(hwnd, _lparam):
         wpid = _wintypes.DWORD()
         u32.GetWindowThreadProcessId(hwnd, _ctypes.byref(wpid))
-        if int(wpid.value) != int(pid):
+        if pid is not None and int(wpid.value) != int(pid):
             return True
         title = _ctypes.create_unicode_buffer(256)
         u32.GetWindowTextW(hwnd, title, 256)
@@ -1544,6 +1666,7 @@ def _enum_toplevel_windows(pid: int) -> list:
         style = int(u32.GetWindowLongW(hwnd, _GWL_STYLE)) & 0xFFFFFFFF
         out.append({
             "hwnd": int(hwnd),
+            "pid": int(wpid.value),
             "title": title.value,
             "class_name": cls.value,
             "visible": bool(u32.IsWindowVisible(hwnd)),

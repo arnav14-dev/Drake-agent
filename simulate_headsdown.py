@@ -281,6 +281,12 @@ class SimDriver(DrakeDriver):
         self.fake.ctrl_n()
         return {"ok": True, "method": method}
 
+    def _find_popup_hwnd(self, timeout: float = 0.0):
+        """Stands in for the ctypes window enumeration. Returning a HANDLE (not a
+        title-matched spec) keeps the production resolution path — handle -> w32.window(
+        handle=...) -> spec — under test, which is where the anchored-regex bug lived."""
+        return (POPUP_HWND, "pid") if self.fake.popup_open else (None, "")
+
     def _popup_edit(self, popup):
         return _FakeEdit(self.fake)
 
@@ -716,6 +722,56 @@ def case_focus_never_taken():
     return _check("popup edit never takes focus -> HALT before typing", ok, f"{res}")
 
 
+def case_anchored_title_regex():
+    """REGRESSION: pywinauto matches `title_re` with `re.match` — ANCHORED at the start
+    (findwindows.py:274-281) — while every hand-rolled check in the driver uses
+    `re.search`. The two disagreed, so `_find_headsdown_popup` returned None for a popup
+    that was on screen AND focused, and probe-popup reported 'popup not open — click a
+    Drake field first' about a window the operator was staring at.
+
+    It also silently voided `_ensure_popup_open`'s central promise. That function claims it
+    can never toggle an open popup back off because it re-checks presence before every
+    Ctrl+N — but presence was UNDETECTABLE, so the retry loop could fire Ctrl+N into an
+    already-open popup and close it.
+
+    Two assertions: the real titles must be found the way we look them up, and the source
+    must not reach for pywinauto's title_re to locate a window."""
+    import re
+    import pathlib
+    from drake_driver import DrakeDriver
+
+    d = DrakeDriver({"navigation": {}, "capabilities": {}})
+    popup_title = "Drake 2025 - Heads Down Data Entry"   # observed live
+    frame_title = "Drake 2025 - Data Entry (123456789 - fynn, Test) - (CONTAINS SENSITIVE DATA)"
+    raw = (pathlib.Path(__file__).parent / "drake_driver.py").read_text()
+    # Code only: the comments deliberately quote the broken call so the trap stays
+    # documented, and a structural check must not trip over its own explanation.
+    src = "\n".join(l for l in raw.splitlines() if not l.strip().startswith("#"))
+
+    checks = [
+        ("popup title IS found by re.search (how we look it up)",
+         bool(re.search(d.popup_title_re, popup_title, re.I))),
+        ("popup title is NOT found by re.match (pywinauto's way — the bug)",
+         not re.match(d.popup_title_re, popup_title, re.I)),
+        ("frame title is NOT found by re.match either (same trap on connect)",
+         not re.match(d.title_re, frame_title, re.I)),
+        ("driver never RESOLVES a single window via pywinauto title_re",
+         "window(title_re=" not in src),
+        ("the one remaining title_re use is a best-effort pool with a full fallback",
+         "self.app.windows(title_re=self.title_re)" in src
+         and "pools.append(self.app.windows())" in src),
+        ("popup is resolved by handle instead",
+         "window(handle=" in src),
+        ("connect has a re.search fallback when the anchored match fails",
+         "_connect_uia" in src and "connect(process=" in src),
+    ]
+    ok = all(v for _, v in checks)
+    _check("anchored-regex trap: popup and frame are findable the way we search", ok)
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
 def case_classifier_table():
     from drake_driver import _classify_process_windows
     CHAT = {"hwnd": 1, "title": "Drake Software Chat", "class_name": "Chrome_WidgetWin_1",
@@ -811,6 +867,7 @@ def main() -> int:
     case_modal_while_popup_open()
     case_keyboard_scope()
     case_focus_never_taken()
+    case_anchored_title_regex()
     case_classifier_table()
     case_comparator_table()
 

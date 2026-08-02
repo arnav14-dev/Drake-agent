@@ -328,6 +328,42 @@ The comparator was loosened in the same direction and is now strict: it forgives
 cosmetic reformatting (`52,000` = `52000`, `12-3456789` = `123456789`, `52000.00` = `52000`)
 but never a moved decimal point or a flipped sign. `322450` is not `3224.50`.
 
+### Windows are found by handle, never by pywinauto's `title_re`
+
+pywinauto matches `title_re` with **`re.compile(pattern).match(title)`** — anchored at the
+start (`findwindows.py:274-281`). Every hand-rolled check in this driver uses `re.search`.
+That difference made two parts of the driver disagree about whether the same window existed:
+
+```
+title   = 'Drake 2025 - Heads Down Data Entry'
+pattern = 'Heads.?Down Data Entry'
+  re.match  (pywinauto title_re) -> None          <- popup "does not exist"
+  re.search (our own checks)     -> <Match>       <- popup is right there, and focused
+```
+
+So `_find_headsdown_popup` returned `None` for a popup that was on screen and had keyboard
+focus, and `probe-popup` reported *"popup not open — click a Drake field first"* about a
+window the operator was looking at. Worse, it silently voided `_ensure_popup_open`'s central
+promise: that function can only avoid toggling an open popup back **off** if it can *detect*
+that one is open — and detection always failed, so the retry loop could fire Ctrl+N into an
+already-open popup and close it.
+
+The same trap applies to `connect(title_re=...)`: the live frame is titled
+`Drake 2025 - Data Entry (…)`, which `Drake \d{4} Tax Software` cannot match from the start
+either. It happened to work only because `_resolve_main_window` re-scans every window of the
+process afterwards.
+
+Both are fixed by never asking pywinauto to *find* a window by title:
+
+- `_find_popup_hwnd` enumerates top-level windows via ctypes and matches with `re.search`
+  (this process first, then all processes — a popup owned by a different process was
+  equally invisible before), then hands pywinauto an exact `window(handle=…)`.
+  `find_elements` returns immediately for a handle criterion, bypassing every other filter.
+- `_connect_uia` keeps the pywinauto path but falls back to finding the PID ourselves.
+
+A regression case asserts the real titles behave as expected under both matchers, and that
+the source never resolves a window by `title_re` again.
+
 **The Field-4/EIN exception** (confirmed on Drake 2025): committing the employer EIN
 fires Drake's employer lookup + auto-fill, auto-advances the caret to Box 1, and
 *swallows the next Ctrl+N*. That single eaten chord is what caused the original cascade —
