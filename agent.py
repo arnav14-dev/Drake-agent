@@ -622,7 +622,17 @@ def cmd_probe_popup(args) -> int:
     print("\n===== HEADS-DOWN POPUP PROBE =====")
     print(json.dumps(res, indent=2, default=str))
     print("==================================")
+    if res.get("edit_resolution"):
+        # The box could not be identified — nothing was typed. popup_controls (above) is the
+        # answer: it lists what the popup actually contains, class names included.
+        print("\n⚠ the popup's TEXT BOX could not be identified, so nothing was typed.")
+        print("  popup_controls above lists the children Drake really has. Set")
+        print("  navigation.headsdown_popup_edit_class in binding.json to the class of the")
+        print("  box (the one that is not a Static label) and re-run this probe.")
+        return 2
     print(f"\nmodel:            {res.get('model')}")
+    print(f"edit control:     {res.get('edit_class_name')!r} "
+          f"(hwnd={res.get('edit_handle')}, matched by {res.get('edit_resolved_by')})")
     print(f"number prompt:    {res.get('prompt_at_number')!r}")
     print(f"value prompt:     {res.get('prompt_at_value')!r}")
     print(f"refusal detection: {res.get('refusal_detection')}")

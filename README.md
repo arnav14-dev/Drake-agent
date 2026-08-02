@@ -364,6 +364,36 @@ Both are fixed by never asking pywinauto to *find* a window by title:
 A regression case asserts the real titles behave as expected under both matchers, and that
 the source never resolves a window by `title_re` again.
 
+### …and the popup's text box is found by shape, never by class name
+
+The same class of bug one layer down. `popup.child_window(class_name="Edit")` matches with
+**exact string equality** (`findwindows.py:257`), and the only regex variant, `class_name_re`,
+is the same anchored `re.match`. A control is called `Edit` only if the toolkit happens to
+name it that: Delphi/C++ Builder emits `TEdit`/`TMemo`/`TMaskEdit`, .NET emits
+`WindowsForms10.EDIT.app.0.378734a`, rich text emits `RichEdit20W`.
+
+On the live build it matched nothing, so `probe-popup` returned pywinauto's criteria dict as
+its "reason" and `write-w2` halted on its **first** field with *"popup edit not ready / no
+handle: timed out"* — an unfindable box, reported as a timeout.
+
+`_resolve_popup_edit` enumerates the popup's children with ctypes and ranks them:
+
+1. the exact class the binding was calibrated to (`headsdown_popup_edit_class`)
+2. any edit-shaped class — `edit`/`textbox`/`memo` as a substring, case-insensitive — with
+   the focused one winning if there is more than one box
+3. the child that currently **owns the keyboard**, whatever its class
+
+A `Static` prompt label is never chosen; a disabled child is never chosen. If nothing
+qualifies, the driver raises `PopupEditNotFound`, which carries the popup's whole child
+topology into the halt line — class names, handles, visibility, text — because *that* is the
+missing fact, and a halt saying only "timed out" costs a round trip to the Windows machine.
+The same verdict is in `envdump` under `popup_edit`, and `probe-popup` now dumps
+`popup_controls` via ctypes **before** resolving, so a failure to identify the box still
+reports what is in there. Nothing is ever typed blind.
+
+`WM_SETTEXT` is refused on a target that is not a text box: on a non-edit window it rewrites
+the **caption**, which on the popup itself would rename the very window we find it by.
+
 **The Field-4/EIN exception** (confirmed on Drake 2025): committing the employer EIN
 fires Drake's employer lookup + auto-fill, auto-advances the caret to Box 1, and
 *swallows the next Ctrl+N*. That single eaten chord is what caused the original cascade —
@@ -380,12 +410,13 @@ python simulate_headsdown.py
 
 A fake Drake reproducing the observed behaviours — the persistent protocol, the Field-4
 swallowed chord, silent refusals, and a popup left armed by a previous run — so the state
-machine is provable in seconds, anywhere, before it touches a return. 23 cases: both popup
+machine is provable in seconds, anywhere, before it touches a return. 28 cases: both popup
 models, the EIN-skipped batch shape, an inert box that declines silently (in both variants:
 leaving the number in the edit, and clearing it), a silently refused value, corrupted and
 late-arriving keystrokes, an empty value, an inherited armed popup, a build with no readable
-prompt text, and the structural dialog gate — **every case runs with the 'Drake Software
-Chat' window present** (the live field-4 halt).
+prompt text, a popup whose text box is a `TEdit`/`WindowsForms10.EDIT…`/`RichEdit20W`, a
+popup with no typing box at all, and the structural dialog gate — **every case runs with the
+'Drake Software Chat' window present** (the live field-4 halt).
 
 It fakes *Drake*, not pywinauto: focus and window behaviour on the real thing is still
 verified on the Windows machine.
@@ -398,15 +429,19 @@ guard is now broken *in the source*, in an isolated copy, and the suite must go 
 
 | guard broken | suite result |
 |---|---|
-| comparator back to alnum-only (deletes `.` and `-`) | 22/23 |
-| comparator drops the decimal/sign refusal | 22/23 |
-| single read instead of convergence (the old repair) | 20/23 |
-| empty-value guard removed | 22/23 |
-| inherited-popup ownership check removed | 22/23 |
-| prompt baseline removed (classify by the edit box alone) | 21/23 |
-| commit proof removed (assume the value was accepted) | 22/23 |
-| Ctrl+N keyboard-scope gate removed | 22/23 |
-| structural dialog gate blinded | 20/23 |
+| comparator back to alnum-only (deletes `.` and `-`) | 27/28 |
+| comparator drops the decimal/sign refusal | 27/28 |
+| single read instead of convergence (the old repair) | 25/28 |
+| empty-value guard removed | 27/28 |
+| inherited-popup ownership check removed | 27/28 |
+| prompt baseline removed (classify by the edit box alone) | 26/28 |
+| commit proof removed (assume the value was accepted) | 27/28 |
+| Ctrl+N keyboard-scope gate removed | 27/28 |
+| popup edit matched by exact class name only (the live halt) | 27/28 |
+| popup edit ranking accepts any child (a label becomes the target) | 26/28 |
+| no children → type at the popup itself (blind entry) | 27/28 |
+| prompt baseline lets edit-shaped children leak in | 27/28 |
+| structural dialog gate blinded | 25/28 |
 
 A guard whose mutant survives has no test, whatever the suite says.
 

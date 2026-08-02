@@ -33,6 +33,7 @@ import drake_driver
 from drake_driver import DrakeDriver
 
 POPUP_EDIT_HWND = 0xE117
+POPUP_STATIC_HWND = 0xE118   # the prompt label — a Static, never a typing target
 MAIN_HWND = 0xBEEF
 CHAT_HWND = 0xCAFE    # the always-present 'Drake Software Chat' overlay (baseline)
 POPUP_HWND = 0xD1A6   # the heads-down dialog as a top-level window
@@ -73,8 +74,17 @@ class FakeDrake:
 
     def __init__(self, model: str = "persistent", autoadvance_from: int | None = 4,
                  *, echo=None, value_validator=None, prompts: bool = True,
-                 inert_fields=None, inert_clears: bool = False):
+                 inert_fields=None, inert_clears: bool = False,
+                 edit_class: str = "Edit", popup_has_edit: bool = True):
         self.model = model
+        # What the toolkit NAMES the popup's text box. "Edit" is plain Win32; a Delphi build
+        # says "TEdit", .NET says "WindowsForms10.EDIT.app.0.378734a". The driver must find
+        # the box by shape, because asking pywinauto for class_name="Edit" is exact-match and
+        # found nothing on the live machine ("popup edit not ready / no handle: timed out").
+        self.edit_class = edit_class
+        # False models a popup that owns no child controls at all — nothing to focus, type
+        # into or read back. The driver must HALT with the topology, never type blind.
+        self.popup_has_edit = popup_has_edit
         self.autoadvance_from = autoadvance_from  # the confirmed Field-4/EIN exception
         # echo(text) -> what ACTUALLY lands in the box. The hook that makes read-back a real
         # gate: a test can drop characters, append late ones, or substitute a value, and the
@@ -287,8 +297,19 @@ class SimDriver(DrakeDriver):
         handle=...) -> spec — under test, which is where the anchored-regex bug lived."""
         return (POPUP_HWND, "pid") if self.fake.popup_open else (None, "")
 
-    def _popup_edit(self, popup):
-        return _FakeEdit(self.fake)
+    def _popup_edit_children(self, popup_hwnd, timeout: float = 2.0) -> list:
+        """The popup's control tree as ctypes would enumerate it. Faking THIS rather than
+        _popup_edit keeps the real resolver (_resolve_popup_edit -> _rank_popup_edit ->
+        w32.window(handle=...)) in the tested path — it is the piece that failed live."""
+        if not self.fake.popup_open:
+            return []
+        kids = [{"hwnd": POPUP_STATIC_HWND, "class_name": "Static", "text": self.fake.prompt(),
+                 "visible": True, "enabled": True, "rect": [8, 8, 300, 18]}]
+        if self.fake.popup_has_edit:
+            kids.append({"hwnd": POPUP_EDIT_HWND, "class_name": self.fake.edit_class,
+                         "text": self.fake.popup_text, "visible": True, "enabled": True,
+                         "rect": [8, 30, 300, 22]})
+        return kids
 
     def _popup_prompt(self, popup, edit_hwnd=None) -> str:
         if popup is None:
@@ -296,7 +317,10 @@ class SimDriver(DrakeDriver):
         return self.fake.prompt()
 
     def _focused_hwnd(self):
-        return (POPUP_EDIT_HWND if self.fake.popup_open else MAIN_HWND, 0, (0, 0, 0, 0), 1)
+        if not self.fake.popup_open:
+            return (MAIN_HWND, 0, (0, 0, 0, 0), 1)
+        focus = POPUP_EDIT_HWND if self.fake.popup_has_edit else POPUP_HWND
+        return (focus, 0, (0, 0, 0, 0), 1)
 
 
 def _install_readers(fake):
@@ -353,6 +377,9 @@ class _FakeW32:
         self.fake = fake
 
     def window(self, **kwargs):
+        # Handle-addressed, exactly as the driver resolves both the popup and its edit.
+        if int(kwargs.get("handle") or 0) == POPUP_EDIT_HWND:
+            return _FakeEdit(self.fake)
         return _FakePopup(self.fake)
 
     def windows(self):
@@ -393,6 +420,9 @@ class _FakeEdit:
         self.handle = POPUP_EDIT_HWND
 
     def wait(self, *a, **k):
+        return self
+
+    def wrapper_object(self):
         return self
 
     def set_focus(self):
@@ -772,6 +802,111 @@ def case_anchored_title_regex():
     return ok
 
 
+def case_edit_class_is_not_literally_edit():
+    """REGRESSION (live halt #2): the popup's text box is only called "Edit" if Drake's
+    toolkit happens to name it that. pywinauto's class_name= criterion is EXACT string
+    equality (findwindows.py:257) and its class_name_re= is the same anchored re.match, so
+    `popup.child_window(class_name="Edit")` found nothing on the live machine — probe-popup
+    returned the criteria dict as its 'reason', and write-w2 died on the FIRST field with
+    "popup edit not ready / no handle: timed out".
+
+    A Delphi build names it "TEdit", .NET names it "WindowsForms10.EDIT.app.0.378734a".
+    Entry must work on all of them."""
+    ok = True
+    for cls in ("TEdit", "WindowsForms10.EDIT.app.0.378734a", "RichEdit20W", "TMaskEdit"):
+        fake, drv = _new("persistent", edit_class=cls)
+        rows = _run_seq(drv, SEQ)
+        fake._commit_canvas()
+        good = fake.values == EXPECTED and all(r[2].get("ok") for r in rows)
+        ok = ok and good
+        print(f"    {'ok  ' if good else 'FAIL'}: popup edit of class {cls!r} is found and typed into"
+              + ("" if good else "  -> " + str([r[2].get("reason") for r in rows if not r[2].get("ok")])))
+    return _check("popup edit is found by SHAPE, not by the literal class name 'Edit'", ok)
+
+
+def case_popup_with_no_typing_box():
+    """A popup that owns no child controls: nothing to focus, nothing to read back.
+
+    The only safe move is to HALT — and to halt with the topology, because "timed out" costs
+    a round trip to the Windows laptop while the real class names answer the question in the
+    same run. Nothing may be typed."""
+    fake, drv = _new("persistent", popup_has_edit=False)
+    res = drv.headsdown_type("23", "52000")
+    reason = str(res.get("reason") or "")
+    checks = [
+        ("halts instead of typing blind", res.get("ok") is False and res.get("halt") is True),
+        ("nothing was committed", fake.values == {} and fake.popup_text == ""),
+        ("names the popup handle", str(POPUP_HWND) in reason or hex(POPUP_HWND) in reason),
+        ("reports the child classes it DID see", "Static" in reason),
+        ("says which binding key to fix", "headsdown_popup_edit_class" in reason),
+    ]
+    ok = all(v for _, v in checks)
+    _check("popup with no typing box halts and reports its real control tree", ok, reason)
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_edit_ranking_table():
+    """_rank_popup_edit in isolation: a Static prompt label is never a typing target, and
+    focus only breaks ties between boxes — it must not promote a label."""
+    from drake_driver import _rank_popup_edit
+
+    def kid(h, cls, **kw):
+        d = {"hwnd": h, "class_name": cls, "visible": True, "enabled": True, "text": ""}
+        d.update(kw)
+        return d
+
+    STATIC, EDIT, EDIT2 = kid(1, "Static"), kid(2, "Edit"), kid(3, "TEdit")
+    rows = [
+        ("plain Edit wins over the Static label", [STATIC, EDIT], None, 2),
+        ("TEdit is found when nothing is called 'Edit'", [STATIC, EDIT2], None, 3),
+        ("exact configured class beats another edit", [EDIT2, EDIT], None, 2),
+        ("focus breaks ties between two edit-shaped boxes", [EDIT2, kid(4, "TEdit")], 4, 4),
+        ("a Static NEVER wins, even holding focus", [STATIC, EDIT], 1, 2),
+        ("a focused non-edit child is used only when there is no box", [STATIC, kid(5, "Button")], 5, 5),
+        ("labels only -> no target (halt)", [STATIC, kid(6, "Button")], None, None),
+        ("no children -> no target (halt)", [], None, None),
+        ("a disabled edit is not a target", [kid(7, "Edit", enabled=False)], None, None),
+        ("a hidden edit is still a target when it is all there is",
+         [kid(8, "Edit", visible=False)], None, 8),
+    ]
+    ok = True
+    for name, kids, focus, want in rows:
+        got, _how = _rank_popup_edit(kids, preferred_class="Edit", focused_hwnd=focus)
+        good = got == want
+        ok = ok and good
+        print(f"    {'ok  ' if good else 'FAIL'}: {name} (got {got}, want {want})")
+    return _check("popup-edit ranking: labels are never typed into", ok)
+
+
+def case_prompt_excludes_the_typing_box():
+    """The prompt baseline must exclude EVERY edit-shaped child, not just the one named
+    "Edit". If the box we type into leaked into the "prompt", the baseline would move
+    because WE typed rather than because Drake changed what it is asking for — and prompt
+    movement is the entire basis for telling acceptance from silent refusal."""
+    from drake_driver import _popup_prompt_text
+    kids = [{"hwnd": 1, "class_name": "Static", "text": NUMBER_PROMPT,
+             "visible": True, "enabled": True},
+            {"hwnd": 2, "class_name": "TEdit", "text": "23", "visible": True, "enabled": True}]
+    orig = drake_driver._enum_child_summaries
+    drake_driver._enum_child_summaries = lambda h, cap=64: kids
+    try:
+        # edit_hwnd unknown (resolution not yet run) and the class not the configured one —
+        # the case where the old two-rule filter let the typed digits through.
+        prompt = _popup_prompt_text(1234, None, "Edit")
+    finally:
+        drake_driver._enum_child_summaries = orig
+    checks = [("the prompt label is kept", NUMBER_PROMPT in prompt),
+              ("the typed digits are NOT part of the prompt", "23" not in prompt)]
+    ok = all(v for _, v in checks)
+    _check("prompt baseline excludes edit-shaped children whatever they are called", ok,
+           f"prompt = {prompt!r}")
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
 def case_classifier_table():
     from drake_driver import _classify_process_windows
     CHAT = {"hwnd": 1, "title": "Drake Software Chat", "class_name": "Chrome_WidgetWin_1",
@@ -868,6 +1003,10 @@ def main() -> int:
     case_keyboard_scope()
     case_focus_never_taken()
     case_anchored_title_regex()
+    case_edit_class_is_not_literally_edit()
+    case_popup_with_no_typing_box()
+    case_edit_ranking_table()
+    case_prompt_excludes_the_typing_box()
     case_classifier_table()
     case_comparator_table()
 

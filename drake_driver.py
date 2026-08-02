@@ -21,6 +21,8 @@ Automation surface — confirm them with `agent.py probe` and fill binding.json.
 from __future__ import annotations
 
 import datetime as _dt
+import re as _re
+from types import SimpleNamespace as _SimpleNamespace
 from typing import Any, Optional
 
 try:
@@ -106,6 +108,9 @@ class DrakeDriver:
         self._warned_prompt_blind = False
         self._warned_popup_foreign = False
         self._popup_hwnd = None  # last resolved popup handle (exact; see _find_popup_hwnd)
+        # Last popup-edit resolution ({hwnd, class_name, how, children}) — kept so a halt
+        # dump can report the popup's real control tree instead of just "timed out".
+        self._last_edit_info = None
         # Structural dialog-gate state (see _detect_unexpected_dialog): windows that already
         # exist at attach are baseline furniture (e.g. the 'Drake Software Chat' overlay) and
         # can never halt a run by existing; windows classified benign mid-run are remembered
@@ -502,12 +507,73 @@ class DrakeDriver:
             self._popup_hwnd = None
             return None
 
-    def _popup_edit(self, popup):
-        """The popup's text box (its real Edit control)."""
+    def _popup_edit_children(self, popup_hwnd, timeout: float = 2.0) -> list:
+        """The popup's child windows, polled until it has some.
+
+        Polled because a dialog's controls are created as it initialises: asking the instant
+        the window appears can legitimately see an empty tree. Returns [] if it stays
+        childless for the whole timeout — which is itself the finding, not an error."""
+        import time
+        deadline = time.time() + max(0.0, float(timeout))
+        kids = []
+        while True:
+            try:
+                kids = _enum_child_summaries(int(popup_hwnd), cap=32)
+            except Exception:
+                kids = []
+            if kids or time.time() >= deadline:
+                return kids
+            time.sleep(0.05)
+
+    def _resolve_popup_edit(self, popup_hwnd, timeout: float = 2.0) -> dict:
+        """Identify the popup's typing box by STRUCTURE. {hwnd, class_name, how, children}.
+
+        This used to be `popup.child_window(class_name="Edit")`, and that is what halted the
+        live run at the first field with "popup edit not ready / no handle: timed out".
+        pywinauto's class_name= criterion is EXACT equality, so it finds nothing unless the
+        toolkit happens to name its control exactly "Edit" — and its only regex variant,
+        class_name_re=, is the same anchored re.match that hid the popup window itself.
+        Enumerating with ctypes and ranking the result cannot fail that way, and when it does
+        fail it reports the class names it actually saw."""
+        kids = self._popup_edit_children(popup_hwnd, timeout=timeout)
         try:
-            return popup.child_window(class_name=self.popup_edit_class)
+            focused = self._focused_hwnd()[0]
         except Exception:
-            return popup.child_window(control_type="Edit")
+            focused = None
+        hwnd, how = _rank_popup_edit(kids, preferred_class=self.popup_edit_class,
+                                     focused_hwnd=focused)
+        cls = next((c.get("class_name") for c in kids
+                    if hwnd is not None and int(c["hwnd"]) == hwnd), None)
+        return {"hwnd": hwnd, "class_name": cls, "how": how if hwnd is not None else None,
+                "why": None if hwnd is not None else how,
+                "popup_hwnd": int(popup_hwnd), "children": kids,
+                "focused_hwnd": focused}
+
+    def _popup_edit(self, popup):
+        """The popup's typing box as something we can focus, clear and read.
+
+        Raises PopupEditNotFound — carrying the popup's full child topology — rather than
+        returning a specification that will time out three lines later with nothing to
+        show for it. Every call site already halts on the exception."""
+        hwnd = self._popup_hwnd
+        if hwnd is None:
+            try:
+                hwnd = int(popup.handle)
+            except Exception as e:
+                raise PopupEditNotFound({"popup_hwnd": None, "children": [],
+                                         "why": f"the popup has no resolvable handle ({e})"})
+        info = self._resolve_popup_edit(hwnd)
+        self._last_edit_info = info
+        if info["hwnd"] is None:
+            raise PopupEditNotFound(info)
+        wrapper = None
+        try:
+            # By handle: exact, and immune to both the exact-class-name and the anchored
+            # -title_re traps. This wrapper is used only for set_focus/set_edit_text.
+            wrapper = self.w32.window(handle=info["hwnd"]).wrapper_object()
+        except Exception:
+            wrapper = None
+        return _EditTarget(info["hwnd"], info["class_name"], info["how"], wrapper=wrapper)
 
     def _window_snapshot(self):
         """(top-level windows of the Drake process, is-main-frame-enabled) — the raw
@@ -675,10 +741,20 @@ class DrakeDriver:
                     w["role"] = "BLOCKING"
                 if w.get("visible"):
                     w["children"] = _enum_child_summaries(h)
+            # Which child of the popup we would type into, and why — read-only. This is the
+            # verdict that decides whether entry can run at all, so it belongs in the dump
+            # rather than only in the halt line of a run that already stopped.
+            popup_edit = None
+            ph = self._popup_hwnd or next(
+                (int(w["hwnd"]) for w in wins if w.get("role") == "heads-down-popup"), None)
+            if ph:
+                popup_edit = {k: v for k, v in self._resolve_popup_edit(ph, timeout=0.3).items()
+                              if k != "children"}
             return {"ok": True, "takenAt": _now(), "pid": pid,
                     "main_hwnd": self.main_hwnd, "main_enabled": main_enabled,
                     "baseline_hwnds": sorted(int(x) for x in self._baseline_hwnds),
                     "keyboard_target": _keyboard_target_info(),
+                    "popup_edit": popup_edit,
                     "blocker": blocker, "benign_notes": list(self.benign_notes),
                     "windows": wins}
         except Exception as e:
@@ -1220,21 +1296,26 @@ class DrakeDriver:
                 out["reason"] = ready.get("reason")
                 return out
             out["popup_title"] = popup.window_text()
-            controls = []
-            for c in popup.descendants():
-                try:
-                    r = c.rectangle()
-                    controls.append({"class": c.friendly_class_name(),
-                                     "class_name": getattr(c.element_info, "class_name", None),
-                                     "text": c.window_text(), "rect": [r.left, r.top, r.width(), r.height()],
-                                     "handle": int(c.handle)})
-                except Exception:
-                    continue
-            out["popup_controls"] = controls
-            edit = self._popup_edit(popup)
+            # The control tree via ctypes, NOT popup.descendants(): pywinauto's own
+            # enumeration is the layer that could not see this popup's text box in the first
+            # place, and the whole point of the dump is to be true when pywinauto is not.
+            # Recorded BEFORE resolution so a failure to identify the box still reports what
+            # is actually in there — that list is the fix.
+            out["popup_controls"] = self._popup_edit_children(self._popup_hwnd or int(popup.handle))
+            try:
+                edit = self._popup_edit(popup)
+            except PopupEditNotFound as e:
+                out["ok"] = False
+                out["reason"] = str(e)
+                out["edit_resolution"] = {k: v for k, v in e.info.items() if k != "children"}
+                # Nothing was typed, so Drake is not armed — but the popup we opened is
+                # still up. Close it so the next run starts from a clean screen.
+                out["disarm"] = self._disarm_popup_blind()
+                return out
             eh = int(edit.handle)
             out["edit_handle"] = eh
-            out["edit_class_name"] = getattr(edit.element_info, "class_name", None)
+            out["edit_class_name"] = edit.class_name
+            out["edit_resolved_by"] = edit.how
             try:
                 edit.set_focus()
             except Exception as e:
@@ -1282,6 +1363,36 @@ class DrakeDriver:
             out["reason"] = str(e)
         return out
 
+    def _disarm_popup_blind(self) -> dict:
+        """Close the popup when its text box could NOT be identified.
+
+        _disarm_popup proves focus by comparing the focused HWND to the edit's — impossible
+        here, that is the whole failure. The weaker but still sufficient proof: the popup
+        must be the FOREGROUND ROOT, so the keystroke goes to a window inside it and not to
+        Drake's canvas, where Esc exits the data-entry screen. No proof, no Esc."""
+        popup = self._find_headsdown_popup(timeout=0.5)
+        if popup is None:
+            self._popup_owned = False
+            return {"ok": True, "note": "popup already closed"}
+        try:
+            root = int(_keyboard_target_info().get("root") or 0)
+        except Exception as e:
+            return {"ok": False, "note": f"could not read the foreground window ({e}) — did "
+                                         f"NOT send Esc. Press Esc in Drake by hand."}
+        if root != int(self._popup_hwnd or 0):
+            return {"ok": False,
+                    "note": f"the heads-down popup is not the foreground window (hwnd={root} "
+                            f"is) — did NOT send Esc, because an Esc on Drake's canvas exits "
+                            f"the data-entry screen. Press Esc in Drake by hand."}
+        self._keys("{ESC}")
+        import time
+        time.sleep(0.25)
+        still = self._find_headsdown_popup(timeout=0.3) is not None
+        self._popup_owned = False
+        return {"ok": not still,
+                "note": ("popup closed" if not still else
+                         "Esc did not close the popup — press Esc in Drake by hand")}
+
     def _disarm_popup(self) -> dict:
         """Send Esc to the heads-down popup so Drake is not left ARMED for a value.
 
@@ -1297,7 +1408,11 @@ class DrakeDriver:
             edit.wait("ready", timeout=2)
             eh = int(edit.handle)
         except Exception as e:
-            return {"ok": False, "note": f"could not resolve the popup edit to disarm: {e}"}
+            # Leaving Drake armed is worse than the weaker proof: fall back to "the popup is
+            # the foreground window", which still guarantees the Esc cannot reach the canvas.
+            blind = self._disarm_popup_blind()
+            blind["note"] = f"could not resolve the popup edit ({e}); " + blind.get("note", "")
+            return blind
         if not self._focus_popup_edit(edit, eh):
             return {"ok": False,
                     "note": "popup edit never took focus — did NOT send Esc, because an Esc on "
@@ -1736,11 +1851,138 @@ def _enum_child_summaries(hwnd, cap: int = 64) -> list:
             txt = ""
         out.append({"hwnd": int(h), "class_name": cls.value, "text": txt[:120],
                     "visible": bool(u32.IsWindowVisible(h)),
+                    "enabled": bool(u32.IsWindowEnabled(h)),
                     "rect": [r.left, r.top, r.right - r.left, r.bottom - r.top]})
         return True
 
     u32.EnumChildWindows(int(hwnd), _cb, 0)
     return out
+
+
+# Window classes that ARE a typing box. Matched as a substring, case-insensitively, because
+# the class name is a toolkit detail we do not control: plain Win32 gives "Edit", Delphi/C++
+# Builder gives "TEdit"/"TMemo"/"TMaskEdit", .NET gives "WindowsForms10.EDIT.app.0.378734a",
+# rich text gives "RichEdit20W". pywinauto's class_name= criterion is EXACT string equality
+# (findwindows.py:257) and its class_name_re= is anchored re.match — so asking it for
+# class_name="Edit" finds NOTHING on any of those builds, which is what made the popup's
+# text box "not ready / no handle: timed out" on the live machine.
+_EDITISH_CLASS = _re.compile(r"edit|textbox|memo|combobox", _re.I)
+
+
+def _editish(class_name: str) -> bool:
+    return bool(_EDITISH_CLASS.search(class_name or ""))
+
+
+def _rank_popup_edit(children, *, preferred_class="Edit", focused_hwnd=None):
+    """Pick the popup's typing box out of its children. Returns (hwnd, how) or (None, why).
+
+    Structure, not a hardcoded class name — see _EDITISH_CLASS. Ordered by how much each
+    signal actually proves:
+
+      1. the exact class the binding was calibrated to (confirmed on this build)
+      2. an edit-shaped class — the focused one first when there is more than one box
+      3. the child that currently OWNS THE KEYBOARD, whatever its class: an owner-drawn
+         input is still where the keystrokes will land, and we prove focus + read the
+         digits back before the irreversible Enter either way
+
+    A Static/Button child is never chosen: the prompt label is not the box. Returning None
+    is a real answer — the caller HALTS rather than typing at a window it could not identify.
+    """
+    kids = list(children or [])
+    if not kids:
+        return None, "the popup reports NO child windows at all"
+    usable = [c for c in kids if c.get("enabled", True)]
+    if not usable:                       # e.g. a modal validator has disabled the whole tree
+        return None, "every child of the popup is DISABLED"
+    shown = [c for c in usable if c.get("visible", True)] or usable
+
+    def _pick(cands):
+        for c in cands:                  # focus breaks ties: it is where keys actually go
+            if focused_hwnd and int(c["hwnd"]) == int(focused_hwnd):
+                return c
+        return cands[0]
+
+    exact = [c for c in shown if (c.get("class_name") or "") == preferred_class]
+    if exact:
+        return int(_pick(exact)["hwnd"]), f"exact class {preferred_class!r}"
+    editish = [c for c in shown if _editish(c.get("class_name"))]
+    if editish:
+        hit = _pick(editish)
+        return int(hit["hwnd"]), f"edit-shaped class {hit.get('class_name')!r}"
+    if focused_hwnd:
+        for c in usable:
+            if int(c["hwnd"]) == int(focused_hwnd):
+                return int(c["hwnd"]), f"child that owns the keyboard ({c.get('class_name')!r})"
+    seen = ", ".join(sorted({(c.get("class_name") or "?") for c in kids})[:8])
+    return None, f"no child looks like a text box (classes present: {seen})"
+
+
+class PopupEditNotFound(Exception):
+    """The heads-down popup is open but its typing box could not be identified.
+
+    Carries the popup's whole child topology, because THAT is the missing fact: a halt that
+    says only "timed out" costs a round trip to the Windows laptop, while one that lists the
+    real class names answers the question in the same run."""
+
+    def __init__(self, info: dict):
+        self.info = info
+        kids = info.get("children") or []
+        if kids:
+            rows = "; ".join(
+                f"{c.get('class_name')} hwnd={c.get('hwnd')} "
+                f"{'vis' if c.get('visible') else 'hidden'}"
+                f"{'' if c.get('enabled', True) else ' DISABLED'}"
+                f"{(' text=' + repr(c.get('text'))) if c.get('text') else ''}"
+                for c in kids[:12])
+            detail = f"its {len(kids)} child window(s) are: {rows}"
+        else:
+            detail = ("it reports NO child windows — the box is drawn by Drake itself, so "
+                      "there is no HWND to focus, type into or read back")
+        super().__init__(
+            f"could not identify the heads-down popup's text box ({info.get('why')}). "
+            f"The popup IS open (hwnd={info.get('popup_hwnd')}) and {detail}. "
+            f"Nothing was typed. Send this line (or env-dump-halt.json) — the class name "
+            f"above is what `headsdown_popup_edit_class` must be set to.")
+
+
+class _EditTarget:
+    """The popup's typing box, addressed by HANDLE.
+
+    Wraps the same three operations the old pywinauto child specification provided —
+    set_focus / set_edit_text / .handle — but resolution already happened by ctypes
+    enumeration, so nothing here can fail the exact-class-name match that broke the live
+    run. wait() is a no-op on purpose: readiness is proven downstream by the focus oracle
+    (GetGUIThreadInfo) and by watching the digits settle, which are facts about this
+    window rather than pywinauto's opinion of it."""
+
+    def __init__(self, hwnd, class_name, how, wrapper=None):
+        self.handle = int(hwnd)
+        self.class_name = class_name
+        self.how = how
+        self.is_edit = _editish(class_name) or (class_name or "") == "Edit"
+        self._wrapper = wrapper
+        self.element_info = _SimpleNamespace(class_name=class_name, handle=int(hwnd))
+
+    def wait(self, flags="ready", timeout=1.0):
+        return self
+
+    def set_focus(self):
+        if self._wrapper is not None:
+            self._wrapper.set_focus()
+        return self
+
+    def set_edit_text(self, text):
+        """Clear/seed the box. Only ever called on a control we identified as a text box —
+        WM_SETTEXT on a window that is NOT an edit rewrites its CAPTION instead, which on
+        the popup itself would rename the very window we find it by."""
+        if not self.is_edit:
+            raise RuntimeError(
+                f"refusing to set text on a {self.class_name!r} — it is not a text box, and "
+                f"WM_SETTEXT would rewrite its caption instead of its contents")
+        if self._wrapper is None:
+            raise RuntimeError("no window wrapper for the popup edit")
+        self._wrapper.set_edit_text(text)
+        return self
 
 
 def _window_deep_text(hwnd, cap: int = 40) -> str:
@@ -1891,7 +2133,12 @@ def _popup_prompt_text(popup_hwnd, edit_hwnd=None, edit_class: str = "Edit") -> 
         for c in _enum_child_summaries(int(popup_hwnd), cap=24):
             if edit_hwnd and int(c.get("hwnd") or 0) == int(edit_hwnd):
                 continue
-            if (c.get("class_name") or "") == edit_class:
+            cls = c.get("class_name") or ""
+            # Skip the configured class AND anything else edit-shaped. If a second text box
+            # leaked into the "prompt", the baseline would change every time we TYPED rather
+            # than only when Drake changed what it is asking for — and prompt movement is
+            # the whole basis of telling acceptance from silent refusal.
+            if cls == edit_class or _editish(cls):
                 continue
             t = (c.get("text") or "").strip()
             if t:
