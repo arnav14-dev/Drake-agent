@@ -441,6 +441,24 @@ changed shape:
   field reads as accepted, and the value gets typed at the number prompt. `_stable_prompt`
   requires the baseline to be seen twice, and returns `''` (→ halt, on a painted popup)
   rather than hand back a reading it could not confirm.
+- **A frame with no words in it is not a reading.** `_read_popup_channels` drops any channel
+  whose text normalises to nothing — blank *or* punctuation-only, because OCR fails by
+  returning `|_. -~` far more often than by returning nothing. This is what halted the first
+  live `write-w2` at field 1: `_settle_surface` already skipped unreadable frames (so the
+  field *number* verified fine), while the baseline path went through `_popup_prompt`, which
+  collapses "no channel answered" into `""` — recording it as a reading of empty and
+  discarding the good reading either side. Two good readings never sat next to each other,
+  so a perfectly legible popup produced no baseline and the run halted with *"could not read
+  the popup at all after jumping to field 1"*. `_classify_after_jump` had the same flaw one
+  step later, where it would have reported a false **refusal** instead.
+- **Per channel, never joined.** Judging the channels as one concatenated string makes the
+  reading only as steady as the least steady channel — a jittering OCR feed stops a clean UIA
+  reading from ever converging. Judging first-wins does the opposite: a channel answering
+  with something useless shadows one that can actually see the typed text. Each channel is
+  compared against its own pre-typing baseline, and one channel proving the keystroke is
+  enough.
+- **No baseline → stop before the Enter.** Not after. The number has only been typed at that
+  point, so Drake is left exactly as it was found.
 
 If **no** channel can read the popup, entry halts before the first Enter rather than typing
 blind, and says that installing Tesseract is what enables the only read-back a painted box
@@ -478,14 +496,15 @@ python simulate_headsdown.py
 
 A fake Drake reproducing the observed behaviours — the persistent protocol, the Field-4
 swallowed chord, silent refusals, and a popup left armed by a previous run — so the state
-machine is provable in seconds, anywhere, before it touches a return. 34 cases: both popup
+machine is provable in seconds, anywhere, before it touches a return. 41 cases: both popup
 models, the EIN-skipped batch shape, an inert box that declines silently (in both variants:
 leaving the number in the edit, and clearing it), a silently refused value, corrupted and
 late-arriving keystrokes, an empty value, an inherited armed popup, a build with no readable
 prompt text, a popup whose text box is a `TEdit`/`WindowsForms10.EDIT…`/`RichEdit20W`, **the
-confirmed painted popup with no child window** (entering a full W-2, under screen-read
-jitter, refusing a silent decline, and halting when nothing can read it), the e-file warning
-being dismissed by name, and the structural dialog gate — **every case runs with the 'Drake
+confirmed painted popup with no child window** (entering a full W-2 under punctuation
+jitter, character-level OCR noise, transient unreadable frames and OCR garbage frames;
+refusing a silent decline; halting when nothing can read it; and halting *before* the Enter
+when the channel dies mid-field), the e-file warning being dismissed by name, and the structural dialog gate — **every case runs with the 'Drake
 Software Chat' window present** (the live field-4 halt).
 
 It fakes *Drake*, not pywinauto: focus and window behaviour on the real thing is still
@@ -507,26 +526,29 @@ guard is now broken *in the source*, in an isolated copy, and the suite must go 
 
 | guard broken | suite result |
 |---|---|
-| comparator back to alnum-only (deletes `.` and `-`) | 37/38 |
-| comparator drops the decimal/sign refusal | 37/38 |
-| single read instead of convergence (the old repair) | 35/38 |
-| empty-value guard removed | 37/38 |
-| inherited-popup ownership check removed | 37/38 |
-| prompt baseline removed (classify by the edit box alone) | 33/38 |
-| commit proof removed (assume the value was accepted) | 37/38 |
-| Ctrl+N keyboard-scope gate removed | 37/38 |
-| popup edit matched by exact class name only (the live halt) | 37/38 |
-| popup edit ranking accepts any child (a label becomes the target) | 37/38 |
-| no children → type at the popup itself (blind entry) | 33/38 |
-| painted popup: commit a value without confirming the keystroke | 37/38 |
-| painted popup: Enter on an unconfirmed field number | 36/38 |
-| painted popup: presence instead of counting (prompt's own digits) | 36/38 |
-| prompt change accepted from a single jittery frame | 37/38 |
-| prompt **baseline** taken from a single frame | 37/38 |
-| auto-dismiss presses Enter blind instead of a named button | 37/38 |
-| auto-dismiss treats every dialog as dismissable | 37/38 |
-| prompt baseline lets edit-shaped children leak in | 37/38 |
-| structural dialog gate blinded | 33/38 |
+| comparator back to alnum-only (deletes `.` and `-`) | 40/41 |
+| comparator drops the decimal/sign refusal | 40/41 |
+| single read instead of convergence (the old repair) | 38/41 |
+| empty-value guard removed | 40/41 |
+| inherited-popup ownership check removed | 40/41 |
+| prompt baseline removed (classify by the edit box alone) | 33/41 |
+| commit proof removed (assume the value was accepted) | 40/41 |
+| Ctrl+N keyboard-scope gate removed | 40/41 |
+| popup edit matched by exact class name only (the live halt) | 40/41 |
+| popup edit ranking accepts any child (a label becomes the target) | 40/41 |
+| no children → type at the popup itself (blind entry) | 33/41 |
+| painted popup: commit a value without confirming the keystroke | 40/41 |
+| painted popup: Enter on an unconfirmed field number | 38/41 |
+| painted popup: presence instead of counting (prompt's own digits) | 39/41 |
+| prompt change accepted from a single jittery frame | 40/41 |
+| prompt **baseline** taken from a single frame | 37/41 |
+| informationless frame admitted as a reading (blank/punctuation) | 40/41 |
+| unreadable frame recorded as a reading of `''` after the jump | 39/41 |
+| no baseline → press Enter anyway and find out afterwards | 40/41 |
+| auto-dismiss presses Enter blind instead of a named button | 40/41 |
+| auto-dismiss treats every dialog as dismissable | 40/41 |
+| prompt baseline lets edit-shaped children leak in | 40/41 |
+| structural dialog gate blinded | 36/41 |
 
 Two mutants are documented in the harness as **not** gaps rather than papered over with a
 test that cannot exist: the `target.startswith(acc)` early-break in `_surface_count` is an

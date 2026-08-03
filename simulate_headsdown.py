@@ -76,7 +76,8 @@ class FakeDrake:
                  *, echo=None, value_validator=None, prompts: bool = True,
                  inert_fields=None, inert_clears: bool = False,
                  edit_class: str = "Edit", popup_has_edit: bool = True,
-                 surface_readable: bool = True, surface_jitter: bool = False):
+                 surface_readable: bool = True, surface_jitter: bool = False,
+                 surface_reads_before_blind: int | None = None):
         self.model = model
         # What the toolkit NAMES the popup's text box. "Edit" is plain Win32; a Delphi build
         # says "TEdit", .NET says "WindowsForms10.EDIT.app.0.378734a". The driver must find
@@ -91,6 +92,11 @@ class FakeDrake:
         # Can any channel read a painted popup on this build? False = every read returns
         # nothing, which must make entry HALT rather than commit a keystroke it never saw.
         self.surface_readable = surface_readable
+        # Reads before the channel goes permanently silent, or None for "never". Models a
+        # channel that DIES MID-FIELD: the field number verifies, and then there is nothing
+        # left to baseline the prompt with. The number must not be committed in that state.
+        self.surface_reads_before_blind = surface_reads_before_blind
+        self._surface_reads = 0
         # Model a screen-read channel: the text is right but the punctuation/spacing jitters
         # frame to frame, exactly as OCR does. Nothing may turn on a stray comma.
         self.surface_jitter = surface_jitter
@@ -130,6 +136,7 @@ class FakeDrake:
         self.advanced: set[int] = set()  # auto-advance fires once per field, on commit
         self.log: list[str] = []
         self.typed: list[str] = []   # every string the driver sent, in order
+        self.keys: list[str] = []    # every CHORD the driver sent, in order
 
     # -- what the operator sees ---------------------------------------------
 
@@ -150,6 +157,23 @@ class FakeDrake:
         if not self.surface_jitter:
             return text
         self._jitter_n += 1
+        if self.surface_jitter == "repaint":
+            # LIVE FAILURE (field 1, first write-w2 run): Drake repaints between reads and
+            # the accessibility read intermittently comes back with NOTHING. Alternating is
+            # the honest model of a slow channel against a busy app — it is what makes "two
+            # consecutive readings that agree" hard to get, and it is the case the driver
+            # got wrong: _settle_surface skipped unreadable frames (so the field NUMBER
+            # verified fine), while _stable_prompt recorded them as a reading of '' — which
+            # discarded the good reading either side, produced no baseline, and halted with
+            # "could not read the popup at all after jumping to field 1".
+            return "" if self._jitter_n % 2 == 0 else text
+        if self.surface_jitter == "garbage":
+            # What OCR does more often than going silent: it returns SOMETHING, and the
+            # something is punctuation. Non-empty, so the channel reports it as a reading,
+            # but it carries no words — normalising it leaves nothing. It must be discarded
+            # for the same reason an absent reading is, or it clobbers the good frame beside
+            # it and no baseline ever forms.
+            return "|_. -~" if self._jitter_n % 2 == 0 else text
         if self.surface_jitter == "chars":
             # The noise OCR actually makes: every third frame a LETTER comes back wrong.
             # Normalising punctuation does not absorb this, so it is what proves the
@@ -347,6 +371,11 @@ class SimDriver(DrakeDriver):
         return wins, self.fake.error_dialog is None
 
     def _keys(self, chord: str):
+        # Every chord, verbatim. Asserting on fake.log was unreliable — the persistent model
+        # logs what an Enter DID ("value committed…"), never the key itself, so "no Enter was
+        # pressed" passed whether or not one had been. A test that cannot fail is worse than
+        # no test.
+        self.fake.keys.append(chord)
         if chord == "{ENTER}":
             self.fake.enter()
         elif chord == "{ESC}":
@@ -375,7 +404,16 @@ class SimDriver(DrakeDriver):
         contract and every gate built on them in the tested path."""
         if not self.fake.popup_open or int(popup_hwnd) != POPUP_HWND:
             return None
-        return self.fake.render() if self.fake.surface_readable else None
+        if not self.fake.surface_readable:
+            return None
+        lim = self.fake.surface_reads_before_blind
+        self.fake._surface_reads += 1
+        if lim is not None and self.fake._surface_reads > lim:
+            return None
+        # None, never '' — a channel with nothing to say must be ABSENT. The real channel
+        # honours this ('.join(parts) or None'), and the distinction is the whole point:
+        # '' is a claim that the popup is empty, and the gates would act on it.
+        return self.fake.render() or None
 
     def _read_popup_ocr(self, popup_hwnd):
         return None      # Tesseract absent unless a case says otherwise
@@ -957,6 +995,32 @@ def case_painted_popup_unreadable():
     return ok
 
 
+def case_painted_popup_channel_dies_before_the_baseline():
+    """The read channel works long enough to verify the field NUMBER, then goes silent —
+    so there is no steady reading to baseline the prompt against.
+
+    Both a driver that checks and one that does not end up halting, so the halt alone proves
+    nothing. What distinguishes them is WHEN: with the check, the number has only been
+    typed, and Drake is left exactly as it was found. Without it, Enter is pressed on a
+    field whose outcome cannot then be read — the number is committed and the run discovers
+    afterwards that it is blind."""
+    fake, drv = _new("persistent", popup_has_edit=False, surface_reads_before_blind=4)
+    res = drv.headsdown_type("23", "52000")
+    reason = str(res.get("reason") or "")
+    checks = [
+        ("halts", res.get("ok") is False and res.get("halt") is True),
+        ("the Enter was NEVER pressed", "{ENTER}" not in fake.keys),
+        ("nothing committed", fake.values == {} and fake.committed == set()),
+        ("says the reading would not settle", "steady reading" in reason),
+    ]
+    ok = all(v for _, v in checks)
+    _check("painted popup: no steady baseline -> stop BEFORE the Enter, not after", ok,
+           f"{reason}\nlog:\n" + "\n".join("  " + l for l in fake.log))
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
 def case_painted_popup_silent_refusal(label="", **kw):
     """An inert box on a painted popup. The number is typed and shown, Drake declines it
     silently, and the ONLY tell is that the popup's text never moves off the number prompt.
@@ -987,7 +1051,7 @@ def case_painted_popup_keystrokes_vanish():
     fake, drv = _new("persistent", popup_has_edit=False, echo=lambda t: "")
     res = drv.headsdown_type("23", "52000")
     ok = (res.get("ok") is False and res.get("halt") is True
-          and fake.values == {} and not any("ENTER" in l for l in fake.log))
+          and fake.values == {} and "{ENTER}" not in fake.keys)
     return _check("painted popup: vanished keystrokes -> HALT, Enter never pressed", ok,
                   f"{res.get('reason')}\nvalues={fake.values}\nlog:\n"
                   + "\n".join("  " + l for l in fake.log))
@@ -1258,6 +1322,10 @@ def main() -> int:
     case_painted_popup_enters()
     case_painted_popup_enters(label=" [punctuation jitter]", surface_jitter="punct")
     case_painted_popup_enters(label=" [character-level OCR noise]", surface_jitter="chars")
+    case_painted_popup_enters(label=" [transient unreadable frames — the live field-1 halt]",
+                              surface_jitter="repaint")
+    case_painted_popup_enters(label=" [OCR garbage frames]", surface_jitter="garbage")
+    case_painted_popup_channel_dies_before_the_baseline()
     case_painted_popup_unreadable()
     case_painted_popup_keystrokes_vanish()
     case_painted_popup_value_corrupted()

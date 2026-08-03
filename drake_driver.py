@@ -618,36 +618,49 @@ class DrakeDriver:
             self._last_ocr_error = f"{type(e).__name__}: {e}"
             return None
 
-    def _read_popup_surface(self, popup_hwnd, edit_hwnd=None):
-        """(text, channel) for the heads-down popup — everything it is showing right now.
+    def _read_popup_channels(self, popup_hwnd, edit_hwnd=None) -> dict:
+        """{channel: text} for every channel that answered THIS INSTANT. Silent channels are
+        absent from the dict — absence is no evidence, never a reading of ''.
 
-        Channels in order of trustworthiness. A child Edit's WM_GETTEXT is exact; UIA is
-        exact when Drake exposes anything; OCR is approximate but is the only one that works
-        on a box the application paints itself. (None, "none") means NO channel could read
-        it — which callers must treat as no evidence, never as agreement.
-
-        Note this returns the WHOLE popup (prompt + whatever has been typed), not a field
-        value, because with no child window there is nothing finer to address."""
+        Kept per channel rather than joined into one string, because the two ways of being
+        wrong pull in opposite directions. First-wins lets a channel that answers with
+        something useless shadow one that can actually see the typed text. Joining does the
+        reverse: the combined string is only as steady as the LEAST steady channel, so an
+        OCR feed jittering by a character stops a perfectly clean UIA reading from ever
+        converging — and the gates, which all require two consecutive equal readings, then
+        time out on keystrokes that landed correctly. Judging each channel on its own
+        evidence avoids both."""
+        out = {}
         if edit_hwnd and int(edit_hwnd) != int(popup_hwnd):
             t = _read_edit_or_none(edit_hwnd)
             if t is not None:
-                return t, "win32"
-        # EVERY enabled channel, joined — not first-wins. A channel that answers with
-        # something useless but non-empty (a constant caption, say) would otherwise shadow
-        # one that actually sees the typed text, and the run would halt on every field with
-        # a working read-back sitting unused behind it. Extra text is harmless: matching
-        # counts tokens, so more haystack cannot manufacture a match.
-        parts, names = [], []
+                out["win32"] = t
+                return out
         for name, fn in (("uia", self._read_popup_uia), ("ocr", self._read_popup_ocr)):
             if name not in self.popup_read_channels:
                 continue
             t = fn(popup_hwnd)
-            if t is not None:
-                parts.append(t)
-                names.append(name)
-        if parts:
-            return " ".join(parts), "+".join(names)
-        return None, "none"
+            # A reading with no alphanumerics in it is not a reading. OCR fails far more
+            # often by returning punctuation ('|_. -~') than by returning nothing, and such
+            # a frame is non-empty enough to look like an answer while carrying no
+            # information. Admitting it would clobber the good frame beside it — every gate
+            # here needs two consecutive readings that agree, so one interloper between two
+            # identical readings is enough to stall the lot.
+            if t is not None and _norm_prompt(t):
+                out[name] = t
+        return out
+
+    def _read_popup_surface(self, popup_hwnd, edit_hwnd=None):
+        """(text, channel) — everything the popup is showing, for halt messages and for the
+        prompt text callers display. (None, "none") means NO channel could read it, which
+        callers must treat as no evidence rather than as agreement.
+
+        The GATES do not use this: they compare channels individually — see
+        _read_popup_channels."""
+        chans = self._read_popup_channels(popup_hwnd, edit_hwnd)
+        if not chans:
+            return None, "none"
+        return " ".join(chans.values()), "+".join(chans)
 
     def _surface_count(self, text, expected) -> int:
         """How many times this popup reading shows `expected` — as WHOLE TOKENS, in order.
@@ -691,26 +704,32 @@ class DrakeDriver:
         one MORE occurrence of the token than the baseline had, not merely its presence:
         Drake's own value prompt names the field ("Enter the value for field 1…"), so a
         presence test would pass on the prompt's own '1' when the value 'T' never landed, and
-        would also refuse the legitimate entry of the value '1'. Counting distinguishes them."""
+        would also refuse the legitimate entry of the value '1'. Counting distinguishes them.
+
+        `baseline` is the per-channel dict from _clear_target, so each channel is compared
+        against what IT showed before the keystroke — one channel is enough to prove the
+        keystroke landed, and a channel that never sees anything simply never votes."""
         import time
-        base_n = self._surface_count(baseline, expected)
+        base = baseline if isinstance(baseline, dict) else {"*": baseline}
         deadline = time.time() + timeout
-        prev, last, chan = None, None, "none"
-        while time.time() < deadline:
-            text, chan = self._read_popup_surface(popup_hwnd)
-            if text is not None:
-                last = text
+        prev, last, chan = {}, None, "none"
+        while True:
+            chans = self._read_popup_channels(popup_hwnd)
+            for name, text in chans.items():
+                last, chan = text, name
                 # Stability is compared on the NORMALISED reading. A screen read of an
                 # unchanged popup is not byte-identical twice running — spacing and
                 # punctuation move — and demanding that would make every OCR build time out
                 # on a keystroke that had in fact landed.
                 cur = _norm_prompt(text)
-                if (prev is not None and cur == prev
+                base_n = self._surface_count(base.get(name, base.get("*", "")), expected)
+                if (prev.get(name) == cur
                         and self._surface_count(text, expected) > base_n):
                     return True, text, chan
-                prev = cur
+                prev[name] = cur
+            if time.time() >= deadline:
+                return False, last, (chan if last is not None else "none")
             time.sleep(poll)
-        return False, last, chan
 
     def _surface_halt_reason(self, what, got, chan, tail) -> str:
         if chan == "none" or got is None:
@@ -742,20 +761,25 @@ class DrakeDriver:
                 return {"ok": False,
                         "reason": f"popup edit still holds {stale!r} before typing — refusing "
                                   f"to type onto residue"}
-            return {"ok": True, "baseline": ""}
+            return {"ok": True, "baseline": {}, "baseline_text": ""}
         # Painted box: no WM_SETTEXT target. Backspace is the only clear, and it is safe on
         # an empty box. Deliberately not Ctrl+A/Delete — Ctrl chords are toxic on this app.
         self._keys("{BACKSPACE 16}")
         import time
         time.sleep(0.15)
-        text, chan = self._read_popup_surface(edit.handle)
+        chans = self._read_popup_channels(edit.handle)
+        text = " ".join(chans.values()) if chans else None
+        chan = "+".join(chans) if chans else "none"
         if text is None and chan == "none" and not self._warned_surface_blind:
             self._warned_surface_blind = True
             print(f"  ⚠ the heads-down popup owns no child window and NOTHING can read it "
                   f"(UIA silent; OCR: {self._last_ocr_error or 'no answer'}). Entry cannot "
                   f"verify a keystroke before committing it, so it will halt rather than "
                   f"type blind.")
-        return {"ok": True, "baseline": text or ""}
+        # Per channel: the settle check compares each channel against what THAT channel
+        # showed here, so a channel that reads the prompt and one that reads only the typed
+        # text are both usable, and neither has to agree with the other.
+        return {"ok": True, "baseline": chans, "baseline_text": text or ""}
 
     def _popup_edit_children(self, popup_hwnd, timeout: float = 2.0) -> list:
         """The popup's child windows, polled until it has some.
@@ -1286,7 +1310,7 @@ class DrakeDriver:
             return text or ""
         return ""
 
-    def _stable_prompt(self, popup, edit_hwnd=None, *, timeout: float = 1.5,
+    def _stable_prompt(self, popup, edit_hwnd=None, *, timeout: float = 3.0,
                        poll: float = 0.1) -> str:
         """A prompt reading that has been seen TWICE — '' if it never settles.
 
@@ -1298,22 +1322,55 @@ class DrakeDriver:
         character-noise case caught in this driver.
 
         '' when it cannot converge, which callers already treat as "this build exposes no
-        prompt" and degrade (on a painted popup: halt) rather than trusting noise."""
+        prompt" and degrade (on a painted popup: halt) rather than trusting noise.
+
+        An UNREADABLE frame is skipped, not recorded as a reading of ''. This is what halted
+        the first live run at field 1: right after the keystroke Drake is still repainting,
+        the first read comes back with nothing, and treating that as a reading discarded the
+        good reading either side of it — so a popup that was perfectly legible produced no
+        baseline, and the field halted with 'could not read the popup at all'. No evidence
+        is not evidence of emptiness.
+
+        Per channel, so a jittery OCR feed cannot stop a clean UIA reading from settling."""
         import time
         deadline = time.time() + timeout
-        prev = None
+        prev, attempts = {}, 0
         while True:
-            t = self._popup_prompt(popup, edit_hwnd)
-            n = _norm_prompt(t)
-            if n and prev == n:
-                return t
-            # Only pause once the two readings actually disagreed: on a build with a real
-            # Edit the second read is identical, so this costs a function call, not a wait.
-            if prev is not None:
-                if time.time() >= deadline:
-                    return ""
-                time.sleep(poll)
-            prev = n
+            chans = self._popup_prompt_channels(popup, edit_hwnd)
+            attempts += 1
+            for name, t in chans.items():
+                # Every reading here already carries words — _read_popup_channels drops the
+                # blank and the punctuation-only ones, so nothing that reaches this loop can
+                # displace a good reading.
+                n = _norm_prompt(t)
+                if prev.get(name) == n:
+                    return t
+                prev[name] = n
+            # Give it a MINIMUM number of tries as well as a deadline: a UIA tree walk can
+            # take most of a second by itself, so a purely wall-clock budget can expire
+            # having barely looked.
+            if attempts >= 3 and time.time() >= deadline:
+                return ""
+            time.sleep(poll)
+
+    def _popup_prompt_channels(self, popup, edit_hwnd=None) -> dict:
+        """{channel: text} for a popup WindowSpecification — the per-channel form of
+        _popup_prompt. Child-window text (a real Static prompt) is reported under 'win32'."""
+        hwnd = self._popup_hwnd
+        if hwnd is None:
+            try:
+                hwnd = int(popup.handle)
+            except Exception:
+                return {}
+        try:
+            t = _popup_prompt_text(hwnd, edit_hwnd, self.popup_edit_class)
+        except Exception:
+            t = ""
+        if t:
+            return {"win32": t}
+        if edit_hwnd is None or int(edit_hwnd) == int(hwnd):
+            return self._read_popup_channels(hwnd)
+        return {}
 
     def _note_prompt_blind(self) -> None:
         if self._warned_prompt_blind:
@@ -1366,7 +1423,12 @@ class DrakeDriver:
                 # function exists to prevent.
                 if cur and cur_norm != base_norm and cur_norm == prev_norm:
                     return ("persistent", {"prompt": cur})
-                prev_norm = cur_norm
+                # ONLY on a real reading. An unreadable frame is no evidence, and letting it
+                # overwrite the previous good reading means two good readings never sit next
+                # to each other — every jump would then time out and report the field as
+                # refused when Drake had accepted it.
+                if cur:
+                    prev_norm = cur_norm
             elif not self._is_surface_hwnd(edit_hwnd):
                 # Blind build: the best available signal is the edit clearing.
                 cur_edit = _read_edit_or_none(edit_hwnd)
@@ -1559,6 +1621,19 @@ class DrakeDriver:
             # Baseline the NUMBER prompt while it is still showing, so step 6 can tell
             # "Drake took the number" from "Drake silently refused it".
             base_prompt = self._stable_prompt(popup, eh)
+            if edit.surface and not base_prompt:
+                # No baseline means step 6 cannot tell acceptance from refusal, and on a
+                # painted popup there is no weaker test to fall back on. Stop HERE rather
+                # than after the Enter: the number has only been typed, not committed, so
+                # nothing has happened to the return yet.
+                return {"ok": False, "halt": True,
+                        "reason": f"could not get a steady reading of the popup before "
+                                  f"committing field {fn} — two consecutive reads never "
+                                  f"agreed (channels: {'+'.join(self._read_popup_channels(eh)) or 'none'}"
+                                  f"{'; OCR: ' + self._last_ocr_error if self._last_ocr_error else ''}). "
+                                  f"Nothing was committed. If this repeats, the popup is "
+                                  f"legible but unstable — raise navigation.headsdown_read_"
+                                  f"channels to just the steady one."}
             # 6) fire the jump, then OBSERVE what Drake actually did.
             self._keys("{ENTER}")
             model, dlg = self._classify_after_jump(eh, fn, base_prompt=base_prompt, timeout=2.5)
@@ -1622,7 +1697,9 @@ class DrakeDriver:
                 # AFTER the gate passes (52000 -> read '520' -> "repair" -> queued '00'
                 # arrives -> 5,200,000 committed, reported OK).
                 if edit.surface:
-                    settled, read_back, chan = self._settle_surface(eh, val, value_prompt)
+                    # Per-channel baseline from the clear, not the joined value_prompt: each
+                    # channel is judged against what IT showed before the value was typed.
+                    settled, read_back, chan = self._settle_surface(eh, val, pre.get("baseline"))
                     if not settled:
                         return {"ok": False, "halt": True,
                                 "reason": self._surface_halt_reason(
