@@ -561,6 +561,9 @@ A guard whose mutant survives has no test, whatever the suite says.
 
 ## Files
 
+- `HANDOFF.md` — **start here if you are new to this project.** What is being built, what is
+  empirically true about Drake, what is finished, and where the real blockers are.
+- `mutants.py` — the mutation harness (`python mutants.py`, ~20 min).
 - `agent.py` — CLI + modes.
 - `drake_driver.py` — the pywinauto driver (focus/type/read). **The parts that depend
   on your Drake build live here and in `binding.json` — expect to iterate on the VM.**
