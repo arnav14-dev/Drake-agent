@@ -97,14 +97,31 @@ A locality CODE is the exception: it is refused rather than trimmed, because cut
 short does not shorten a name, it names a different locality.
 
 **Heads-down arms off an ACTIVE CARET, not window focus.** Ctrl+N is a silent no-op with no
-field active — no popup, no error. A finished run leaves the canvas focused with no caret
-and the popup still on screen, which is exactly the state a second back-to-back run starts
-in: on 2026-08-05 run 1 wrote 78/78 and run 2 halted on field 1 having typed nothing. The
-halt is safe, but consecutive UNATTENDED W-2s do not work without a re-arm step. `{ESC}`
-then `{TAB}` then Ctrl+N recovers it — proven live on the stuck state, keyboard-only, no
-coordinates, and Tab moves between boxes rather than altering one. Deliberately NOT built
-in: the founder prefers to clear the popup by hand and be asked first. Build it when the
-backend starts feeding W-2s unattended.
+box active — no popup, no error, no sound. A finished run leaves exactly that: caret gone,
+focus drifted to another Drake window, and the old popup still on screen holding no
+keyboard. On 2026-08-05 run 1 wrote 78/78 and run 2 halted on field 1 having typed nothing.
+
+FIXED, and the route there is worth keeping because two plausible fixes were both wrong:
+  - **Esc does not reach that popup.** It holds no keyboard, so Esc goes to whatever does.
+    The "proof" that Esc worked was worthless — the popup had already closed on its own
+    before the test sent it.
+  - **Tab does not reliably give a box the caret** from this state either. It worked once,
+    in that same muddled test, and failed every time after.
+  - **Focusing a canvas Edit through UIA does**, and Ctrl+N then behaves normally.
+  - **Closing the stale popup drops focus to NOTHING** (`GetGUIThreadInfo` returns hwnd 0),
+    so the caret must be restored a SECOND time before the popup can be re-opened. Missing
+    that is why the first version got as far as closing the popup and no further.
+  - **The focus check itself was the last bug.** Drake's canvas is WPF — ONE window hosting
+    every box — so the focused HWND is identical whether the caret is on a box or on none.
+    Asserting the hwnd had CHANGED made the recovery pass or fail on where focus happened to
+    start: it worked when focus sat on the app frame, failed when it was already on the
+    canvas. `CurrentHasKeyboardFocus` on the element is the only thing that actually knows,
+    and it answers cleanly (False before `set_focus`, True after).
+
+`_rearm_caret` runs once per run and lowers no bar: the popup it produces must still be
+found, still hold the keyboard, and still be on the field-number prompt before a character
+is typed. Verified live — four consecutive 8-field entries and two consecutive 78-field
+entries, every one self-recovering, with nobody touching the keyboard.
 
 **Two identical runs produce an identical form.** 2026-08-05, first time this was ever
 tested: the same 78-field payload run twice with no edits between, compared box-by-box off

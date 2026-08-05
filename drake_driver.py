@@ -155,6 +155,12 @@ class DrakeDriver:
         self._warned_popup_foreign = False
         self._warned_surface_blind = False
         self._warned_recycled = False
+        # Has the caret re-arm already been spent this run? Once, deliberately — see
+        # _rearm_caret. A state one re-arm does not fix is a state a human should see.
+        self._caret_rearmed = False
+        # Screen y below which the data-entry FORM starts. Above it are Drake's toolbar and
+        # tab strip, which have Edits of their own; the caret belongs on a form box.
+        self._canvas_form_top = int(self.nav.get("canvas_form_top", 150))
         # Has this build's heads-down popup been OBSERVED to own no child windows? None
         # until the first full-budget resolution answers it. See _resolve_popup_edit.
         self._popup_painted = None
@@ -1478,9 +1484,17 @@ class DrakeDriver:
                 self._popup_owned = True  # WE opened it, so its state is known: number prompt
                 return {"ok": True, "opened": True, "attempts": i + 1, "popup": spec}
             time.sleep(0.25 * (i + 1))  # Drake is busy (auto-fill / commit) — let it settle
+        # Every attempt fired into Drake's frame and nothing came up. "Drake is busy" is now
+        # exhausted as an explanation; the remaining one is that no field holds the caret, so
+        # Ctrl+N has been a no-op every time. Answer the question the old message could only
+        # ask ("is a canvas field active?") instead of handing it back to the operator.
+        rearmed = self._rearm_caret(method=method)
+        if rearmed.get("ok"):
+            return {"ok": True, "opened": True, "attempts": attempts, "popup": rearmed["popup"],
+                    "rearmed": True}
         return {"ok": False,
-                "reason": f"Ctrl+N did not open the heads-down popup after {attempts} attempts "
-                          f"(is a canvas field active?)"}
+                "reason": f"Ctrl+N did not open the heads-down popup after {attempts} attempts. "
+                          f"{rearmed.get('reason', '')}".strip()}
 
     def _popup_holds_keyboard(self, popup, tries: int = 4) -> bool:
         """Does the heads-down popup actually own the keyboard? Retried briefly, because
@@ -1541,10 +1555,10 @@ class DrakeDriver:
                 break
             time.sleep(0.1)
         if not gone:
-            return {"ok": False,
-                    "reason": "the heads-down popup is up but does not hold the keyboard, and "
-                              "Ctrl+N did not close it. Nothing was typed. Press Esc in Drake, "
-                              "click a field, and re-run."}
+            # Ctrl+N could not close it because Ctrl+N is doing NOTHING — no caret. Esc
+            # closes a popup without needing one, and Tab puts the caret back. Verified
+            # end-to-end before this returns ok.
+            return self._rearm_caret(method=method)
         self._popup_owned = False
         self.headsdown_toggle(method=method)          # 2) bring up a live one
         popup = self._find_headsdown_popup(timeout=2.0)
@@ -1561,6 +1575,162 @@ class DrakeDriver:
         self._popup_owned = True
         self._note_recycled()
         return {"ok": True, "popup": popup, "recycled": True}
+
+    def _focus_canvas_field(self) -> bool:
+        """Put the caret back on a real data-entry box, through the accessibility tree.
+
+        NOT a coordinate click. The element is found in the canvas window's UIA tree — the
+        same tree FORM CHECK already reads — and asked to take focus, so there is no screen
+        position to get wrong, nothing to land on a button, and no dependence on the window
+        being where it was last time. Taking focus does not alter a box's contents.
+
+        Boxes above the form band are skipped: the toolbar has its own Edits, and while
+        focusing one does happen to arm Ctrl+N on this build, a field inside the form is
+        the thing we actually mean. Deterministic order (top, then left) so the same box is
+        chosen every run and a failure is reproducible.
+        """
+        if self.dry_run or self.app is None:
+            return False
+        best = None
+        for h in self.canvas_windows():
+            try:
+                els = self.app.window(handle=h).descendants()
+            except Exception:
+                continue
+            for el in els:
+                try:
+                    if str(el.element_info.control_type or "") != "Edit":
+                        continue
+                    if not (el.is_enabled() and el.is_visible()):
+                        continue
+                    r = el.rectangle()
+                except Exception:
+                    continue
+                if int(r.top) < self._canvas_form_top:
+                    continue                     # toolbar / tab strip, not the form
+                key = (int(r.top), int(r.left))
+                if best is None or key < best[0]:
+                    best = (key, el)
+        if best is None:
+            return False
+        try:
+            best[1].set_focus()
+        except Exception:
+            return False
+        import time
+        for _ in range(10):
+            got = _element_has_keyboard_focus(best[1])
+            if got:
+                return True
+            if got is None:
+                # The toolkit will not answer. Fall back to the window-level fact — the
+                # keyboard is on a data-entry window — which is weaker but still evidence.
+                # The run must ALSO see the popup open and hold the keyboard before it
+                # types, so a generous answer here cannot let a keystroke through.
+                now = int(self._focused_hwnd()[0] or 0)
+                if now and now in set(self.canvas_windows()):
+                    return True
+            time.sleep(0.08)
+        return False
+
+    def _rearm_caret(self, *, method: str = "scancode") -> dict:
+        """Recover the state a FINISHED run leaves behind, in which Ctrl+N does nothing.
+
+        Drake arms heads-down off an ACTIVE CARET, not window focus. With no box active,
+        Ctrl+N is a SILENT no-op — no popup, no error, no sound. A completed run leaves
+        exactly that: the caret gone, focus drifted onto a different Drake window, and the
+        old popup still on screen and holding no keyboard. A second back-to-back entry
+        cannot bootstrap itself out of it. Confirmed live 2026-08-05: run 1 wrote 78/78,
+        run 2 halted on field 1 having typed nothing.
+
+        MEASURED, after a first attempt built on guesswork failed three times running:
+          - Esc does NOT reach that popup. It has no keyboard, so Esc goes to whatever does.
+          - Tab does not reliably give a box the caret from this state either.
+          - Focusing a canvas Edit through UIA DOES, and Ctrl+N then behaves normally.
+          - Closing the stale popup drops focus to NOTHING (hwnd 0), so the caret has to be
+            put back a second time before the popup can be re-opened. Missing that step is
+            why the first version got as far as closing the popup and no further.
+
+        Attempted ONCE per run: a state this does not fix is a state a human should see,
+        and retrying only repeats a sequence against a screen we have already misread.
+
+        This lowers no bar. The popup it produces still has to be found, still has to hold
+        the keyboard, and still has to be on the field-number prompt before one character is
+        typed — the same three proofs demanded of any other popup. It only reaches a state
+        the run could otherwise reach only by asking a human to click.
+        """
+        import time
+        if self._caret_rearmed:
+            return {"ok": False,
+                    "reason": "heads-down still will not arm after a caret re-arm was already "
+                              "tried this run. Nothing was typed. Click into a Drake field and "
+                              "re-run."}
+        self._caret_rearmed = True
+        stale = self._find_headsdown_popup(timeout=0.05) is not None
+        if stale:
+            # Ctrl+N cannot close it while nothing holds the caret — that is exactly why we
+            # are here. Give the caret back FIRST, then the toggle is heard.
+            if not self._focus_canvas_field():
+                return {"ok": False,
+                        "reason": "the heads-down popup is up, holds no keyboard, and no box on "
+                                  "the data-entry form would take the caret — so nothing can "
+                                  "reach it. Nothing was typed. Close it in Drake, click a "
+                                  "field, and re-run."}
+            ok_scope, where = self._input_scope(allow_popup=True)
+            if not ok_scope:
+                return {"ok": False,
+                        "reason": f"heads-down will not arm and the keyboard is in {where} — "
+                                  f"outside Drake entirely. Refusing to send Ctrl+N. Click a "
+                                  f"Drake field and re-run."}
+            self.headsdown_toggle(method=method)
+            gone = False
+            for _ in range(12):
+                if self._find_headsdown_popup(timeout=0.05) is None:
+                    gone = True
+                    break
+                time.sleep(0.1)
+            if not gone:
+                return {"ok": False,
+                        "reason": "the heads-down popup is up, holds no keyboard, and would not "
+                                  "close even once the caret was restored. Nothing was typed. "
+                                  "Close it in Drake, click a field, and re-run."}
+            self._popup_owned = False
+        # Closing the popup drops focus to nothing, so the caret goes back a second time.
+        # Unconditional: on the no-popup path this is the only place it happens at all.
+        if not self._focus_canvas_field():
+            return {"ok": False,
+                    "reason": "heads-down will not arm and no box on the data-entry form would "
+                              "take the caret — is a return's data-entry screen actually open? "
+                              "Nothing was typed. Click a Drake field and re-run."}
+        ok_scope, where = self._input_scope(allow_popup=False)
+        if not ok_scope:
+            return {"ok": False,
+                    "reason": f"restored the caret, but the keyboard is in {where} — not Drake's "
+                              f"frame. Refusing to send Ctrl+N. Click a Drake field and re-run."}
+        self.headsdown_toggle(method=method)
+        popup = self._find_headsdown_popup(timeout=2.0)
+        if popup is None:
+            return {"ok": False,
+                    "reason": "restored the caret on a data-entry box, but Ctrl+N still did not "
+                              "open the heads-down popup. Nothing was typed. Click a Drake field "
+                              "and re-run."}
+        if not self._popup_holds_keyboard(popup, tries=8):
+            return {"ok": False,
+                    "reason": "restored the caret and the heads-down popup opened, but it does "
+                              "NOT hold the keyboard, so a keystroke would land on the canvas. "
+                              "Nothing was typed. Click into a Drake field and re-run."}
+        # WE opened this one, so its state is known: it is on the field-number prompt.
+        self._popup_owned = True
+        self._note_rearmed()
+        return {"ok": True, "popup": popup, "rearmed": True}
+
+    def _note_rearmed(self) -> None:
+        if getattr(self, "_warned_rearmed", False):
+            return
+        self._warned_rearmed = True
+        _say("  · heads-down would not arm (no active caret — the state a finished run leaves "
+             "behind). Put the caret back on a data-entry box and re-opened the popup; entry "
+             "continues.")
 
     def _note_recycled(self) -> None:
         if getattr(self, "_warned_recycled", False):
@@ -3588,6 +3758,27 @@ def _element_rect(el):
     try:
         r = el.rectangle()
         return [int(r.left), int(r.top), int(r.right), int(r.bottom)]
+    except Exception:
+        return None
+
+
+def _element_has_keyboard_focus(el) -> Optional[bool]:
+    """Does this UIA element hold the keyboard? None when the toolkit will not say.
+
+    'No' and 'we could not tell' must not look alike. Drake's data-entry canvas is WPF —
+    ONE window hosting every box — so the FOCUSED HWND is identical whether the caret is
+    on a box or on none of them. Asserting the hwnd had changed (the first attempt at this)
+    made the caret re-arm pass or fail on where focus happened to be beforehand: it worked
+    when focus sat on the app frame and failed when it was already on the canvas, which is
+    exactly the flapping seen live on 2026-08-05. The element itself is the only thing that
+    knows, and it answers: False before set_focus, True after.
+    """
+    try:
+        return bool(el.element_info.element.CurrentHasKeyboardFocus)
+    except Exception:
+        pass
+    try:
+        return bool(el.has_keyboard_focus())
     except Exception:
         return None
 

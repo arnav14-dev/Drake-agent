@@ -547,6 +547,39 @@ field numbers typing onto the canvas, every value landing one box too far down.
 can never toggle the mode back off) and retrying with a settle. No per-field special
 case: any auto-advancing field recovers the same way.
 
+### Heads-down arms off a CARET, not window focus — and a finished run leaves none
+
+Ctrl+N does nothing at all when no data-entry box is active. Not an error, not a beep —
+nothing. That is the state a completed run leaves behind: the caret gone, focus drifted to
+another Drake window, and the previous popup still on screen holding no keyboard. So a
+second, back-to-back entry could not start itself. It halted safely, having typed nothing,
+but consecutive unattended W-2s were impossible.
+
+`_rearm_caret` fixes it. The route there is documented because **two obvious fixes were
+both wrong**, and each failed in a way that first looked like success:
+
+| tried | what actually happens |
+|---|---|
+| `Esc` to close the stale popup | never reaches it — it holds no keyboard, so Esc goes to whatever does |
+| `Tab` to restore the caret | worked once, in a muddled test; unreliable from this state |
+| **UIA `set_focus()` on a canvas Edit** | **works** — Ctrl+N then behaves normally |
+
+Two more facts only a live run could have surfaced. **Closing the stale popup drops focus
+to nothing** (`GetGUIThreadInfo` returns hwnd 0), so the caret has to be restored a *second*
+time before the popup can be reopened — missing that is why the first version got as far as
+closing the popup and no further. And **Drake's canvas is WPF: one HWND hosting every box**,
+so "did the focused window change?" is not a focus test at all. That check made the recovery
+pass or fail depending on where focus happened to start. `CurrentHasKeyboardFocus` on the
+element is the only thing that knows, and it answers cleanly — `False` before `set_focus`,
+`True` after.
+
+It runs **once per run**, and lowers no bar: the popup it produces must still be found, must
+still hold the keyboard, and must still be on the field-number prompt before one character
+is typed. All it does is reach a state the run could otherwise only reach by asking a human
+to click. If it cannot, the run halts and says *which* dead end it hit — no box would take
+the caret, or a popup opened but the keyboard is elsewhere — because those need different
+things from the person reading it.
+
 ### Testing it without the VM
 
 ```

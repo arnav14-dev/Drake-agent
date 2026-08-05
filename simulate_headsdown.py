@@ -136,6 +136,12 @@ class FakeDrake:
         # what the founder found by hand.
         self.inert_after_field = inert_after_field
         self.popup_inert = False
+        # A screen on which NO box will take the caret. Drake always has one when a return
+        # is open, but the recovery must be provable to fail safely, not only to succeed.
+        self.no_focusable_field = False
+        # Ctrl+N does nothing even WITH a caret — heads-down switched off in Drake's setup.
+        # The caret restores, the chord is heard, and still no popup appears.
+        self.ctrl_n_dead = False
         self.checks: dict[int, bool] = {}     # committed tick state, per field
         self.pending_check: bool | None = None  # what the popup is SHOWING, not yet committed
         # Every reading taken while a tick box was up. The tick must never appear in any of
@@ -358,6 +364,9 @@ class FakeDrake:
         if self.canvas_focus is None:
             self.log.append("ctrl+n ignored (no active caret)")
             return
+        if self.ctrl_n_dead:
+            self.log.append("ctrl+n ignored (heads-down disabled in setup)")
+            return
         self.popup_open = not self.popup_open
         self.popup_text = ""
         self.awaiting_value_for = None
@@ -398,7 +407,28 @@ class FakeDrake:
             self.popup_open = False
             self.popup_text = ""
             self.awaiting_value_for = None
+            # The stale window is GONE, so its inertness goes with it — same as the Ctrl+N
+            # close path. Leaving the flag set would model a popup that is closed and still
+            # not holding the keyboard, which is not a state Drake can be in.
+            self.popup_inert = False
             self.log.append("ESC -> popup closed (disarmed)")
+
+    def focus_canvas_field(self) -> bool:
+        """A data-entry box is asked to take focus through the accessibility tree.
+
+        This is what actually re-arms Ctrl+N — MEASURED, after Esc and Tab were both tried
+        live and neither worked (Esc cannot reach a popup that holds no keyboard; Tab did
+        not reliably give any box the caret). `no_focusable_field` models a screen where
+        nothing takes it, so the recovery can be proven to FAIL safely too.
+
+        Focusing a box does not alter its contents, which is why this is allowed to happen
+        without a human — unlike a click, it also has no coordinate to get wrong.
+        """
+        if self.error_dialog or self.no_focusable_field:
+            return False
+        self.canvas_focus = ENTER_ORDER[0]
+        self.log.append(f"FOCUS -> caret restored on field {self.canvas_focus}")
+        return True
 
     def enter(self):
         if self.error_dialog:
@@ -598,6 +628,12 @@ class SimDriver(DrakeDriver):
 
     def _read_popup_checkbox_pixels(self, popup_hwnd):
         return self.fake.pixel_tick(popup_hwnd)
+
+    def _focus_canvas_field(self):
+        # The UIA tree walk itself is live-only; what the suite proves is the SEQUENCE the
+        # driver builds on it — that the caret is restored before Ctrl+N, again after the
+        # stale popup closes, and that a screen which refuses focus halts instead of typing.
+        return self.fake.focus_canvas_field()
 
     def _focused_hwnd(self):
         if not self.fake.popup_open:
@@ -1973,6 +2009,154 @@ def case_comparator_table():
     return ok
 
 
+def _stranded_fake():
+    """The state a FINISHED run leaves behind, which the next run starts in.
+
+    Popup still on screen, keyboard held by the canvas, and NO active caret — so Ctrl+N is
+    a silent no-op and cannot even close the popup. Reproduced live 2026-08-05: run 1 wrote
+    78/78 and run 2 halted on field 1 having typed nothing.
+    """
+    fake = FakeDrake(model="persistent", autoadvance_from=None)
+    fake.popup_open = True
+    fake.popup_inert = True
+    fake.canvas_focus = None          # nobody clicked; this is what breaks Ctrl+N
+    return fake
+
+
+def case_stranded_run_rearms_caret():
+    fake = _stranded_fake()
+    _install_readers(fake)
+    drv = SimDriver(fake)
+    drv.begin_batch()
+    rows = [(n, v, drv.headsdown_type(n, v)) for n, v in (("23", "52000"), ("24", "6000"))]
+    focused = sum(1 for l in fake.log if l.startswith("FOCUS ->"))
+    checks = [
+        ("both fields entered", all(r[2].get("ok") for r in rows)),
+        ("both values landed in the right boxes", fake.values == {23: "52000", 24: "6000"}),
+        # TWICE, not once: closing the stale popup drops focus to nothing (measured live —
+        # hwnd 0), so the caret has to go back a second time before Ctrl+N can re-open it.
+        # Asserting "at least once" would pass the version that got stuck exactly there.
+        ("the caret was restored twice — before the close AND after it", focused == 2),
+        # Esc cannot reach a popup that holds no keyboard; it lands on whatever does. A
+        # driver that sends it anyway is firing keys at a window it has not identified.
+        ("no Esc was sent", fake.keys.count("{ESC}") == 0),
+        ("the caret really was restored", fake.canvas_focus is not None),
+        # Bound the recovery: a stuck-state fix, not a per-field habit.
+        ("it recovered once, not once per field", focused == 2 and len(rows) == 2),
+    ]
+    ok = all(v for _, v in checks)
+    _check("stranded after a previous run -> caret restored twice, entry continues", ok)
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_no_popup_no_caret_rearms():
+    """The OTHER stranded shape: no popup at all, and still no caret.
+
+    Seen live 2026-08-05 on the retry — the founder had pressed Esc, so nothing was on
+    screen, and Ctrl+N still did nothing because no field held the caret. `_ensure_popup_open`
+    burns all three attempts here rather than failing on a stale popup, so it is a genuinely
+    different path into the same dead end and needs its own proof.
+    """
+    fake = FakeDrake(model="persistent", autoadvance_from=None)
+    fake.popup_open = False
+    fake.canvas_focus = None
+    _install_readers(fake)
+    drv = SimDriver(fake)
+    drv.begin_batch()
+    res = drv.headsdown_type("23", "52000")
+    focused = sum(1 for l in fake.log if l.startswith("FOCUS ->"))
+    checks = [
+        ("the field was entered", bool(res.get("ok"))),
+        ("the value landed in the right box", fake.values == {23: "52000"}),
+        # ONCE here, against twice on the stale-popup path: there was no popup to close, so
+        # there was no focus loss to repair. Pinning the exact count is what keeps the two
+        # paths honest — a recovery that always focuses twice would pass a laxer check.
+        ("the caret was restored exactly once", focused == 1),
+        ("no Esc was sent — there was no popup to close", fake.keys.count("{ESC}") == 0),
+    ]
+    ok = all(v for _, v in checks)
+    _check("no popup and no caret -> focusing a box re-arms, entry continues", ok)
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    if not ok:
+        print(f"      res={res}\n      keys={fake.keys}\n      log={fake.log}")
+    return ok
+
+
+def case_rearm_that_cannot_work_halts_clean():
+    """If nothing takes the caret, the recovery must HALT — not type into a dead screen.
+
+    This is the half that matters. A recovery which only ever succeeds in the fake would
+    let a real dead screen through, and the value would go to the canvas instead of the
+    popup: the exact cascade every gate here exists to prevent.
+    """
+    fake = _stranded_fake()
+    fake.no_focusable_field = True
+    _install_readers(fake)
+    drv = SimDriver(fake)
+    drv.begin_batch()
+    res = drv.headsdown_type("23", "52000")
+    checks = [
+        ("it halted", not res.get("ok") and bool(res.get("halt"))),
+        ("NOTHING was typed", not fake.values and not fake.typed),
+        ("no value was committed to the canvas either", not fake.committed),
+        # Name WHICH dead end this was. "No box would take the caret" and "a popup opened
+        # but the keyboard is elsewhere" need different things from the human, so a message
+        # that could mean either is not a report.
+        ("it says no box would take the caret",
+         "take the caret" in (res.get("reason") or "")),
+        # Exactly one Ctrl+N: the recycle path's legitimate first try, which is what
+        # discovers the popup will not close. Once focusing a box has FAILED, no further
+        # chord may be fired at that screen — firing anyway is how a field number ends up
+        # typed onto the canvas instead of into the popup.
+        ("no further Ctrl+N after the caret could not be restored",
+         sum(1 for l in fake.log if "ctrl+n" in l) == 1),
+    ]
+    ok = all(v for _, v in checks)
+    _check("re-arm impossible (no box takes the caret) -> clean HALT, nothing typed", ok)
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    if not ok:
+        print(f"      res={res}\n      values={fake.values} typed={fake.typed}\n"
+              f"      keys={fake.keys}\n      log={fake.log}")
+    return ok
+
+
+def case_rearm_works_but_headsdown_is_off():
+    """Caret restored, chord heard, still no popup — heads-down switched off in setup.
+
+    The recovery must not report success on the strength of its own actions. It did the
+    right things; Drake did not respond; that is a halt. Distinguishing this from "no box
+    would take the caret" matters because the two need completely different things from
+    the human — one is a click, the other is a Drake setup option.
+    """
+    fake = FakeDrake(model="persistent", autoadvance_from=None)
+    fake.popup_open = False
+    fake.canvas_focus = None
+    fake.ctrl_n_dead = True
+    _install_readers(fake)
+    drv = SimDriver(fake)
+    drv.begin_batch()
+    res = drv.headsdown_type("23", "52000")
+    checks = [
+        ("it halted", not res.get("ok") and bool(res.get("halt"))),
+        ("NOTHING was typed", not fake.values and not fake.typed),
+        ("the caret WAS restored — the recovery did its part",
+         fake.canvas_focus is not None),
+        ("it blames the popup not opening, not the caret",
+         "still did not open the heads-down popup" in (res.get("reason") or "")),
+    ]
+    ok = all(v for _, v in checks)
+    _check("caret restored but Ctrl+N still opens nothing -> HALT, nothing typed", ok)
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    if not ok:
+        print(f"      res={res}\n      log={fake.log}")
+    return ok
+
+
 def case_locality_resolution():
     """Box 20 stores a CODE, not the name on the W-2.
 
@@ -2088,6 +2272,10 @@ def main() -> int:
     # once per mutant — being able to run only the family a mutant touches is the
     # difference between a 30-minute check and an all-day one.
     cases = [
+        ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
+        ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),
+        ('caret_rearm_impossible_halts', lambda: case_rearm_that_cannot_work_halts_clean()),
+        ('caret_headsdown_off_halts', lambda: case_rearm_works_but_headsdown_is_off()),
         ('locality_resolves_to_drake_code', lambda: case_locality_resolution()),
         ('full_sequence "persistent"', lambda: case_full_sequence("persistent")),
         ('full_sequence "per-jump"', lambda: case_full_sequence("per-jump")),

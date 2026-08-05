@@ -166,6 +166,38 @@ MUTANTS = {
         "        return None\n"
         "        wins, main_enabled = snap\n"
         "        kw = dict(popup_title_re=self.popup_title_re, main_hwnd=self.main_hwnd,"),
+    # --- caret re-arm (the between-runs stuck state) ---------------------------------
+    # Ctrl+N is a SILENT no-op with no active caret, which is the state a finished run
+    # leaves behind. These mutants restore the 2026-08-05 halt in each of the two places
+    # it can happen, and check that the recovery cannot be reduced to "send keys and hope".
+    "caret: re-arm never fires when a stale popup blocks Ctrl+N": (
+        "            return self._rearm_caret(method=method)",
+        '            return {"ok": False, "reason": "Ctrl+N did not close it."}'),
+    "caret: re-arm never fires when Ctrl+N opens nothing": (
+        "        rearmed = self._rearm_caret(method=method)",
+        '        rearmed = {"ok": False, "reason": "no caret"}'),
+    "caret: the caret is never restored before Ctrl+N": (
+        "        if not self._focus_canvas_field():\n"
+        "            return {\"ok\": False,\n"
+        "                    \"reason\": \"heads-down will not arm and no box on the data-entry form would \"",
+        "        if False:\n"
+        "            return {\"ok\": False,\n"
+        "                    \"reason\": \"heads-down will not arm and no box on the data-entry form would \""),
+    # NOT listed as a mutant: the SECOND _focus_canvas_field call, after the stale popup is
+    # closed. It is load-bearing — measured live 2026-08-05, closing that popup leaves NOTHING
+    # focused (GetGUIThreadInfo returns hwnd 0) and the re-open goes nowhere; that is exactly
+    # where the first version of this recovery got stuck. But the simulator's popup returns
+    # the caret to the box it came from, which is what Drake does everywhere EXCEPT this one
+    # state, so the fake cannot distinguish the two without modelling focus loss in a way
+    # that would misrepresent the normal EIN recycle. Live-verified, not suite-verified, and
+    # said plainly here rather than covered by a mutant that would pass for the wrong reason.
+    "caret: re-arm claims success without proving a popup appeared": (
+        "        if popup is None:\n"
+        "            return {\"ok\": False,\n"
+        "                    \"reason\": \"restored the caret on a data-entry box, but Ctrl+N still did not \"",
+        "        if False:\n"
+        "            return {\"ok\": False,\n"
+        "                    \"reason\": \"restored the caret on a data-entry box, but Ctrl+N still did not \""),
     # --- w2_map: Box 20 locality resolution -----------------------------------------
     # These guards decide WHICH locality goes on the return. There is no downstream
     # defense against them: a wrong-but-valid code is typed cleanly, read back cleanly,
@@ -204,6 +236,7 @@ FAMILY.update({n: "modal" for n in MUTANTS if "disabled frame" in n or "already 
 FAMILY.update({n: "jump" for n in MUTANTS if "jump budget" in n})
 FAMILY.update({n: "ctrln" for n in MUTANTS if "inert popup" in n or "double-toggle cascade" in n})
 FAMILY.update({n: "locality" for n in MUTANTS if n.startswith("locality:")})
+FAMILY.update({n: "caret" for n in MUTANTS if n.startswith("caret:")})
 
 
 def run(dirpath, only=None):
