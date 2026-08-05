@@ -245,6 +245,7 @@ entry auditable.
 
 ```
 python agent.py write-w2 --json sample_w2.json --dry-run        # review first, anywhere
+python agent.py probe-checkbox --binding binding.json --field 47 # once per Drake build
 python agent.py write-w2 --binding binding.json --json sample_w2.json
 ```
 
@@ -465,6 +466,64 @@ blind, and says that installing Tesseract is what enables the only read-back a p
 allows. `probe-popup` reports each channel by name, what it returned, and whether it could
 see the probe number — that verdict is `read_back: AVAILABLE via … / UNAVAILABLE`.
 
+### A checkbox field has no text box — the tick is what gets read
+
+Confirmed live on 2026-08-03, at field 47 (Box 13 *Retirement plan*), after sixteen fields had
+gone in clean. Jump to a checkbox field and the popup does **not** offer a box to type in: it
+keeps the field-number box and puts a **real checkbox widget** beside it, captioned with the
+field's name.
+
+```
+┌ Drake 2025 - Heads Down Data Entry ───────────┐
+│  ┌────┐                                        │
+│  │ 47 │      ☑ Retirement plan                 │      ← the tick IS the value
+│  └────┘                                        │
+└────────────────────────────────────────────────┘
+```
+
+The `X` reached it and ticked the box. Nothing was wrong with the keystroke — what failed was
+the *verification model*: every gate on the text path asks "does the popup now show what I
+typed, one more time than before?", and **a tick is a glyph, not a character**. It appears in
+no reading, from any text channel, ever. So the field could never be confirmed, and the driver
+did the right thing with something it could not confirm: it halted, before the Enter, with the
+box uncommitted. (The screenshot shows the popup ticked and Box 13 on the canvas still empty —
+that is the pending state, not a written one.)
+
+The fix is a different **channel**, not a weaker gate. `_enter_checkbox` reads the tick:
+
+| channel | what it is | what it can prove |
+|---|---|---|
+| `uia` | the checkbox's Toggle state, addressed by handle | ticked **and** clear |
+| `pixel` | the accent-blue glyph on screen (measured: a 14×14 blob of `rgb(0,103,192)` filling 92% of its box) | ticked only |
+
+The pixel channel is deliberately one-sided. An unticked checkbox and a plain text box are
+pixel-identical to it — both are simply *not blue* — so answering "clear" there would let
+"this is a text field" masquerade as "the box is clear". It returns `True` or *no evidence*,
+never `False`, and the glyph is identified by **shape** (square-ish, checkbox-sized, mostly
+filled) so a blue hyperlink or the round Live Chat bubble cannot be mistaken for a tick.
+
+The entry sequence is state-driven rather than keystroke-driven:
+
+1. **converge on the arrival state** — what the box shows before anything is typed;
+2. **already correct? type nothing.** On a build where the token *toggles*, a keystroke sent
+   at an already-ticked box clears a tick a human put there, and the run reports success;
+3. otherwise **send a token and watch the tick actually flip** — `X`, then `1`, then Space,
+   each verified before the next is sent, so escalation can never double-toggle unnoticed;
+4. **re-prove the state immediately before the Enter** — the token loop's check can be several
+   hundred milliseconds old, and a tick that flipped back must stop the commit;
+5. **prove Drake took it**, with the same prompt-moved commit gate every other field uses.
+
+Two channels that **disagree** are not a reading: the pair is discarded rather than one of them
+being picked, because picking the convenient one is how a box that was never ticked gets
+reported as ticked. And because the map says which fields are checkboxes, a checkbox appearing
+where money is expected — or a text box appearing where the map expects a checkbox — halts as
+**build drift**, which is the cheapest possible detector for heads-down numbers having moved in
+a Drake update.
+
+`agent.py probe-checkbox --field 47` reports all of it in one run — which channels see the
+widget, what state it arrives in, which token flips it and whether that token sets or toggles —
+and leaves with Esc, having committed nothing.
+
 ### One dialog may be answered automatically — by clicking a named button
 
 Drake raises *"There are fields on this screen that must contain data if you are planning to
@@ -496,7 +555,7 @@ python simulate_headsdown.py
 
 A fake Drake reproducing the observed behaviours — the persistent protocol, the Field-4
 swallowed chord, silent refusals, and a popup left armed by a previous run — so the state
-machine is provable in seconds, anywhere, before it touches a return. 41 cases: both popup
+machine is provable in seconds, anywhere, before it touches a return. 61 cases: both popup
 models, the EIN-skipped batch shape, an inert box that declines silently (in both variants:
 leaving the number in the edit, and clearing it), a silently refused value, corrupted and
 late-arriving keystrokes, an empty value, an inherited armed popup, a build with no readable
@@ -506,6 +565,16 @@ jitter, character-level OCR noise, transient unreadable frames and OCR garbage f
 refusing a silent decline; halting when nothing can read it; and halting *before* the Enter
 when the channel dies mid-field), the e-file warning being dismissed by name, and the structural dialog gate — **every case runs with the 'Drake
 Software Chat' window present** (the live field-4 halt).
+
+Eighteen of those cases are **Box 13 checkboxes**, the live halt of 2026-08-03: the tick read
+back off the widget and committed; no token flipping it (halt, box untouched); nothing able to
+read the tick (halt, with the remedy named); the box arriving already ticked (type *nothing*);
+the screen glyph carrying it alone; an element present but mute about its state; the two
+channels disagreeing (no reading, no commit); a silently refused tick; escalation to the token
+this build takes; a toggling build never double-flipped; drift caught in both directions; a
+per-jump build refused because a canvas tick cannot be read; and truth tables for the glyph
+detector and for what a value means to a tick box. The fake never leaks the token into the
+popup's text — because the real one does not — so none of them can pass on the text path.
 
 It fakes *Drake*, not pywinauto: focus and window behaviour on the real thing is still
 verified on the Windows machine.
@@ -549,6 +618,27 @@ guard is now broken *in the source*, in an isolated copy, and the suite must go 
 | auto-dismiss treats every dialog as dismissable | 40/41 |
 | prompt baseline lets edit-shaped children leak in | 40/41 |
 | structural dialog gate blinded | 36/41 |
+
+| guard broken | modal family |
+|---|---|
+| an inherited disabled frame read as a modal again (the live 08-04 halt) | 2/3 |
+| attach never records that the frame was already disabled | 2/3 |
+
+The checkbox guards are measured against the **18-case checkbox family** rather than the whole
+suite — `python mutants.py checkbox` runs only those cases against only those mutants, which
+turns an all-day check into a ten-minute one. Running *fewer* cases can only ever turn a kill
+into a reported gap, never a survivor into a false kill, so the shortcut cannot flatter a guard:
+
+| guard broken | checkbox family |
+|---|---|
+| checkbox routed down the TEXT path again (the live field-47 halt) | 7/18 |
+| the tick committed without being re-proved just before the Enter | 16/18 |
+| a single read is proof (no convergence) | 17/18 |
+| disagreeing channels resolved instead of discarded | 17/18 |
+| a token sent even when the box is already in the wanted state | 17/18 |
+| build-drift guard removed (money typed at a tick box) | 17/18 |
+| a tick typed blind on the canvas (per-jump build) | 17/18 |
+| an unreadable arrival state treated as 'clear' for an untick | 17/18 |
 
 Two mutants are documented in the harness as **not** gaps rather than papered over with a
 test that cannot exist: the `target.startswith(acc)` early-break in `_surface_count` is an

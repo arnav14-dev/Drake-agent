@@ -106,53 +106,164 @@ MUTANTS = {
     "prompt baseline: edit-shaped children leak into the prompt": (
         "            if cls == edit_class or _editish(cls):",
         "            if cls == edit_class:"),
+    # Box 13 checkboxes. The live halt of 2026-08-03: a tick is a GLYPH, so the text gates
+    # can never see it. Each of these breaks one of the guards that replaced them.
+    "checkbox: routed down the TEXT path again (the live field-47 halt)": (
+        '                if kind == "checkbox" or (kind is None and shows_checkbox is True):',
+        "                if False:"),
+    "checkbox: commit the tick without re-proving it just before the Enter": (
+        "        ok2, state, chan = self._settle_checkbox(eh, desired, timeout=1.0)",
+        "        ok2, state, chan = True, desired, 'assumed'"),
+    "checkbox: a single read is proof (no convergence)": (
+        "                if prev is not None and prev == cur and (desired is None or cur == desired):",
+        "                if (desired is None or cur == desired):"),
+    "checkbox: disagreeing channels resolved instead of discarded": (
+        "            vals = set(st.values())\n            if len(vals) == 1:",
+        "            vals = set(st.values())\n            if vals:\n                vals = {max(vals)}\n"
+        "            if len(vals) == 1:"),
+    "checkbox: send a token even when the box is already in the wanted state": (
+        "        if not (ok0 and arrival == desired):",
+        "        if True:"),
+    "checkbox: build-drift guard removed (money typed at a tick box)": (
+        '                if shows_checkbox is True and kind not in (None, "checkbox"):',
+        "                if False:"),
+    "checkbox: a tick on the canvas is typed blind (per-jump build)": (
+        '            if model == "per-jump" and kind == "checkbox":',
+        "            if False:"),
+    "checkbox: an unreadable arrival state is treated as 'clear' for an untick": (
+        "        if not ok0 and desired is False:",
+        "        if False:"),
+    # NOT listed as a mutant to kill, and verified not to be a gap:
+    #  • _read_popup_checkbox_pixels returning None rather than False for "no tick visible"
+    #    is a CHANNEL semantic, and the simulator replaces both checkbox channels at the
+    #    same boundary it replaces the UIA/OCR text channels — so no case can distinguish
+    #    the two here. The rule is enforced instead by the fake's pixel_tick(), which never
+    #    returns False, and by case_tick_glyph_table on the detector itself.
+    # The EIN catch: the popup is present but INERT (keyboard still on the canvas).
+    "inert popup accepted as ready (present == armed again)": (
+        "                if not self._popup_holds_keyboard(popup):",
+        "                if False:"),
+    "recycle fires on a HEALTHY popup too (the double-toggle cascade)": (
+        "                if focused == int(h):",
+        "                if False:"),
+    # The other live halt of 2026-08-04: a jump that lands LATE (Drake busy auto-filling)
+    # read as a refusal. The budget is what buys the distinction.
+    "jump budget back to the 2.5s that called a busy Drake a refusal": (
+        '        self.jump_timeout = float(self.nav.get("headsdown_jump_timeout", 8.0))',
+        "        self.jump_timeout = 2.5"),
+    # The live halt of 2026-08-04: a frame that was ALREADY disabled at attach was read as
+    # a modal, and no field could be entered. Both directions have to be covered — the
+    # inherited state must not halt, and a modal that arrives later must still be caught.
+    "inherited disabled frame treated as a modal again (the live 08-04 halt)": (
+        "        if not main_disabled_at_attach:",
+        "        if True:"),
+    "attach never records that the frame was already disabled": (
+        "        self._baseline_main_disabled = (enabled is False)",
+        "        self._baseline_main_disabled = False"),
     "structural dialog gate blinded": (
         "        wins, main_enabled = snap\n"
         "        kw = dict(popup_title_re=self.popup_title_re, main_hwnd=self.main_hwnd,",
         "        return None\n"
         "        wins, main_enabled = snap\n"
         "        kw = dict(popup_title_re=self.popup_title_re, main_hwnd=self.main_hwnd,"),
+    # --- w2_map: Box 20 locality resolution -----------------------------------------
+    # These guards decide WHICH locality goes on the return. There is no downstream
+    # defense against them: a wrong-but-valid code is typed cleanly, read back cleanly,
+    # and sits in the box looking exactly like a right one. Only refusing to guess
+    # protects that, so refusing has to be proven to have a test.
+    "locality: ambiguous prefix picks the first match instead of refusing": (
+        "    if len(prefix) == 1:",
+        "    if len(prefix) >= 1:"),
+    "locality: duplicate names pick the first instead of refusing": (
+        "    if len(by_name) == 1:",
+        "    if len(by_name) >= 1:"),
+    "locality: an exact code is re-resolved by name/prefix instead of passing through": (
+        "    if text in entries:                                        # already the code",
+        "    if False:"),
+    "locality: ' CITY' treated as noise (silently retargets 'Portland City')": (
+        '    for suffix in (" COUNTY", " CO."):',
+        '    for suffix in (" COUNTY", " CO.", " CITY"):'),
+    "locality: an unresolvable value is entered anyway (the 2026-08-04 bug, restored)": (
+        '            if res["code"] is None:',
+        "            if False:"),
 }
 
+# Which source file each mutant edits. drake_driver.py unless named here — the guards that
+# decide what gets TYPED do not all live in the driver, and a mutation harness that can only
+# reach one file quietly reports "all covered" about the other.
+TARGET = {n: "w2_map.py" for n in MUTANTS if n.startswith("locality:")}
+MUTABLE_FILES = ("drake_driver.py", "w2_map.py")
 
-def run(dirpath):
-    p = subprocess.run([sys.executable, "simulate_headsdown.py"], cwd=dirpath,
-                       capture_output=True, text=True, timeout=600)
+
+# Mutants whose guard belongs to one family of cases may name that family, so the harness
+# runs only those cases against them. The asymmetry is what makes this safe: running FEWER
+# cases can only ever turn a kill into a reported GAP — never a survivor into a false kill.
+# Unfiltered mutants still run the whole suite.
+FAMILY = {name: "checkbox" for name in MUTANTS if name.startswith("checkbox:")}
+FAMILY.update({n: "modal" for n in MUTANTS if "disabled frame" in n or "already disabled" in n})
+FAMILY.update({n: "jump" for n in MUTANTS if "jump budget" in n})
+FAMILY.update({n: "ctrln" for n in MUTANTS if "inert popup" in n or "double-toggle cascade" in n})
+FAMILY.update({n: "locality" for n in MUTANTS if n.startswith("locality:")})
+
+
+def run(dirpath, only=None):
+    cmd = [sys.executable, "simulate_headsdown.py"] + ([only] if only else [])
+    p = subprocess.run(cmd, cwd=dirpath, capture_output=True, text=True, timeout=1800)
     tail = [l for l in p.stdout.splitlines() if "cases pass" in l]
     return p.returncode, (tail[-1] if tail else "?")
 
 
+args = [a for a in sys.argv[1:] if not a.startswith("-")]
+pick = args[0] if args else None      # substring: run only these mutants
+if pick:
+    print(f"(only mutants matching {pick!r})\n")
+
 base_dir = tempfile.mkdtemp()
 for f in ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py"):
     shutil.copy(SRC / f, base_dir)
-rc, line = run(base_dir)
-print(f"baseline: {line}  (exit {rc})\n")
-if rc != 0:
-    print("baseline is not green — fix that before mutating")
+todo = {k: v for k, v in MUTANTS.items() if not pick or pick.lower() in k.lower()}
+if not todo:
+    print(f"no mutants match {pick!r}")
     raise SystemExit(1)
+# One baseline per family actually in play — a mutant is only evidence against a set of
+# cases that passes without it.
+baselines = {}
+for fam in sorted({FAMILY.get(k) for k in todo}, key=lambda x: (x is not None, x)):
+    rc, line = run(base_dir, fam)
+    baselines[fam] = line
+    print(f"baseline [{fam or 'full suite'}]: {line}  (exit {rc})")
+    if rc != 0:
+        print("baseline is not green — fix that before mutating")
+        raise SystemExit(1)
+print()
 
-original = (SRC / "drake_driver.py").read_text()
+originals = {f: (SRC / f).read_text(encoding="utf-8") for f in MUTABLE_FILES}
 survived = []
-for name, (anchor, repl) in MUTANTS.items():
+for name, (anchor, repl) in todo.items():
+    target = TARGET.get(name, "drake_driver.py")
+    original = originals[target]
     n = original.count(anchor)
     if n != 1:
-        print(f"  ??   {name}\n         -> anchor matched {n} times, not 1 — mutant not applied")
+        print(f"  ??   {name}\n         -> anchor matched {n} times in {target}, not 1 "
+              f"— mutant not applied")
         survived.append(name)
         continue
     d = tempfile.mkdtemp()
-    for f in ("simulate_headsdown.py", "w2_map.py", "protocol.py"):
+    for f in ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py"):
         shutil.copy(SRC / f, d)
-    (pathlib.Path(d) / "drake_driver.py").write_text(original.replace(anchor, repl))
-    rc, line = run(d)
+    (pathlib.Path(d) / target).write_text(original.replace(anchor, repl), encoding="utf-8")
+    fam = FAMILY.get(name)
+    rc, line = run(d, fam)
     killed = rc != 0
     if not killed:
         survived.append(name)
     print(f"  {'ok  ' if killed else 'GAP '} {name}\n"
-          f"         -> {'KILLED' if killed else 'SURVIVED — no test covers this'}  [{line}]")
+          f"         -> {'KILLED' if killed else 'SURVIVED — no test covers this'}  [{line}"
+          f"{'; cases: ' + fam if fam else ''}]")
     shutil.rmtree(d, ignore_errors=True)
 
 shutil.rmtree(base_dir, ignore_errors=True)
-print(f"\n{len(MUTANTS) - len(survived)}/{len(MUTANTS)} mutants killed")
+print(f"\n{len(todo) - len(survived)}/{len(todo)} mutants killed")
 for s in survived:
     print(f"  still alive: {s}")
 raise SystemExit(0 if not survived else 1)

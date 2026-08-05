@@ -27,7 +27,7 @@ test controls, and handles must match.
 
 from __future__ import annotations
 
-
+import sys
 
 import drake_driver
 from drake_driver import DrakeDriver
@@ -48,6 +48,17 @@ NUMBER_PROMPT = "To begin, enter desired field number and press enter."
 
 def VALUE_PROMPT(n) -> str:
     return f"Enter the value for field {n} and press enter."
+
+
+# Box 13. CONFIRMED live (2026-08-03, field 47): these fields have NO text box in the value
+# stage — the popup shows the tick box itself, captioned with the field's name. The caption
+# is all the popup's text channels can see, and the tick is a GLYPH that appears in none of
+# them. That is the whole reason the text gates could not pass this field.
+CHECKBOX_FIELDS = {46: "Statutory employee", 47: "Retirement plan", 48: "Sick pay"}
+
+
+def CHECKBOX_PROMPT(n) -> str:
+    return f"{n} {CHECKBOX_FIELDS[int(n)]}"
 
 
 # The W-2 numbers the fake accepts; anything else is Drake's "invalid field" modal.
@@ -77,8 +88,61 @@ class FakeDrake:
                  inert_fields=None, inert_clears: bool = False,
                  edit_class: str = "Edit", popup_has_edit: bool = True,
                  surface_readable: bool = True, surface_jitter: bool = False,
-                 surface_reads_before_blind: int | None = None):
+                 surface_reads_before_blind: int | None = None,
+                 checkbox_tokens=("X",), checkbox_behaviour: str = "set",
+                 checkbox_uia: bool = True, checkbox_uia_state: bool = True,
+                 checkbox_pixel: bool = True, checkbox_pixel_lies: bool = False,
+                 checkbox_pretick: bool = False, checkbox_flicker: bool = False,
+                 jump_delay_reads: int = 0, inert_after_field: int | None = None):
         self.model = model
+        # --- Box 13 checkbox fields ------------------------------------------------
+        # Which tokens THIS build's checkbox accepts. Empty models a build that ignores
+        # every one of them, which must halt rather than commit an untouched box.
+        self.checkbox_tokens = set(checkbox_tokens)
+        # "set"    an accepted token always ticks it (Drake's classic X)
+        # "toggle" an accepted token flips it — so sending a second one CLEARS it, which is
+        #          what makes verifying between tokens rather than after them load-bearing
+        self.checkbox_behaviour = checkbox_behaviour
+        # Does the popup expose the checkbox to accessibility at all, and if so will it
+        # report the tick STATE? A control can be visible to UIA and still refuse to answer
+        # the Toggle pattern, which is a different failure from not being there.
+        self.checkbox_uia = checkbox_uia
+        self.checkbox_uia_state = checkbox_uia_state
+        # Is the tick glyph on screen for the pixel channel? checkbox_pixel_lies models a
+        # stale/incorrect screen read that DISAGREES with accessibility — neither may be
+        # picked over the other, so nothing may be committed.
+        self.checkbox_pixel = checkbox_pixel
+        self.checkbox_pixel_lies = checkbox_pixel_lies
+        # Does Drake arrive at the field with the box already ticked? Unknown on the real
+        # build and it matters enormously: if it does, sending a token would CLEAR it.
+        self.checkbox_pretick = checkbox_pretick
+        # A state channel that JITTERS: every other read comes back ticked when the box is
+        # not. The tick equivalent of the repaint noise the text path already models — Drake
+        # repaints asynchronously, and an accessibility read taken mid-repaint hands back a
+        # state that the next read contradicts. No single frame may be acted on, and a
+        # channel that never says the same thing twice running must never converge at all.
+        self.checkbox_flicker = checkbox_flicker
+        self._flicker_n = 0
+        # Drake BUSY: the jump is accepted but does not land for this many reads of the
+        # popup. Committing a field can fire Drake's employer-database lookup and auto-fill,
+        # which blocks its UI thread — so the popup sits on the number prompt for a while
+        # and then moves. Indistinguishable from a refusal except by waiting long enough,
+        # which is exactly what the live run of 2026-08-04 got wrong on field 14.
+        self.jump_delay_reads = jump_delay_reads
+        self._pending_jump = None
+        # After committing THIS field, Drake leaves the popup on screen but keeps the
+        # keyboard on the data-entry window — the confirmed post-EIN state. The only way
+        # out is to close the inert popup and open a fresh one (Ctrl+N twice), which is
+        # what the founder found by hand.
+        self.inert_after_field = inert_after_field
+        self.popup_inert = False
+        self.checks: dict[int, bool] = {}     # committed tick state, per field
+        self.pending_check: bool | None = None  # what the popup is SHOWING, not yet committed
+        # Every reading taken while a tick box was up. The tick must never appear in any of
+        # them as TEXT — that is the property the live build has and the reason the text
+        # gates could not verify field 47. Asserted on, so a fake that started leaking the
+        # token would fail the case rather than quietly make the old path work again.
+        self.checkbox_renders: list[str] = []
         # What the toolkit NAMES the popup's text box. "Edit" is plain Win32; a Delphi build
         # says "TEdit", .NET says "WindowsForms10.EDIT.app.0.378734a". The driver must find
         # the box by shape, because asking pywinauto for class_name="Edit" is exact-match and
@@ -140,12 +204,64 @@ class FakeDrake:
 
     # -- what the operator sees ---------------------------------------------
 
+    def _tick_pending_jump(self) -> None:
+        """A jump Drake has accepted but not finished. Counted in READS rather than seconds
+        so the fake stays deterministic — every observation of the popup moves it along."""
+        if self._pending_jump is None:
+            return
+        n, left = self._pending_jump
+        if left > 1:
+            self._pending_jump = (n, left - 1)
+            return
+        self._pending_jump = None
+        self.awaiting_value_for, self.popup_text = n, ""
+        if n in CHECKBOX_FIELDS:
+            self.pending_check = bool(self.checks.get(n, False)) or self.checkbox_pretick
+        self.log.append(f"jump -> field {n} LANDED late (Drake was busy)")
+
     def prompt(self) -> str:
+        self._tick_pending_jump()
         if not self.prompts or not self.popup_open:
             return ""
         if self.awaiting_value_for is not None:
+            if self.awaiting_value_for in CHECKBOX_FIELDS:
+                # The live shape: a checkbox field's popup shows the number and the field's
+                # caption, and NOTHING that reflects the tick. Deliberately no English
+                # "enter the value" prompt — this build does not print one, and a fake that
+                # invented one would hand the driver a signal the real popup never gives it.
+                return CHECKBOX_PROMPT(self.awaiting_value_for)
             return VALUE_PROMPT(self.awaiting_value_for)
         return NUMBER_PROMPT
+
+    def is_checkbox_stage(self) -> bool:
+        return (self.popup_open and self.awaiting_value_for is not None
+                and self.awaiting_value_for in CHECKBOX_FIELDS)
+
+    def uia_checkboxes(self, hwnd):
+        """What _read_popup_checkbox_uia would return: a list, or None for 'the channel
+        could not answer'. [] is the meaningful middle — UIA looked and there is no
+        checkbox, i.e. this field is a text box."""
+        if not self.popup_open or int(hwnd) != POPUP_HWND or not self.checkbox_uia:
+            return None
+        if not self.is_checkbox_stage():
+            return []
+        state = self.pending_check if self.checkbox_uia_state else None
+        if self.checkbox_flicker:
+            self._flicker_n += 1
+            if self._flicker_n % 2:
+                state = True    # a mid-repaint frame, contradicted by the very next read
+        return [{"name": CHECKBOX_FIELDS[self.awaiting_value_for], "state": state,
+                 "rect": [40, 30, 56, 46]}]
+
+    def pixel_tick(self, hwnd):
+        """What _read_popup_checkbox_pixels would return: True, or None. NEVER False —
+        the real channel cannot tell an unticked checkbox from a text box, and a fake that
+        answered False here would be more generous than the thing it stands in for."""
+        if not self.popup_open or int(hwnd) != POPUP_HWND or not self.checkbox_pixel:
+            return None
+        if self.checkbox_pixel_lies:
+            return True
+        return True if (self.is_checkbox_stage() and self.pending_check) else None
 
     def render(self) -> str:
         """The popup AS SEEN — prompt and typed text in one string, which is all a screen
@@ -154,6 +270,8 @@ class FakeDrake:
         if not self.popup_open:
             return ""
         text = " ".join(p for p in (self.prompt(), self.popup_text) if p)
+        if self.is_checkbox_stage():
+            self.checkbox_renders.append(text)
         if not self.surface_jitter:
             return text
         self._jitter_n += 1
@@ -209,6 +327,8 @@ class FakeDrake:
                  "rect": [8, 30, 300, 22]}]
 
     def backspace(self, n: int = 1):
+        if self.is_checkbox_stage():
+            return                      # there is no text on a tick box to delete
         if self.awaiting_value_for is not None or self.popup_open:
             self.popup_text = self.popup_text[:-n] if n < len(self.popup_text) else ""
         elif self.pending_canvas_text:
@@ -241,7 +361,10 @@ class FakeDrake:
         self.popup_open = not self.popup_open
         self.popup_text = ""
         self.awaiting_value_for = None
-        self.log.append(f"ctrl+n -> popup {'OPEN' if self.popup_open else 'CLOSED'}")
+        if not self.popup_open:
+            self.popup_inert = False     # the stale window is gone
+        self.log.append(f"ctrl+n -> popup {'OPEN' if self.popup_open else 'CLOSED'}"
+                        f"{' (inert)' if self.popup_inert else ''}")
 
     def type(self, text: str):
         if self.error_dialog:
@@ -251,6 +374,19 @@ class FakeDrake:
         # and still ends up halting — on the invalid-field modal its own mistake raised.
         # The interesting question is what it TYPED, not just how it finished.
         self.typed.append(text)
+        if self.is_checkbox_stage():
+            # A tick box swallows the keystroke: an accepted token moves the TICK and puts
+            # no character anywhere. So there is nothing for a text read to find — which is
+            # exactly why counting characters could never verify one of these fields.
+            self._flicker_left = self.checkbox_flicker
+            if text in self.checkbox_tokens:
+                self.pending_check = (not self.pending_check
+                                      if self.checkbox_behaviour == "toggle" else True)
+                self.log.append(f"token {text!r} -> field {self.awaiting_value_for} tick is now "
+                                f"{'ON' if self.pending_check else 'OFF'} (pending)")
+            else:
+                self.log.append(f"token {text!r} -> IGNORED by the checkbox")
+            return
         landed = self.echo(text)
         if self.popup_open:
             self.popup_text += landed
@@ -289,12 +425,44 @@ class FakeDrake:
                 self.popup_open, self.popup_text = False, ""
                 self.canvas_focus, self.pending_canvas_text = n, ""
                 self.log.append(f"jump -> field {n} (popup closed, caret on canvas)")
+            elif self.jump_delay_reads:
+                # Accepted, but Drake is busy: the popup stays on the number prompt until
+                # the auto-fill finishes. Nothing distinguishes this from a refusal except
+                # waiting.
+                self._pending_jump = (n, self.jump_delay_reads)
+                self.log.append(f"jump -> field {n} ACCEPTED but Drake is busy "
+                                f"({self.jump_delay_reads} reads)")
             else:
                 self.awaiting_value_for, self.popup_text = n, ""
-                self.log.append(f"jump -> field {n} (popup now prompting for the VALUE)")
+                if n in CHECKBOX_FIELDS:
+                    # The tick box arrives showing the field's CURRENT state — or already
+                    # ticked, on a build that pre-ticks whatever field you jumped to.
+                    self.pending_check = bool(self.checks.get(n, False)) or self.checkbox_pretick
+                    self.log.append(f"jump -> field {n} (popup now showing the TICK BOX, "
+                                    f"{'ticked' if self.pending_check else 'clear'})")
+                else:
+                    self.pending_check = None
+                    self.log.append(f"jump -> field {n} (popup now prompting for the VALUE)")
             return
         if self.popup_open and self.awaiting_value_for is not None:
             n = self.awaiting_value_for
+            if n in CHECKBOX_FIELDS:
+                verdict = self.value_validator(n, "X" if self.pending_check else "")
+                if verdict == "dialog":
+                    self.error_dialog = f"Invalid entry for field {n}"
+                    self.log.append(f"tick for {n} -> VALIDATOR DIALOG")
+                    return
+                if verdict == "silent":
+                    self.log.append(f"tick for {n} -> SILENTLY REFUSED, still on the tick box")
+                    return
+                self.checks[n] = bool(self.pending_check)
+                self.values[n] = "X" if self.pending_check else ""
+                self.committed.add(n)
+                self.awaiting_value_for, self.pending_check = None, None
+                self.log.append(f"tick for {n} committed as "
+                                f"{'CHECKED' if self.checks[n] else 'clear'}, popup back to "
+                                f"the number prompt")
+                return
             verdict = self.value_validator(n, self.popup_text)
             if verdict == "dialog":
                 self.error_dialog = f"Invalid entry for field {n}"
@@ -309,6 +477,10 @@ class FakeDrake:
             self.values[n] = self.popup_text
             self.committed.add(n)
             self.awaiting_value_for, self.popup_text = None, ""
+            if n == self.inert_after_field:
+                self.popup_inert = True
+                self.log.append(f"value for {n} committed -> popup left INERT "
+                                f"(on screen, keyboard back on the canvas)")
             if n == self.autoadvance_from and n not in self.advanced:  # heads-down drops
                 self.advanced.add(n)
                 self.popup_open = False
@@ -418,8 +590,21 @@ class SimDriver(DrakeDriver):
     def _read_popup_ocr(self, popup_hwnd):
         return None      # Tesseract absent unless a case says otherwise
 
+    def _read_popup_checkbox_uia(self, popup_hwnd):
+        """The accessibility CHANNEL for a tick, overridden at the same boundary as the text
+        channels — so _read_checkbox_state, _settle_checkbox, the drift guard and the whole
+        of _enter_checkbox are the production code under test."""
+        return self.fake.uia_checkboxes(popup_hwnd)
+
+    def _read_popup_checkbox_pixels(self, popup_hwnd):
+        return self.fake.pixel_tick(popup_hwnd)
+
     def _focused_hwnd(self):
         if not self.fake.popup_open:
+            return (MAIN_HWND, 0, (0, 0, 0, 0), 1)
+        # An INERT popup: on screen, but the keyboard is still held by the data-entry
+        # window. Confirmed live right after Drake's employer auto-fill commits the EIN.
+        if self.fake.popup_inert:
             return (MAIN_HWND, 0, (0, 0, 0, 0), 1)
         focus = POPUP_EDIT_HWND if self.fake.popup_has_edit else POPUP_HWND
         return (focus, 0, (0, 0, 0, 0), 1)
@@ -644,6 +829,77 @@ def case_invalid_number():
                   f"halted at {halted}, values={sorted(fake.values)}")
 
 
+def case_inert_popup_after_ein_is_recycled():
+    """THE EIN CATCH, confirmed live 2026-08-04 and then by hand: after the employer EIN
+    commits, Drake's auto-fill finishes with the heads-down popup STILL ON SCREEN but the
+    keyboard back on the data-entry window. The popup is present and inert.
+
+    "Is the popup up?" is the wrong question in that state — keys would land on the canvas.
+    The recovery is Ctrl+N twice (drop the stale window, open a live one), which the founder
+    found by hand and which is NOT the double-toggle bug: that bug is a blind second chord
+    fired at a HEALTHY popup, and the next case pins that it still cannot happen."""
+    fake, drv = _new("persistent", autoadvance_from=None, inert_after_field=4)
+    rows = _run_seq(drv, [("4", "123456789"), ("5", "TEST EMPLOYER LLC"), ("23", "52000")])
+    checks = [
+        ("every field went in", all(r[2].get("ok") for r in rows)),
+        ("values landed in the right boxes",
+         fake.values == {4: "123456789", 5: "TEST EMPLOYER LLC", 23: "52000"}),
+        ("the inert popup was recycled, not typed into",
+         any("popup left INERT" in l for l in fake.log)),
+        ("it ended holding the keyboard", not fake.popup_inert),
+    ]
+    ok = all(v for _, v in checks)
+    _check("inert popup after the EIN is closed and re-opened, then entry continues", ok,
+           "\n".join(f"HALT at {n}: {r.get('reason')}" for n, v, r in rows if not r.get("ok"))
+           + f"\nvalues={fake.values}\nlog:\n" + "\n".join("  " + l for l in fake.log))
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_healthy_popup_is_never_double_toggled(label="", **kw):
+    """The other half of the same rule. A popup that IS holding the keyboard must never be
+    sent a second Ctrl+N — that is the original cascade: the chord closes heads-down, the
+    next field NUMBER types onto the canvas, and every value after it lands one box out
+    while every row reports OK.
+
+    So the recycle must fire on the INERT state only, and the way to prove that is to count
+    the chords: a healthy batch sends exactly one Ctrl+N, for the very first field."""
+    fake, drv = _new("persistent", autoadvance_from=None, **kw)
+    rows = _run_seq(drv, SEQ[:4])
+    ctrl_n = sum(1 for l in fake.log if l.startswith("ctrl+n"))
+    ok = (all(r[2].get("ok") for r in rows) and ctrl_n == 1)
+    return _check(f"a healthy popup is never toggled a second time{label}", ok,
+                  f"ctrl+n chords={ctrl_n} (want 1)\nlog:\n"
+                  + "\n".join("  " + l for l in fake.log))
+
+
+def case_slow_jump_is_not_a_refusal():
+    """THE LIVE HALT of 2026-08-04, field 14. Drake ACCEPTED the number and then took its
+    time landing the jump, because committing the employer block fires Drake's
+    employer-database lookup and auto-fill, which blocks its UI thread.
+
+    At a 2.5s budget the driver called that a refusal and stopped the batch — and the
+    screenshot taken moments later showed the popup sitting on field 14's value box, jump
+    complete. A busy app and a declined field number look identical; the only thing that
+    tells them apart is waiting long enough. So the budget is a BUSY budget, and it costs
+    nothing on a healthy field: the loop returns the instant the prompt moves."""
+    fake, drv = _new("persistent", autoadvance_from=None, jump_delay_reads=40)
+    res = drv.headsdown_type("14", "JOHN")
+    checks = [
+        ("the late jump is entered, not called a refusal", bool(res.get("ok"))),
+        ("the value landed in the right box", fake.values.get(14) == "JOHN"),
+        ("the jump is recorded as late", any("LANDED late" in l for l in fake.log)),
+    ]
+    ok = all(v for _, v in checks)
+    _check("a slow jump (Drake busy auto-filling) is not a refusal", ok,
+           f"{res.get('reason')}\nvalues={fake.values}\nlog:\n"
+           + "\n".join("  " + l for l in fake.log))
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
 def case_inert_field_silently_declined():
     """THE reason the driver reads the prompt instead of the edit box. Field 31 (box 9,
     greyed) silently declines: Drake does not move and does not complain, and it leaves the
@@ -820,6 +1076,50 @@ def case_modal_disable():
           and "DISABLED" in (second.get("reason") or ""))
     return _check("disabled main frame halts structurally (unnamed modal, popup down)", ok,
                   f"first={first}\nsecond={second}")
+
+
+def case_main_frame_disabled_before_we_attached():
+    """THE LIVE HALT of 2026-08-04: Drake's main frame was already disabled when the agent
+    attached, and every field halted with "main frame DISABLED by a modal — window not
+    identified". There was no dialog: the screenshot taken at the halt shows a clean W-2
+    screen, and every window in the process was in the baseline. Drake simply nests its
+    data-entry screens and puts WS_DISABLED on the frames behind them.
+
+    A disabled frame we INHERITED is furniture, exactly like the chat overlay — the gate's
+    own founding rule. What must still halt is a frame that becomes disabled DURING the
+    run, which is the case above."""
+    fake = FakeDrake(model="per-jump", autoadvance_from=None)
+    fake.canvas_focus = 4
+    _install_readers(fake)
+    drv = _ModalSim(fake)
+    drv.modal = True                 # already modal BEFORE the baseline is taken
+    # The REAL attach-time snapshot, not a hand-set flag — otherwise the recording of the
+    # flag is untested and can be deleted with the suite still green.
+    drv._snapshot_baseline()
+    drv.begin_batch()
+    first = drv.headsdown_type("4", "123456789")
+    # Per-jump: the value sits on the canvas until the NEXT jump commits it (no trailing
+    # Enter, by design), so read it there rather than from the committed values.
+    landed = fake.pending_canvas_text
+    # ...and a real validator arriving later is still caught, on the same run.
+    fake.extra_windows.append({"hwnd": 0xBAD2, "title": "Drake 2025", "class_name": "#32770",
+                               "visible": True, "enabled": True, "owner": MAIN_HWND,
+                               "style": 0x80C80000, "rect": [500, 400, 360, 140],
+                               "_text": "This field must contain data"})
+    second = drv.headsdown_type("5", "TEST EMPLOYER LLC")
+    checks = [
+        ("the inherited disabled frame does NOT halt the run", bool(first.get("ok"))),
+        ("the field was actually entered", landed == "123456789"),
+        ("a validator arriving later still halts",
+         second.get("ok") is False and second.get("halt") is True),
+        ("and nothing was entered after it", 5 not in fake.values),
+    ]
+    ok = all(v for _, v in checks)
+    _check("a main frame disabled BEFORE attach is furniture, not a modal", ok,
+           f"first={first}\nsecond={second}\nvalues={fake.values}")
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
 
 
 def case_modal_while_popup_open():
@@ -1111,6 +1411,391 @@ WARNING = ("There are fields on this screen that must contain data if you are pl
            "e-file this return. To enter this data now, click OK.")
 
 
+# --- Box 13 checkboxes ------------------------------------------------------
+#
+# THE LIVE HALT of 2026-08-03. Nineteen fields went in clean and field 47 stopped the run:
+# the popup had swapped its text box for a tick box, the X had landed, the box was ticked
+# on screen — and the gate, which counts how many times the typed token appears in the
+# popup's TEXT, could never see a glyph. The driver was right to refuse; the model was
+# wrong. These cases pin the model that replaced it: read the tick, not the character.
+
+
+def _cb(field=47, value="X", kind="checkbox", **kw):
+    fake, drv = _new("persistent", popup_has_edit=False, **kw)
+    res = drv.headsdown_type(str(field), value, kind=kind)
+    return fake, drv, res
+
+
+def _after_jump(fake) -> list:
+    """The keys sent AFTER the field-number Enter — i.e. everything that happened at the
+    value stage. The number stage legitimately clears its box and presses Enter, so an
+    assertion about the VALUE stage has to start here or it is asserting about the wrong
+    half of the field."""
+    return fake.keys[fake.keys.index("{ENTER}") + 1:] if "{ENTER}" in fake.keys else []
+
+
+def case_checkbox_ticks_and_commits():
+    """The field that halted the live run, done properly: the token flips the tick, the
+    TICK is read back (not the character), and only then is it committed."""
+    fake, drv, res = _cb()
+    after = _after_jump(fake)
+    checks = [
+        ("committed as ticked", fake.checks.get(47) is True and 47 in fake.committed),
+        ("the token was sent", "X" in fake.typed),
+        ("the token went in BEFORE the committing Enter",
+         after[:1] == ["X"] and after[-1:] == ["{ENTER}"]),
+        # The proof that this cannot be passing on the old text path: the popup NEVER shows
+        # the token. If a future change made the text gate the thing being satisfied here,
+        # there is nothing for it to count. Sampled at the tick stage, not after the
+        # commit, because by then the popup is back on the number prompt.
+        ("the popup never showed the token as text", "X" not in fake.checkbox_renders),
+        ("no backspaces were sent at the tick box",
+         not any(k.startswith("{BACKSPACE") for k in after)),
+        ("reports what confirmed it", "confirmed via" in str(res.get("read_back"))),
+    ]
+    ok = res.get("ok") is True and all(v for _, v in checks)
+    _check("checkbox: the tick is read back off the widget, then committed", ok,
+           f"{res}\ntick-stage reads={fake.checkbox_renders!r}\nkeys={fake.keys}\nlog:\n"
+           + "\n".join("  " + l for l in fake.log))
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_checkbox_token_ignored_halts():
+    """Drake ignores every token this build knows. The box stays clear, so there is nothing
+    to commit — and committing anyway would report a ticked Box 13 that is not ticked, which
+    is a wrong tax return that every downstream check would call verified."""
+    fake, drv, res = _cb(checkbox_tokens=())
+    checks = [
+        ("halts", res.get("ok") is False and res.get("halt") is True),
+        ("the committing Enter was NEVER pressed", fake.keys.count("{ENTER}") == 1),
+        ("nothing committed", fake.checks == {} and 47 not in fake.committed),
+        ("names the tokens it tried", "'X'" in str(res.get("reason"))),
+        ("says where to put the right one",
+         "headsdown_checkbox_tokens" in str(res.get("reason"))),
+    ]
+    ok = all(v for _, v in checks)
+    _check("checkbox: no token flips the tick -> HALT with the box untouched", ok,
+           str(res.get("reason")))
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_checkbox_unreadable_halts():
+    """Neither channel can see the tick: no accessibility checkbox, no glyph on screen.
+    Same rule as every other gate here — an unverifiable keystroke is not committed — and
+    the halt has to name the remedy, because "cannot verify" with no way forward reads as a
+    dead end when it is one binding line away."""
+    fake, drv, res = _cb(checkbox_uia=False, checkbox_pixel=False)
+    reason = str(res.get("reason"))
+    checks = [
+        ("halts", res.get("ok") is False and res.get("halt") is True),
+        ("the committing Enter was NEVER pressed", fake.keys.count("{ENTER}") == 1),
+        ("nothing committed", fake.checks == {}),
+        ("names the probe", "probe-checkbox" in reason),
+        ("names the pixel-channel escape hatch", "headsdown_checkbox_channels" in reason),
+    ]
+    ok = all(v for _, v in checks)
+    _check("checkbox: nothing can read the tick -> HALT before Enter, with the remedy", ok, reason)
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_checkbox_already_ticked_types_nothing():
+    """Drake arrives with the box ALREADY ticked — either because the return already has it
+    or because this build pre-ticks the field you jump to.
+
+    Sending the token there is a coin flip: on a build where it toggles, it CLEARS a tick a
+    human put in, and the run reports success. So when the state is already the one asked
+    for, nothing is typed at all."""
+    fake, drv, res = _cb(checkbox_pretick=True, checkbox_behaviour="toggle")
+    checks = [
+        ("committed", res.get("ok") is True and fake.checks.get(47) is True),
+        ("NO token was typed", "X" not in fake.typed),
+        ("the arrival state is reported", (res.get("checkbox") or {}).get("arrival") is True),
+        ("no tokens tried", (res.get("checkbox") or {}).get("tokens_tried") == []),
+    ]
+    ok = all(v for _, v in checks)
+    _check("checkbox: already in the wanted state -> type NOTHING, just commit", ok,
+           f"{res}\ntyped={fake.typed}\nlog:\n" + "\n".join("  " + l for l in fake.log))
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_checkbox_pixel_only():
+    """A build that exposes no checkbox to accessibility at all. The tick glyph on screen is
+    then the only evidence there is — and it is enough, because the state that has to be
+    PROVEN is the ticked one, and a tick is exactly what that channel can see."""
+    fake, drv, res = _cb(checkbox_uia=False, checkbox_pixel=True)
+    ok = (res.get("ok") is True and fake.checks.get(47) is True
+          and (res.get("checkbox") or {}).get("verified_by") == "pixel")
+    return _check("checkbox: screen glyph alone is enough to confirm a tick", ok,
+                  f"{res}\nlog:\n" + "\n".join("  " + l for l in fake.log))
+
+
+def case_checkbox_uia_present_but_mute():
+    """The checkbox is in the accessibility tree but will not report its Toggle state. That
+    is not a reading of 'clear' — it is no reading — so the screen channel has to carry it,
+    and the field must still go in."""
+    fake, drv, res = _cb(checkbox_uia=True, checkbox_uia_state=False, checkbox_pixel=True)
+    ok = (res.get("ok") is True and fake.checks.get(47) is True
+          and (res.get("checkbox") or {}).get("verified_by") == "pixel")
+    return _check("checkbox: element visible but mute -> the screen channel carries it", ok,
+                  f"{res}\nlog:\n" + "\n".join("  " + l for l in fake.log))
+
+
+def case_checkbox_channels_disagree():
+    """Accessibility says clear, the screen says ticked. One of them is wrong and there is
+    no way to know which, so neither is picked: the pair is discarded and the field halts.
+    Picking the convenient one is how a box that was never ticked gets reported as ticked."""
+    fake, drv, res = _cb(checkbox_pixel_lies=True, checkbox_tokens=())
+    ok = (res.get("ok") is False and res.get("halt") is True
+          and fake.checks == {} and fake.keys.count("{ENTER}") == 1)
+    return _check("checkbox: channels disagree -> no reading, no commit", ok,
+                  f"{res.get('reason')}\nchecks={fake.checks}\nkeys={fake.keys}")
+
+
+def case_checkbox_commit_silently_refused():
+    """The tick is showing and verified, the Enter goes in — and Drake silently declines it
+    and stays on the tick box. No dialog, nothing on screen to see. Reported as success, the
+    NEXT field's number would be typed at this field's tick box."""
+    fake, drv, res = _cb(value_validator=lambda n, v: "silent" if n == 47 else None)
+    ok = (res.get("ok") is False and res.get("halt") is True
+          and fake.checks == {} and 47 not in fake.committed
+          and "did not accept the tick" in str(res.get("reason")))
+    return _check("checkbox: a silently refused tick still HALTs", ok,
+                  f"{res.get('reason')}\nchecks={fake.checks}")
+
+
+def case_checkbox_token_escalation():
+    """'X' does nothing on this build but '1' works. Escalation is allowed BECAUSE each
+    token is verified before the next is sent — the alternative, firing all three and
+    looking afterwards, would leave a toggling build in whatever state the last one made."""
+    fake, drv, res = _cb(checkbox_tokens=("1",))
+    cb = res.get("checkbox") or {}
+    ok = (res.get("ok") is True and fake.checks.get(47) is True
+          and cb.get("tokens_tried") == ["X", "1"])
+    return _check("checkbox: escalates to the token this build takes, verifying each", ok,
+                  f"{res}\nlog:\n" + "\n".join("  " + l for l in fake.log))
+
+
+def case_checkbox_toggle_not_double_flipped():
+    """On a build where the token TOGGLES, the first one already did the job. Sending the
+    next one 'to be sure' would untick it again — and the box would be committed clear while
+    the run reported it ticked. The loop stops the moment the tick is right."""
+    fake, drv, res = _cb(checkbox_tokens=("X", "1", "{SPACE}"), checkbox_behaviour="toggle")
+    cb = res.get("checkbox") or {}
+    ok = (res.get("ok") is True and fake.checks.get(47) is True
+          and cb.get("tokens_tried") == ["X"] and fake.typed.count("X") == 1)
+    return _check("checkbox: a toggling build is never double-flipped", ok,
+                  f"{res}\ntyped={fake.typed}")
+
+
+def case_checkbox_drift_guard():
+    """Drake shows a tick box for a field the map calls money. The field numbers have moved
+    on this build — every value after this one would land somewhere else — so the run stops
+    before typing anything, rather than posting 52000 at a checkbox."""
+    fake, drv, res = _cb(field=47, value="52000", kind="money")
+    ok = (res.get("ok") is False and res.get("halt") is True
+          and "52000" not in fake.typed and fake.checks == {}
+          and "moved" in str(res.get("reason")))
+    return _check("checkbox where the map expects money -> HALT as build drift", ok,
+                  f"{res.get('reason')}\ntyped={fake.typed}")
+
+
+def case_checkbox_map_wrong_field_is_text():
+    """The mirror image: the map says field 23 is a checkbox, but Drake gives it a text box.
+    No tick ever appears, so nothing is committed — the same drift caught from the other
+    side, and without the driver having to be told which side it is on."""
+    fake, drv, res = _cb(field=23, value="X", kind="checkbox")
+    ok = (res.get("ok") is False and res.get("halt") is True
+          and 23 not in fake.committed and fake.keys.count("{ENTER}") == 1)
+    return _check("map says checkbox, Drake shows a text box -> HALT, nothing committed", ok,
+                  f"{res.get('reason')}\ncommitted={fake.committed}\nkeys={fake.keys}")
+
+
+def case_checkbox_per_jump_refused():
+    """A build where the popup closes on the jump would put the caret on the CANVAS
+    checkbox, and the canvas exposes nothing at all — no window, no value, no rectangle to
+    look at. A tick typed there could never be confirmed, so it is not typed."""
+    fake, drv = _new("per-jump", popup_has_edit=False)
+    res = drv.headsdown_type("47", "X", kind="checkbox")
+    ok = (res.get("ok") is False and res.get("halt") is True
+          and "X" not in fake.typed and fake.checks == {}
+          and "by hand" in str(res.get("reason")))
+    return _check("checkbox on a per-jump build -> refuse, it cannot be read back", ok,
+                  f"{res.get('reason')}\ntyped={fake.typed}")
+
+
+class _FakeImage:
+    """The bare surface _find_tick_glyph uses (size + load()), so the glyph detector can be
+    tested with no Pillow and no Drake — it is pure pixel logic and deserves a table."""
+
+    def __init__(self, w, h, pixels):
+        self.size = (w, h)
+        self._px = pixels
+
+    def load(self):
+        return self._px
+
+
+def _img(w, h, shapes):
+    px = {(x, y): (242, 240, 242) for x in range(w) for y in range(h)}
+    for (x0, y0, sw, sh, colour, kind) in shapes:
+        for y in range(y0, y0 + sh):
+            for x in range(x0, x0 + sw):
+                if kind == "circle":
+                    cx, cy, r = x0 + sw / 2, y0 + sh / 2, sw / 2
+                    if (x - cx) ** 2 + (y - cy) ** 2 > r * r:
+                        continue
+                if kind == "cut-corners":
+                    # A square with a quarter of each corner taken off: still square-ish,
+                    # still mostly filled, but its CORNERS are empty. The one shape that
+                    # isolates the corner test from the fill test.
+                    i, j, c = x - x0, y - y0, min(sw, sh) // 4
+                    if (min(i, sw - 1 - i) + min(j, sh - 1 - j)) < c:
+                        continue
+                px[(x, y)] = colour
+    return _FakeImage(w, h, px)
+
+
+def case_checkbox_glyph_table():
+    """What counts as a tick, and what does not. The colour alone is not the test — a Drake
+    screen has other blue on it — so the glyph is identified by SHAPE: square-ish, checkbox
+    sized, and mostly filled. The accent colour and the 14x14 size are measured off the live
+    build (w2-after.png, field 47)."""
+    ACCENT = (0, 103, 192)
+    rows = [
+        ("a ticked checkbox (14x14 accent square, as measured live)",
+         _img(300, 94, [(84, 56, 14, 14, ACCENT, "rect")]), True),
+        ("an empty popup is not a tick", _img(300, 94, []), False),
+        ("a blue hyperlink run is not a tick (too thin)",
+         _img(300, 94, [(20, 40, 127, 13, (0, 102, 204), "rect")]), False),
+        ("the Live Chat bubble is not a tick (too big, and round)",
+         _img(300, 94, [(10, 10, 56, 56, (26, 115, 232), "circle")]), False),
+        # A REAL false positive, found by running the detector over an earlier screenshot:
+        # Drake's toolbar Help button is a 22x22 blue circle, which passes every size and
+        # aspect test there is. Measured fill 0.651 and corner occupancy 0.24-0.32 against
+        # the real tick's 0.918 and 0.67-0.89.
+        ("Drake's round blue Help icon (22x22) is not a tick",
+         _img(300, 94, [(40, 20, 22, 22, (0, 122, 204), "circle")]), False),
+        ("a rounded blue square is not a tick either — its corners are empty",
+         _img(300, 94, [(40, 20, 16, 16, (0, 103, 192), "cut-corners")]), False),
+        ("anti-aliasing specks are not a tick",
+         _img(300, 94, [(10, 10, 2, 3, ACCENT, "rect"), (40, 20, 2, 4, ACCENT, "rect")]), False),
+        ("black text is not a tick", _img(300, 94, [(20, 20, 14, 14, (0, 0, 0), "rect")]), False),
+        ("the yellow caption highlight is not a tick",
+         _img(300, 94, [(20, 20, 90, 16, (253, 255, 147), "rect")]), False),
+        ("a tick at 200% DPI (28x28) still reads",
+         _img(300, 94, [(84, 30, 28, 28, ACCENT, "rect")]), True),
+    ]
+    ok = True
+    for name, img, want in rows:
+        got = drake_driver._find_tick_glyph(img) is not None
+        ok = ok and got == want
+        print(f"    {'ok  ' if got == want else 'FAIL'}: {name} -> {got}")
+    return _check("tick glyph is identified by SHAPE, not just colour", ok)
+
+
+def case_checkbox_flicker_is_not_proof():
+    """The state channel JITTERS: every other read says the box is ticked when it is not.
+    A mid-repaint accessibility read looks exactly like a successful tick, and acting on a
+    single one commits a Box 13 that is not ticked while reporting it verified.
+
+    Two consecutive agreeing readings is the same drain proof the text path uses, and here
+    it is what makes a channel that never says the same thing twice converge on NOTHING —
+    which is the honest answer. Without it the tick is committed on whichever frame happened
+    to be flattering, and the box is left clear on the return.
+
+    Deliberately jitters the ARRIVAL read too. A one-shot lie right after the token is not
+    enough to prove the guard: the re-prove immediately before the Enter catches that one on
+    its own, so a test built on it passes with the convergence rule deleted."""
+    fake, drv, res = _cb(checkbox_tokens=(), checkbox_flicker=True)
+    checks = [
+        ("halts", res.get("ok") is False and res.get("halt") is True),
+        ("the committing Enter was NEVER pressed", fake.keys.count("{ENTER}") == 1),
+        ("nothing committed", fake.checks == {} and 47 not in fake.committed),
+    ]
+    ok = all(v for _, v in checks)
+    _check("checkbox: a jittering state channel converges on nothing", ok,
+           f"{res.get('reason')}\nchecks={fake.checks}\nkeys={fake.keys}")
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_checkbox_untick_needs_a_read_first():
+    """Clearing a tick is the one direction the screen channel cannot carry: an unticked
+    checkbox and a plain text box are pixel-identical, so "no tick visible" is not evidence
+    that a tick box is there and clear.
+
+    Asked to untick with only that channel available, the honest move is to type NOTHING.
+    Firing tokens at a box whose state cannot be read is how a build where the token
+    TOGGLES ends up ticking the very box that was meant to be cleared."""
+    fake, drv, res = _cb(value="0", checkbox_uia=False, checkbox_pixel=True,
+                         checkbox_behaviour="toggle",
+                         checkbox_tokens=("X", "1", "{SPACE}"))
+    checks = [
+        ("halts", res.get("ok") is False and res.get("halt") is True),
+        ("NO token was fired at a box it cannot read",
+         not any(t in fake.typed for t in ("X", "1", "{SPACE}"))),
+        ("nothing committed", fake.checks == {}),
+        ("says the state was never read", "actually read" in str(res.get("reason"))),
+    ]
+    ok = all(v for _, v in checks)
+    _check("checkbox: an untick will not start from a state nothing could read", ok,
+           f"{res.get('reason')}\ntyped={fake.typed}")
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_checkbox_probe_measures_and_leaves_clean():
+    """`probe-checkbox` is the first thing that runs on the live machine, and an untested
+    probe is exactly the wasted trip this suite exists to prevent.
+
+    It has to answer three questions — is this a checkbox, what state does it arrive in,
+    which token flips it — and then leave Drake exactly as it found it: tick restored, popup
+    closed, and NO Enter, because Enter is what would write the value."""
+    fake, drv = _new("persistent", popup_has_edit=False, checkbox_behaviour="toggle")
+    res = drv.probe_checkbox_field(field_no="47", flip=True)
+    checks = [
+        ("it ran", res.get("ok") is True),
+        ("identifies the field as a checkbox", res.get("is_checkbox_field") is True),
+        ("reports the arrival state", (res.get("arrival_state") or {}).get("ticked") is False),
+        ("finds the token that flips it", res.get("token_that_worked") == "X"),
+        ("says whether it sets or toggles", res.get("token_behaviour") == "toggle"),
+        ("puts the tick back", (res.get("restored") or {}).get("ok") is True),
+        ("committed NOTHING", fake.checks == {} and fake.committed == set()),
+        ("never pressed Enter on the tick", fake.keys.count("{ENTER}") == 1),
+        ("left the popup closed", res.get("popup_open_after_disarm") is False),
+    ]
+    ok = all(v for _, v in checks)
+    _check("probe-checkbox measures the build and leaves Drake untouched", ok,
+           f"{res}\nkeys={fake.keys}\nlog:\n" + "\n".join("  " + l for l in fake.log))
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_checkbox_desired_table():
+    """What a value means to a tick box. Anything that is not a yes-or-no answer must come
+    back as None, so the caller halts instead of picking a state for the taxpayer."""
+    rows = [("X", True), ("x", True), ("1", True), ("true", True), ("YES", True),
+            ("{SPACE}", True), ("0", False), ("false", False), ("no", False),
+            ("off", False), ("52000", None), ("D", None), ("", None)]
+    ok = True
+    for val, want in rows:
+        got = drake_driver._as_checkbox_desired(val)
+        ok = ok and got is want
+        print(f"    {'ok  ' if got is want else 'FAIL'}: {val!r} -> {got}")
+    return _check("checkbox values resolve to tick / clear / not-an-answer", ok)
+
+
 def case_known_dialog_dismissed_by_name():
     """Drake's e-file completeness warning is the normal state of a half-keyed W-2, and it
     blocks entry. It may be answered automatically — but by CLICKING A NAMED BUTTON, never
@@ -1288,7 +1973,108 @@ def case_comparator_table():
     return ok
 
 
+def case_locality_resolution():
+    """Box 20 stores a CODE, not the name on the W-2.
+
+    Pinned to a SYNTHETIC table, not the live CITY.HLP: this must fail on a machine with no
+    Drake installed, and it must fail when the resolver breaks — not when Drake ships a new
+    city list. The real file is only read live.
+    """
+    import w2_map as m
+    saved_table, saved_src = m._LOCALITY_TABLE, m._LOCALITY_SOURCE
+    m._LOCALITY_TABLE = {
+        "PA": {"PL": "Philadelphia", "LC": "Local (Generic)", "PY": "Part Year"},
+        "NY": {"NY": "New York City", "YONKERS": "Yonkers", "PY": "Part Year"},
+        "IN": {"49": "MARION", "48": "MADISON", "50": "MARSHALL"},
+        # Muskegon is not decoration: Drake really lists both 'Muskegon City' and
+        # 'Muskegon Heights', so treating ' CITY' as a noise suffix turns a valid,
+        # unambiguous locality into an ambiguous one. Without a collision like this in the
+        # table, a ' CITY'-stripping bug is masked by the prefix rule and tests green.
+        "MI": {"PC": "Portland City", "PH": "Port Huron", "PT": "Pontiac",
+               "MC": "Muskegon City", "MH": "Muskegon Heights"},
+        "CA": {"VD": "Voluntary Plan DI", "VI": "Voluntary Plan DI"},
+    }
+    m._LOCALITY_SOURCE = "<synthetic>"
+    try:
+        def code(st, raw):
+            return m.resolve_locality(st, raw)["code"]
+
+        def how(st, raw):
+            return m.resolve_locality(st, raw)["how"]
+
+        # The three values that were typed live on 2026-08-04 and stored nothing, plus the
+        # codes they should have been. This is the regression the whole section exists for.
+        checks = [
+            ("'PHILA' -> 'PL' (was typed raw, stored nothing)", code("PA", "PHILA") == "PL"),
+            ("'NYC' -> 'NY' (was typed raw, stored nothing)", code("NY", "NYC") == "NY"),
+            ("'MARION' -> '49' (was typed raw, stored nothing)", code("IN", "MARION") == "49"),
+            # A code that arrives already correct must pass through untouched, not get
+            # re-resolved into something else by a name or prefix rule.
+            ("'PL' stays 'PL' (already a code)", (code("PA", "PL"), how("PA", "PL")) == ("PL", "code")),
+            ("'YONKERS' is both a code and a name -> code wins",
+             (code("NY", "YONKERS"), how("NY", "YONKERS")) == ("YONKERS", "code")),
+            ("case and padding are irrelevant", code("PA", "  philadelphia ") == "PL"),
+            ("'Marion County' loses the noise suffix", code("IN", "Marion County") == "49"),
+            # ' CITY' is NOT noise — Michigan lists 'Portland City' and stripping it would
+            # silently retarget the entry.
+            ("' CITY' is kept ('Portland City' is a real name)",
+             code("MI", "Portland City") == "PC"),
+            ("' CITY' is kept even when dropping it would collide (Muskegon City/Heights)",
+             code("MI", "Muskegon City") == "MC"),
+            ("unique prefix resolves ('Pont' -> Pontiac)", code("MI", "Pont") == "PT"),
+            # Everything below must REFUSE. A locality that resolves to the wrong code is a
+            # wrong number on a return that looks entirely plausible.
+            ("ambiguous prefix refuses ('Port' matches 2)", code("MI", "Port") is None),
+            ("duplicate names refuse (CA lists 2 for one name)",
+             code("CA", "Voluntary Plan DI") is None),
+            ("unknown name refuses", code("PA", "PITTSBURGH") is None),
+            ("state with no localities refuses (TX)", code("TX", "DALLAS") is None),
+            ("missing state refuses", code("", "PHILADELPHIA") is None),
+            ("a refusal names the codes Drake does offer",
+             sorted(m.resolve_locality("MI", "Port")["candidates"])
+             == ["PC (Portland City)", "PH (Port Huron)"]),
+        ]
+
+        # No table at all (Drake not installed / moved) must disable resolution, never fall
+        # back to typing the raw string — the exact failure this section was written to end.
+        m._LOCALITY_TABLE = {}
+        checks.append(("no CITY.HLP -> refuse, never type raw", code("PA", "PHILA") is None))
+        m._LOCALITY_TABLE = {"PA": {"PL": "Philadelphia"}, "TX": {}}
+
+        # build_plan integration: a resolved locality is ENTERED as the code; an unresolvable
+        # one is diverted to hand-entry and must not reach the keyboard.
+        plan = m.build_plan({"box15_state": "PA", "box20_locality": "Philadelphia",
+                             "box15_state_2": "TX", "box20_locality_2": "DALLAS"})
+        ent = {e["field_no"]: e for e in plan["entries"]}
+        hand = {h["field_no"]: h for h in plan["hand_entry"]}
+        checks += [
+            ("plan enters field 63 as the CODE 'PL'", ent.get(63, {}).get("value") == "PL"),
+            ("plan keeps what it resolved FROM, for review",
+             ent.get(63, {}).get("resolved_from") == "PHILADELPHIA"),
+            ("plan diverts the TX locality to hand-entry", 70 in hand and 70 not in ent),
+            ("the diverted one says why", "no local income tax" in (hand.get(70, {}).get("why") or "")),
+        ]
+        ok = all(v for _, v in checks)
+        _check("Box 20 locality resolves to Drake's code, or refuses", ok)
+        for name, v in checks:
+            print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+        return ok
+    finally:
+        m._LOCALITY_TABLE, m._LOCALITY_SOURCE = saved_table, saved_src
+
+
 def main() -> int:
+    # The suite prints '⚠' and '·', and a REDIRECTED stdout on Windows is cp1252 — which
+    # raised UnicodeEncodeError inside the driver, was caught by headsdown_type's outer
+    # handler, and came back as a HALT. Five cases failed that way when the suite was run
+    # into a file and passed when it was run at a console: a red suite for a reason that
+    # had nothing to do with the code under test. Same fix as agent.py's _utf8_console.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    only = sys.argv[1] if len(sys.argv) > 1 else None
     print("=" * 74)
     print("Heads-down entry — offline state-machine proof")
     print("Confirmed protocol: popup persists, alternating number -> value -> number,")
@@ -1296,49 +2082,94 @@ def main() -> int:
     print("Every case runs with the 'Drake Software Chat' window present.")
     print("=" * 74)
 
-    case_full_sequence("persistent")
-    case_full_sequence("per-jump")
-    case_full_sequence("persistent", autoadvance_from=23, label=" auto-advance elsewhere")
-    case_full_sequence("persistent", autoadvance_from=None, label=" no auto-advance")
-    case_ein_skipped()
-    case_invalid_number()
-    case_inert_field_silently_declined()
-    case_inert_field_that_clears_the_box()
-    case_value_silently_refused()
-    case_value_corrupted_in_flight()
-    case_number_corrupted_in_flight()
-    case_late_keys_append()
-    case_empty_value_refused()
-    case_inherited_armed_popup()
-    case_blind_build_degrades()
-    case_window_closed_midbatch()
-    case_benign_window_midrun()
-    case_modal_disable()
-    case_modal_while_popup_open()
-    case_keyboard_scope()
-    case_focus_never_taken()
-    case_anchored_title_regex()
-    case_edit_class_is_not_literally_edit()
-    case_painted_popup_enters()
-    case_painted_popup_enters(label=" [punctuation jitter]", surface_jitter="punct")
-    case_painted_popup_enters(label=" [character-level OCR noise]", surface_jitter="chars")
-    case_painted_popup_enters(label=" [transient unreadable frames — the live field-1 halt]",
-                              surface_jitter="repaint")
-    case_painted_popup_enters(label=" [OCR garbage frames]", surface_jitter="garbage")
-    case_painted_popup_channel_dies_before_the_baseline()
-    case_painted_popup_unreadable()
-    case_painted_popup_keystrokes_vanish()
-    case_painted_popup_value_corrupted()
-    case_painted_popup_silent_refusal()
-    case_painted_popup_silent_refusal(label=" [character-level OCR noise]",
-                                      surface_jitter="chars")
-    case_surface_token_counting()
-    case_known_dialog_dismissed_by_name()
-    case_unknown_dialog_still_halts()
-    case_edit_ranking_table()
-    case_prompt_excludes_the_typing_box()
-    case_classifier_table()
-    case_comparator_table()
+    # (label, thunk) pairs so one case or one family can be run on its own:
+    #     python simulate_headsdown.py checkbox
+    # The full suite takes minutes on a slow box, and the mutation harness runs it
+    # once per mutant — being able to run only the family a mutant touches is the
+    # difference between a 30-minute check and an all-day one.
+    cases = [
+        ('locality_resolves_to_drake_code', lambda: case_locality_resolution()),
+        ('full_sequence "persistent"', lambda: case_full_sequence("persistent")),
+        ('full_sequence "per-jump"', lambda: case_full_sequence("per-jump")),
+        ('full_sequence "persistent", autoadvance_from=23, label=" auto-advance elsewhere"', lambda: case_full_sequence("persistent", autoadvance_from=23, label=" auto-advance elsewhere")),
+        ('full_sequence "persistent", autoadvance_from=None, label=" no auto-advance"', lambda: case_full_sequence("persistent", autoadvance_from=None, label=" no auto-advance")),
+        ('ein_skipped', lambda: case_ein_skipped()),
+        ('invalid_number', lambda: case_invalid_number()),
+        ('ctrln_inert_popup_after_ein_is_recycled',
+         lambda: case_inert_popup_after_ein_is_recycled()),
+        ('ctrln_healthy_popup_is_never_double_toggled',
+         lambda: case_healthy_popup_is_never_double_toggled()),
+        ('ctrln_healthy_painted_popup_is_never_double_toggled',
+         lambda: case_healthy_popup_is_never_double_toggled(
+             label=" [painted popup — the confirmed shape]", popup_has_edit=False)),
+        ('slow_jump_is_not_a_refusal', lambda: case_slow_jump_is_not_a_refusal()),
+        ('inert_field_silently_declined', lambda: case_inert_field_silently_declined()),
+        ('inert_field_that_clears_the_box', lambda: case_inert_field_that_clears_the_box()),
+        ('value_silently_refused', lambda: case_value_silently_refused()),
+        ('value_corrupted_in_flight', lambda: case_value_corrupted_in_flight()),
+        ('number_corrupted_in_flight', lambda: case_number_corrupted_in_flight()),
+        ('late_keys_append', lambda: case_late_keys_append()),
+        ('empty_value_refused', lambda: case_empty_value_refused()),
+        ('inherited_armed_popup', lambda: case_inherited_armed_popup()),
+        ('blind_build_degrades', lambda: case_blind_build_degrades()),
+        ('window_closed_midbatch', lambda: case_window_closed_midbatch()),
+        ('benign_window_midrun', lambda: case_benign_window_midrun()),
+        ('modal_disable', lambda: case_modal_disable()),
+        ('modal_disabled_before_attach',
+         lambda: case_main_frame_disabled_before_we_attached()),
+        ('modal_while_popup_open', lambda: case_modal_while_popup_open()),
+        ('keyboard_scope', lambda: case_keyboard_scope()),
+        ('focus_never_taken', lambda: case_focus_never_taken()),
+        ('anchored_title_regex', lambda: case_anchored_title_regex()),
+        ('edit_class_is_not_literally_edit', lambda: case_edit_class_is_not_literally_edit()),
+        ('painted_popup_enters', lambda: case_painted_popup_enters()),
+        ('painted_popup_enters label=" [punctuation jitter]", surface_jitter="punct"', lambda: case_painted_popup_enters(label=" [punctuation jitter]", surface_jitter="punct")),
+        ('painted_popup_enters label=" [character-level OCR noise]", surface_jitter="chars"', lambda: case_painted_popup_enters(label=" [character-level OCR noise]", surface_jitter="chars")),
+        ('painted_popup_enters label=" [transient unreadable frames — the live field-1 halt]", surfa', lambda: case_painted_popup_enters(label=" [transient unreadable frames — the live field-1 halt]", surface_jitter="repaint")),
+        ('painted_popup_enters label=" [OCR garbage frames]", surface_jitter="garbage"', lambda: case_painted_popup_enters(label=" [OCR garbage frames]", surface_jitter="garbage")),
+        ('painted_popup_channel_dies_before_the_baseline', lambda: case_painted_popup_channel_dies_before_the_baseline()),
+        ('painted_popup_unreadable', lambda: case_painted_popup_unreadable()),
+        ('painted_popup_keystrokes_vanish', lambda: case_painted_popup_keystrokes_vanish()),
+        ('painted_popup_value_corrupted', lambda: case_painted_popup_value_corrupted()),
+        ('painted_popup_silent_refusal', lambda: case_painted_popup_silent_refusal()),
+        ('painted_popup_silent_refusal label=" [character-level OCR noise]", surface_jitter="chars"', lambda: case_painted_popup_silent_refusal(label=" [character-level OCR noise]", surface_jitter="chars")),
+        ('surface_token_counting', lambda: case_surface_token_counting()),
+        ('checkbox_ticks_and_commits', lambda: case_checkbox_ticks_and_commits()),
+        ('checkbox_token_ignored_halts', lambda: case_checkbox_token_ignored_halts()),
+        ('checkbox_unreadable_halts', lambda: case_checkbox_unreadable_halts()),
+        ('checkbox_already_ticked_types_nothing', lambda: case_checkbox_already_ticked_types_nothing()),
+        ('checkbox_pixel_only', lambda: case_checkbox_pixel_only()),
+        ('checkbox_uia_present_but_mute', lambda: case_checkbox_uia_present_but_mute()),
+        ('checkbox_channels_disagree', lambda: case_checkbox_channels_disagree()),
+        ('checkbox_commit_silently_refused', lambda: case_checkbox_commit_silently_refused()),
+        ('checkbox_token_escalation', lambda: case_checkbox_token_escalation()),
+        ('checkbox_toggle_not_double_flipped', lambda: case_checkbox_toggle_not_double_flipped()),
+        ('checkbox_drift_guard', lambda: case_checkbox_drift_guard()),
+        ('checkbox_map_wrong_field_is_text', lambda: case_checkbox_map_wrong_field_is_text()),
+        ('checkbox_per_jump_refused', lambda: case_checkbox_per_jump_refused()),
+        ('checkbox_flicker_is_not_proof', lambda: case_checkbox_flicker_is_not_proof()),
+        ('checkbox_untick_needs_a_read_first',
+         lambda: case_checkbox_untick_needs_a_read_first()),
+        ('checkbox_glyph_table', lambda: case_checkbox_glyph_table()),
+        ('checkbox_probe_measures_and_leaves_clean',
+         lambda: case_checkbox_probe_measures_and_leaves_clean()),
+        ('checkbox_desired_table', lambda: case_checkbox_desired_table()),
+        ('known_dialog_dismissed_by_name', lambda: case_known_dialog_dismissed_by_name()),
+        ('unknown_dialog_still_halts', lambda: case_unknown_dialog_still_halts()),
+        ('edit_ranking_table', lambda: case_edit_ranking_table()),
+        ('prompt_excludes_the_typing_box', lambda: case_prompt_excludes_the_typing_box()),
+        ('classifier_table', lambda: case_classifier_table()),
+        ('comparator_table', lambda: case_comparator_table()),
+    ]
+    for label, fn in cases:
+        if only and only.lower() not in label.lower():
+            continue
+        fn()
+    if not _results:
+        # An empty run must never look like a clean one — that is how a filter typo
+        # turns into 'the mutant was killed' when nothing ran at all.
+        print(f"NO CASES MATCHED {only!r}")
+        return 1
 
     print("\n" + "=" * 74)
     passed = sum(1 for r in _results if r)

@@ -64,9 +64,33 @@ except Exception:  # pragma: no cover
     pytesseract = None  # type: ignore
     Image = None  # type: ignore
 
+try:
+    # Pillow ALONE — no Tesseract. The tick on a checkbox is a coloured square, not text,
+    # so it is read by looking at the pixels rather than by OCR. Tracked separately because
+    # a machine with Pillow but no Tesseract binary can still verify a checkbox.
+    from PIL import Image as _PILImage  # noqa: F401
+    _PIL_OK = True
+except Exception:  # pragma: no cover
+    _PIL_OK = False
+
 
 def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+def _say(msg: str) -> None:
+    """print(), but a console that cannot spell the character does not kill the run.
+
+    Every warning this driver prints goes through here. On Windows a redirected stdout
+    defaults to the legacy ANSI codepage, and printing '⚠' into cp1252 raises
+    UnicodeEncodeError — which headsdown_type's outer `except Exception` then reports as a
+    HALT ("'charmap' codec can't encode character"). A field that entered perfectly would
+    stop the batch because of a symbol in a message about it. Redirecting a run to a log
+    file is the normal thing to do with an audit artifact, so this must not be fragile."""
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", "replace").decode("ascii"))
 
 
 class DrakeDriver:
@@ -102,7 +126,13 @@ class DrakeDriver:
         # Path to tesseract.exe for OCR read-back, if it isn't on PATH (Windows installs
         # often aren't). e.g. "C:\\Program Files\\Tesseract-OCR\\tesseract.exe".
         self.tesseract_cmd = binding.get("tesseract_cmd")
-        self.key_pause = key_pause
+        # Seconds between injected keystrokes. Drake is a DOS-heritage app that can drop
+        # keys sent too fast, so this is deliberately conservative — but it is also charged
+        # on every character of every value AND on the 16-backspace clear, twice a field.
+        # Tunable per VM because the right value is a property of the machine, and because
+        # a value too low cannot pass silently: a dropped character fails the settle gate
+        # and HALTS rather than committing a short value.
+        self.key_pause = float(self.nav.get("key_pause", key_pause))
         self.dry_run = dry_run
         self.app = None          # backend="uia" connection to the main data-entry frame
         self.win = None          # the resolved main-frame window
@@ -124,12 +154,42 @@ class DrakeDriver:
         self._warned_prompt_blind = False
         self._warned_popup_foreign = False
         self._warned_surface_blind = False
+        self._warned_recycled = False
+        # Has this build's heads-down popup been OBSERVED to own no child windows? None
+        # until the first full-budget resolution answers it. See _resolve_popup_edit.
+        self._popup_painted = None
         self._last_ocr_error = None   # why the screen-reading channel came back empty
         # How the heads-down popup is READ when it owns no child window (CONFIRMED on Drake
         # 2025: EnumChildWindows returns [] — Drake paints the box itself). Order matters:
         # UIA is exact if Drake exposes anything, OCR is approximate but cannot be refused.
         # Set to [] to force the run to prove nothing can be read and stop.
         self.popup_read_channels = list(self.nav.get("headsdown_read_channels", ["uia", "ocr"]))
+        # CHECKBOX fields (Box 13) have their own value stage: Drake puts a real checkbox
+        # widget on the popup instead of a text box, so the tick is read rather than the
+        # text. "uia" is the Toggle pattern on the widget; "pixel" is the glyph on screen —
+        # the channel that cannot be taken away, and the fallback if this build turns out
+        # not to expose the checkbox to accessibility.
+        self.checkbox_channels = list(self.nav.get("headsdown_checkbox_channels",
+                                                   ["uia", "pixel"]))
+        # Tokens tried, IN ORDER, until the tick actually flips — each one verified before
+        # the next is sent, so a token that toggles rather than sets cannot leave the box
+        # in the wrong state unnoticed. 'X' is Drake's classic token; '1' and Space are the
+        # documented alternatives on other builds. Sent as pywinauto key specs, so
+        # "{SPACE}" works — these are configuration, never extracted data.
+        self.checkbox_tokens = [str(t) for t in (
+            self.nav.get("headsdown_checkbox_tokens")
+            or [self.nav.get("headsdown_checkbox_true", "X"), "1", "{SPACE}"])]
+        self._last_tick_error = None      # why the screen tick-read came back empty
+        self._last_checkbox_note = None   # e.g. more than one checkbox on the popup
+        # How long to wait for Drake to move from the field-number prompt to the value
+        # prompt. This is a BUSY budget, not a refusal test: committing a field can fire
+        # Drake's employer-database lookup and auto-fill, which blocks its UI thread, and
+        # the jump lands whenever that finishes. At 2.5s the live run of 2026-08-04 called
+        # field 14 refused and halted — while the screenshot taken moments later showed the
+        # popup sitting on field 14's value box, i.e. the jump had happened, just late.
+        # Waiting longer costs nothing on a healthy field (the loop returns as soon as the
+        # prompt moves) and only slows down a field that was genuinely declined.
+        self.jump_timeout = float(self.nav.get("headsdown_jump_timeout", 8.0))
         # Dialogs the run may close BY ITSELF, each by clicking a NAMED button. Everything
         # else still halts for a human. Keep this list short and specific: an entry here is
         # permission to answer a question about a tax return without being asked.
@@ -145,6 +205,8 @@ class DrakeDriver:
         self.pid = None
         self._baseline_hwnds: set = set()
         self._benign_hwnds: set = set()
+        # Was Drake's main frame ALREADY disabled when we attached? See _snapshot_baseline.
+        self._baseline_main_disabled = False
         self.benign_notes: list = []
 
     # -- connection ---------------------------------------------------------
@@ -196,7 +258,7 @@ class DrakeDriver:
                     f"no visible window matches app_title_re {self.title_re!r} "
                     f"(searched every process; pywinauto's own anchored match also failed: "
                     f"{first})")
-            print(f"  · app_title_re only matched mid-title — connected by process id "
+            _say(f"  · app_title_re only matched mid-title — connected by process id "
                   f"{best[0]} instead (pywinauto's title_re is anchored at the start).")
             return Application(backend="uia").connect(process=best[0], timeout=20)
 
@@ -211,7 +273,7 @@ class DrakeDriver:
             agent_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
             drake_elevated = self._process_is_elevated(self.win.element_info.process_id)
             if drake_elevated and not agent_admin:
-                print("WARNING: Drake appears to run ELEVATED but this agent is NOT — Windows "
+                _say("WARNING: Drake appears to run ELEVATED but this agent is NOT — Windows "
                       "UIPI will SILENTLY DROP keystrokes (fields stay empty, no error). "
                       "Relaunch this agent as Administrator, or run Drake un-elevated.")
         except Exception:
@@ -521,7 +583,7 @@ class DrakeDriver:
             return None
         if scope == "global" and not self._warned_popup_foreign:
             self._warned_popup_foreign = True
-            print(f"  · the heads-down popup (hwnd={hwnd}) is NOT owned by the Drake process "
+            _say(f"  · the heads-down popup (hwnd={hwnd}) is NOT owned by the Drake process "
                   f"we attached to — driving it by handle.")
         try:
             # By HANDLE: find_elements returns the element directly for a handle criterion,
@@ -693,7 +755,7 @@ class DrakeDriver:
     def _surface_shows(self, text, expected) -> bool:
         return self._surface_count(text, expected) > 0
 
-    def _settle_surface(self, popup_hwnd, expected, baseline, *, timeout=3.5, poll=0.12):
+    def _settle_surface(self, popup_hwnd, expected, baseline, *, timeout=3.5, poll=0.05):
         """Wait until the popup SHOWS `expected` and has stopped changing. (ok, text, channel).
 
         The surface equivalent of _settle_read, carrying the same drain proof: two consecutive
@@ -731,6 +793,203 @@ class DrakeDriver:
                 return False, last, (chan if last is not None else "none")
             time.sleep(poll)
 
+    # -- checkbox fields (Box 13) -------------------------------------------
+    #
+    # CONFIRMED on Drake 2025 (live run 2026-08-03, field 47): a checkbox field's value
+    # stage is NOT a text box. The popup keeps its field-number box and puts a real
+    # CHECKBOX widget beside it, captioned with the field's name ("Retirement plan"), and
+    # the token flips the tick. So there is nothing for the text gates to count: the tick
+    # is a GLYPH, not a character, and _settle_surface — which requires the typed token to
+    # appear in the popup's text one more time than before — can never be satisfied. That
+    # is exactly what halted the first 20-field run: the X had landed, the box was ticked
+    # on screen, and the driver correctly refused to commit something it could not read.
+    #
+    # The fix is a different CHANNEL, not a weaker gate: read the tick itself.
+
+    def _read_popup_checkbox_uia(self, popup_hwnd) -> Optional[list]:
+        """Every checkbox the popup exposes to UI Automation: [{name, state, rect}].
+
+        `state` is True/False, or None when the element is there but will not say. The
+        return is None when the CHANNEL could not answer at all (no UIA connection, the
+        walk blew up) and [] when it walked the popup and there is genuinely no checkbox
+        on it. Those two are not the same claim and must not be collapsed — [] is evidence
+        that this is a text field, None is no evidence about anything.
+
+        Worth expecting to work here even though Drake's grid exposes nothing: the popup is
+        a WPF window (class HwndWrapper[DrakeTax2025;;…]) that owns no child HWNDs, and WPF
+        controls are UIA elements rather than windows — which is why the popup reads through
+        UIA at all. A WPF CheckBox carries the Toggle pattern, so its tick is readable even
+        though nothing about it is a window."""
+        if self.app is None:
+            return None
+        try:
+            spec = self.app.window(handle=int(popup_hwnd))
+            try:
+                els = spec.descendants(control_type="CheckBox")
+            except Exception:
+                els = []
+            if not els:
+                # NEVER take an empty filtered result as "there is no checkbox".
+                # UIAElementInfo._get_elements catches COMError and returns [] (pywinauto
+                # 0.6.9), so a channel failure is indistinguishable from an answer — and
+                # this one's answer is load-bearing: [] is what the drift guard reads as
+                # "this is a text field". Confirm it with the unfiltered walk, which is a
+                # different code path, before believing it. The popup holds a handful of
+                # elements, so the second walk costs nothing worth saving.
+                els = [e for e in spec.descendants() if _looks_like_checkbox(e)]
+            out = []
+            for el in els:
+                out.append({"name": _element_name(el),
+                            "state": _element_toggle_state(el),
+                            "rect": _element_rect(el)})
+            return out
+        except Exception:
+            return None
+
+    def _read_popup_checkbox_pixels(self, popup_hwnd) -> Optional[bool]:
+        """Is a TICKED checkbox glyph showing on the popup? True / None — never False.
+
+        The screen channel for a tick, and deliberately one-sided. A ticked WPF checkbox is
+        a solid accent-coloured square (measured on this build: a compact 14x14 blob of
+        RGB 0,103,192 filling ~92% of its bounding box); nothing else the popup draws comes
+        close. So a blob like that IS a tick.
+
+        The absence of one is NOT a reading of "unticked", because an unticked checkbox and
+        a plain text box are pixel-identical to this test — both simply have no blue square.
+        Returning False there would let "this is a text field" masquerade as "the checkbox
+        is clear", so it returns None: no evidence. Positive evidence only is enough to run
+        on, because the only state this driver ever needs to PROVE is the ticked one."""
+        if not _PIL_OK:
+            self._last_tick_error = "Pillow not installed — pip install pillow"
+            return None
+        try:
+            from PIL import ImageGrab
+            # Same rule as the OCR channel: a screen grab is only evidence about the popup
+            # while the popup is what is on top of it.
+            if int(_keyboard_target_info().get("root") or 0) != int(popup_hwnd):
+                self._last_tick_error = "the popup is not the foreground window — grab skipped"
+                return None
+            r = _wintypes.RECT()
+            _u32().GetWindowRect(int(popup_hwnd), _ctypes.byref(r))
+            if r.right <= r.left or r.bottom <= r.top:
+                return None
+            try:
+                img = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom), all_screens=True)
+            except TypeError:      # Pillow < 9.2 has no all_screens
+                img = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom))
+            if img.width < 8 or img.height < 8:
+                return None
+            self._last_tick_error = None
+            return True if _find_tick_glyph(img.convert("RGB")) else None
+        except Exception as e:
+            self._last_tick_error = f"{type(e).__name__}: {e}"
+            return None
+
+    def _checkbox_hwnd(self, hwnd) -> int:
+        """The window the tick is drawn on — the POPUP, not the typing box.
+
+        On the confirmed build they are one handle: Drake paints the box onto the dialog, so
+        the popup IS the edit. On a build that has a real child Edit they are not, and the
+        checkbox is that edit's SIBLING — walking the edit's own descendants would find
+        nothing and report a perfectly readable tick as unreadable."""
+        try:
+            return int(self._popup_hwnd or hwnd)
+        except Exception:
+            return int(hwnd)
+
+    def _read_checkbox_state(self, popup_hwnd) -> dict:
+        """{channel: True/False} for every channel with a DEFINITE answer this instant.
+
+        A channel that cannot see the tick is ABSENT from the dict, exactly as in
+        _read_popup_channels — silence is never a vote. Two checkboxes on one popup would
+        make "the state" meaningless, so that reports nothing and leaves a note for the
+        halt message instead of picking one."""
+        popup_hwnd = self._checkbox_hwnd(popup_hwnd)
+        out = {}
+        if "uia" in self.checkbox_channels:
+            els = self._read_popup_checkbox_uia(popup_hwnd)
+            known = [e for e in (els or []) if e.get("state") is not None]
+            if len(known) == 1:
+                out["uia"] = bool(known[0]["state"])
+            elif len(known) > 1:
+                self._last_checkbox_note = (
+                    f"the popup exposes {len(known)} checkboxes "
+                    f"({', '.join(repr(e.get('name')) for e in known)}) — which one is the "
+                    f"field is not decidable, so no tick state was read")
+        if "pixel" in self.checkbox_channels:
+            t = self._read_popup_checkbox_pixels(popup_hwnd)
+            if t is not None:
+                out["pixel"] = bool(t)
+        return out
+
+    def _popup_checkbox_present(self, popup_hwnd, *, screen: bool = True) -> Optional[bool]:
+        """Is the popup showing a checkbox? True / False / None (cannot tell).
+
+        Only UIA can say NO — see _read_popup_checkbox_pixels for why the screen channel
+        can only ever say yes. Used for the build-drift guard (Drake showing a checkbox for
+        a field the map calls money means the field numbers have moved) and for messages;
+        the entry gate does not rest on it, because the tick evidence is what actually has
+        to be true before the Enter.
+
+        `screen=False` asks UIA only. That is what entry uses, on every field of every run:
+        the screen half costs a grab and a scan, and its unique contribution — "a tick is
+        visible" — cannot change the routing of a field the map already calls a checkbox."""
+        popup_hwnd = self._checkbox_hwnd(popup_hwnd)
+        els = self._read_popup_checkbox_uia(popup_hwnd)
+        if els:
+            return True
+        if screen and self._read_popup_checkbox_pixels(popup_hwnd):
+            return True
+        return False if els == [] else None
+
+    def _settle_checkbox(self, popup_hwnd, desired=None, *, timeout: float = 1.5,
+                         poll: float = 0.05):
+        """Wait until the tick has STOPPED CHANGING. (ok, state, channel).
+
+        `desired=None` converges on whatever state the box is in — that is how the arrival
+        state is read, and it is what makes "it is already ticked, type nothing" possible.
+        `desired=True/False` waits for that specific state, which is what a keystroke has
+        to produce before it may be committed.
+
+        Same drain proof as every other gate here: two consecutive readings that agree mean
+        the keystroke has already been consumed, so none can arrive after the check passes.
+        Two extra rules, both learned on the text path:
+          • channels that DISAGREE are not a reading — the pair is discarded rather than
+            one of them being picked, so a stale screen frame can never outvote UIA;
+          • a channel with nothing to say is skipped, never recorded as a state. No
+            evidence is not evidence."""
+        import time
+        deadline = time.time() + timeout
+        prev, chan = None, "none"
+        while True:
+            st = self._read_checkbox_state(popup_hwnd)
+            vals = set(st.values())
+            if len(vals) == 1:
+                cur = vals.pop()
+                chan = "+".join(st)
+                if prev is not None and prev == cur and (desired is None or cur == desired):
+                    return True, cur, chan
+                prev = cur
+            elif len(vals) > 1:
+                prev, chan = None, "+".join(st)
+            if time.time() >= deadline:
+                return False, prev, chan
+            time.sleep(poll)
+
+    def _checkbox_halt_reason(self, fn, desired, state, chan, tail) -> str:
+        want = "ticked" if desired else "clear"
+        note = f" ({self._last_checkbox_note})" if self._last_checkbox_note else ""
+        if chan in ("", "none") or state is None:
+            return (f"NOTHING can read the tick on field {fn}'s checkbox{note} — UI Automation "
+                    f"exposes no checkbox on this popup and no tick glyph is on screen"
+                    f"{'; ' + self._last_tick_error if self._last_tick_error else ''}. "
+                    f"{tail} Run `agent.py probe-checkbox --field {fn}` to see what the popup "
+                    f"really exposes; if UIA is silent on this build, set "
+                    f"navigation.headsdown_checkbox_channels to [\"pixel\"] so the tick is "
+                    f"confirmed off the screen instead.")
+        shown = "ticked" if state else "clear"
+        return (f"field {fn}'s checkbox still reads {shown}, not {want} (via {chan}){note}. {tail}")
+
     def _surface_halt_reason(self, what, got, chan, tail) -> str:
         if chan == "none" or got is None:
             return (f"NOTHING can read the heads-down popup on this build — it owns no child "
@@ -766,13 +1025,13 @@ class DrakeDriver:
         # an empty box. Deliberately not Ctrl+A/Delete — Ctrl chords are toxic on this app.
         self._keys("{BACKSPACE 16}")
         import time
-        time.sleep(0.15)
+        time.sleep(0.06)
         chans = self._read_popup_channels(edit.handle)
         text = " ".join(chans.values()) if chans else None
         chan = "+".join(chans) if chans else "none"
         if text is None and chan == "none" and not self._warned_surface_blind:
             self._warned_surface_blind = True
-            print(f"  ⚠ the heads-down popup owns no child window and NOTHING can read it "
+            _say(f"  ⚠ the heads-down popup owns no child window and NOTHING can read it "
                   f"(UIA silent; OCR: {self._last_ocr_error or 'no answer'}). Entry cannot "
                   f"verify a keystroke before committing it, so it will halt rather than "
                   f"type blind.")
@@ -809,7 +1068,20 @@ class DrakeDriver:
         class_name_re=, is the same anchored re.match that hid the popup window itself.
         Enumerating with ctypes and ranking the result cannot fail that way, and when it does
         fail it reports the class names it actually saw."""
-        kids = self._popup_edit_children(popup_hwnd, timeout=timeout)
+        # WAIT ONCE, NOT EVERY FIELD. The poll exists because a dialog creates its controls
+        # as it initialises, so asking the instant it appears can legitimately see an empty
+        # tree — but on the confirmed Drake shape the tree is empty FOREVER (Drake paints the
+        # box), so the full budget was being burned on every resolution, twice per field.
+        # Measured live: 2s each, ~4s of the 8.2s a field was taking.
+        #
+        # So the first resolution pays the full budget and LEARNS the shape; afterwards a
+        # popup already known to be painted gets a short probe. The enumeration itself still
+        # runs every time — if children ever do appear they are still found and used — this
+        # only stops re-proving a negative that was established once.
+        budget = 0.0 if self._popup_painted else timeout
+        kids = self._popup_edit_children(popup_hwnd, timeout=budget)
+        if kids or budget == timeout:
+            self._popup_painted = not kids
         try:
             focused = self._focused_hwnd()[0]
         except Exception:
@@ -891,22 +1163,37 @@ class DrakeDriver:
         if snap is None:
             return
         import re as _re
-        wins, _enabled = snap
+        wins, enabled = snap
         self._baseline_hwnds = {int(w["hwnd"]) for w in wins}
+        # The main frame's DISABLED bit is furniture too when it is already set at attach.
+        # Drake nests its screens: opening a return's data-entry screen creates a new
+        # top-level window and puts WS_DISABLED on the frames behind it. That is Drake at
+        # rest, not a modal that arrived to block us — and it is indistinguishable from one
+        # by looking at the bit alone, which is what stopped a live run dead (2026-08-04:
+        # "unexpected dialog before entry: main-disabled", nothing typed, no dialog on
+        # screen, every window in the process already in the baseline).
+        #
+        # A modal that appears LATER still disables the frame and still halts, because the
+        # test is "did this change since we attached", not "is the frame disabled".
+        self._baseline_main_disabled = (enabled is False)
+        if self._baseline_main_disabled:
+            _say("  · Drake's main frame is already disabled at attach (its data-entry "
+                 "screen is a nested window) — baseline, not a modal. A modal appearing "
+                 "later still halts.")
         extras = [w for w in wins
                   if int(w["hwnd"]) != int(self.main_hwnd or 0)
                   and w.get("visible")
                   and not _re.search(self.popup_title_re, w.get("title") or "")]
         if extras:
             names = ", ".join(repr(w.get("title") or w.get("class_name")) for w in extras[:6])
-            print(f"  · {len(extras)} other window(s) in the Drake process at attach — "
+            _say(f"  · {len(extras)} other window(s) in the Drake process at attach — "
                   f"benign baseline, ignored unless one blocks input: {names}")
 
     def _note_benign(self, w) -> None:
         line = (f"ignoring benign window {w.get('title')!r} "
                 f"(class={w.get('class_name')}, hwnd={w.get('hwnd')}) — non-modal, not a dialog")
         self.benign_notes.append(line)
-        print(f"  · {line}")
+        _say(f"  · {line}")
 
     def _input_scope(self, allow_popup: bool = True):
         """HWND-scoped keystroke gate: (ok, where). ok=True only when the FOREGROUND root
@@ -961,7 +1248,8 @@ class DrakeDriver:
             return None
         wins, main_enabled = snap
         kw = dict(popup_title_re=self.popup_title_re, main_hwnd=self.main_hwnd,
-                  baseline=self._baseline_hwnds, benign_seen=self._benign_hwnds)
+                  baseline=self._baseline_hwnds, benign_seen=self._benign_hwnds,
+                  main_disabled_at_attach=self._baseline_main_disabled)
         blocker, benign_new, _pp = _classify_process_windows(wins, main_enabled=main_enabled, **kw)
         if blocker is not None and blocker.get("why") == "main-disabled" and not blocker.get("dialogish"):
             import time as _t
@@ -1039,7 +1327,7 @@ class DrakeDriver:
                     return {"ok": False, "reason": f"clicked {txt!r} but the dialog is still up"}
                 self.benign_notes.append(
                     f"auto-dismissed {dlg.get('title')!r} by clicking {txt!r} ({rule.get('why', '')})")
-                print(f"  ⚠ auto-dismissed {dlg.get('title')!r} — clicked {txt!r}. "
+                _say(f"  ⚠ auto-dismissed {dlg.get('title')!r} — clicked {txt!r}. "
                       f"{rule.get('why', '')}")
                 return {"ok": True, "clicked": txt}
         return {"ok": False,
@@ -1140,6 +1428,16 @@ class DrakeDriver:
         for i in range(max(1, attempts)):
             popup = self._find_headsdown_popup(timeout=0.3 if i == 0 else 0.15)
             if popup is not None:
+                # PRESENT IS NOT THE SAME AS ARMED. Confirmed live after the EIN commits
+                # (2026-08-04): Drake's auto-fill finishes, the popup is on screen, and the
+                # KEYBOARD is still held by the data-entry window. Typing then goes to the
+                # canvas, so the run halted at the next field with "could not identify the
+                # popup's text box … the keyboard is held by hwnd=…, not the popup".
+                if not self._popup_holds_keyboard(popup):
+                    cycled = self._recycle_popup(method=method)
+                    if not cycled.get("ok"):
+                        return cycled
+                    popup = cycled["popup"]
                 ready = self._popup_ready_for_number(popup)
                 if not ready.get("ok"):
                     return ready
@@ -1183,6 +1481,93 @@ class DrakeDriver:
         return {"ok": False,
                 "reason": f"Ctrl+N did not open the heads-down popup after {attempts} attempts "
                           f"(is a canvas field active?)"}
+
+    def _popup_holds_keyboard(self, popup, tries: int = 4) -> bool:
+        """Does the heads-down popup actually own the keyboard? Retried briefly, because
+        focus arrives a moment after the window does.
+
+        "The popup is up" and "keys will land in it" are different claims, and only the
+        second one matters. On the confirmed Drake shape the popup owns no child windows, so
+        the popup itself must hold focus. On a build that HAS a real child Edit the keyboard
+        belongs to that CHILD, and that is perfectly healthy — accepting only the popup's own
+        handle there would call every healthy popup inert and recycle it on every field,
+        which is the double-toggle cascade wearing a different hat."""
+        import time
+        h = self._popup_hwnd
+        if h is None:
+            try:
+                h = int(popup.handle)
+            except Exception:
+                return False
+        for _ in range(max(1, tries)):
+            try:
+                focused = int(self._focused_hwnd()[0])
+                if focused == int(h):
+                    return True
+                try:
+                    kids = _enum_child_summaries(int(h), cap=32)
+                except Exception:
+                    kids = []
+                if any(int(k.get("hwnd") or 0) == focused for k in kids):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.12)
+        return False
+
+    def _recycle_popup(self, *, method: str = "scancode") -> dict:
+        """Close a popup that is on screen but not holding the keyboard, then open a fresh
+        one — Ctrl+N twice, VERIFIED at each step rather than fired blind.
+
+        The founder found this by hand after an EIN commit: one Ctrl+N to drop the stale
+        popup, a second to bring up a live one, and heads-down then behaves normally. The
+        reason it is not the double-toggle bug this driver guards against is the state it
+        starts from — a popup that is up but inert. A blind double-tap on a HEALTHY popup
+        would still be a bug, which is why each toggle here is confirmed by looking at the
+        window before the next one is sent: close must be observed before open is sent, and
+        the new popup must be seen to hold the keyboard before it is handed back."""
+        import time
+        ok_scope, where = self._input_scope(allow_popup=True)
+        if not ok_scope:
+            return {"ok": False,
+                    "reason": f"the heads-down popup is up but does not hold the keyboard, "
+                              f"and the keyboard is in {where} — outside Drake entirely. "
+                              f"Refusing to send Ctrl+N. Click a Drake field and re-run."}
+        self.headsdown_toggle(method=method)          # 1) drop the inert popup
+        gone = False
+        for _ in range(12):
+            if self._find_headsdown_popup(timeout=0.05) is None:
+                gone = True
+                break
+            time.sleep(0.1)
+        if not gone:
+            return {"ok": False,
+                    "reason": "the heads-down popup is up but does not hold the keyboard, and "
+                              "Ctrl+N did not close it. Nothing was typed. Press Esc in Drake, "
+                              "click a field, and re-run."}
+        self._popup_owned = False
+        self.headsdown_toggle(method=method)          # 2) bring up a live one
+        popup = self._find_headsdown_popup(timeout=2.0)
+        if popup is None:
+            return {"ok": False,
+                    "reason": "closed the inert heads-down popup, but Ctrl+N did not bring a "
+                              "new one back. Nothing was typed — click a Drake field and re-run."}
+        if not self._popup_holds_keyboard(popup, tries=8):
+            return {"ok": False,
+                    "reason": "re-opened the heads-down popup and it STILL does not hold the "
+                              "keyboard, so a keystroke would land on the canvas. Nothing was "
+                              "typed. Click into a Drake field and re-run."}
+        # WE opened this one, so its state is known: it is on the field-number prompt.
+        self._popup_owned = True
+        self._note_recycled()
+        return {"ok": True, "popup": popup, "recycled": True}
+
+    def _note_recycled(self) -> None:
+        if getattr(self, "_warned_recycled", False):
+            return
+        self._warned_recycled = True
+        _say("  · the heads-down popup was up but inert (no keyboard) — closed and re-opened "
+             "it. Expected right after Drake's employer auto-fill; entry continues.")
 
     def _popup_ready_for_number(self, popup) -> dict:
         """Is the popup that is ALREADY up waiting for a FIELD NUMBER? {"ok":True} or a halt.
@@ -1311,7 +1696,7 @@ class DrakeDriver:
         return ""
 
     def _stable_prompt(self, popup, edit_hwnd=None, *, timeout: float = 3.0,
-                       poll: float = 0.1) -> str:
+                       poll: float = 0.05) -> str:
         """A prompt reading that has been seen TWICE — '' if it never settles.
 
         Every refusal check compares later readings against a baseline captured here, and a
@@ -1376,7 +1761,7 @@ class DrakeDriver:
         if self._warned_prompt_blind:
             return
         self._warned_prompt_blind = True
-        print("  ⚠ this build exposes NO readable prompt text on the heads-down popup, so a "
+        _say("  ⚠ this build exposes NO readable prompt text on the heads-down popup, so a "
               "silently REFUSED field number or value cannot be positively detected. "
               "Falling back to the weaker 'did the edit box change' test — verify the "
               "screenshot field by field.")
@@ -1522,8 +1907,89 @@ class DrakeDriver:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def _enter_checkbox(self, popup, eh, fn, val, base_prompt) -> dict:
+        """The VALUE stage for a checkbox field — state-driven, never keystroke-driven.
+
+        Drake's checkbox value stage has no text box (CONFIRMED live on field 47, Box 13
+        "Retirement plan"): the popup shows the tick box itself. So the question this has
+        to answer is not "did my character appear" but "is the box in the state I want",
+        and it is answered by reading the widget:
+
+          1. converge on the ARRIVAL state — what the box shows before we touch it
+          2. already correct? type NOTHING. A token sent at an already-ticked box is a
+             coin flip between a no-op and silently clearing a human's tick.
+          3. otherwise send a token and wait for the tick to actually FLIP, verified
+             between tokens, so an escalation cannot double-toggle unnoticed
+          4. re-prove the state immediately before the Enter
+          5. prove Drake took it (the shared prompt-moved commit gate)
+
+        Every exit before step 5 leaves Drake exactly as it was found: the popup is still
+        up, nothing has been committed, and a human ticks the box by hand."""
+        desired = _as_checkbox_desired(val)
+        if desired is None:
+            return {"ok": False, "halt": True,
+                    "reason": f"field {fn} is a checkbox and {val!r} is not a yes-or-no "
+                              f"value for one. Nothing was entered."}
+        self._last_checkbox_note = None
+        # The VALUE prompt, captured before anything is typed — step 5 compares against it.
+        value_prompt = self._stable_prompt(popup, eh)
+        ok0, arrival, chan0 = self._settle_checkbox(eh, timeout=1.5)
+        if not ok0 and desired is False:
+            # Unticking needs to know the box IS a checkbox and IS currently ticked, and
+            # only the accessibility channel can establish that — the screen channel can
+            # confirm a tick but never its absence (see _read_popup_checkbox_pixels).
+            return {"ok": False, "halt": True,
+                    "reason": self._checkbox_halt_reason(
+                        fn, desired, arrival, chan0,
+                        "Clearing a tick has to start from a state that was actually read, "
+                        "and nothing read it, so nothing was typed.")}
+        tokens_tried = []
+        state, chan = arrival, chan0
+        if not (ok0 and arrival == desired):
+            for token in self.checkbox_tokens:
+                tokens_tried.append(token)
+                self._keys(token)
+                ok, state, chan = self._settle_checkbox(eh, desired, timeout=1.5)
+                if ok:
+                    break
+            else:
+                return {"ok": False, "halt": True,
+                        "reason": self._checkbox_halt_reason(
+                            fn, desired, state, chan,
+                            f"The tick was never SEEN in that state, so the Enter was not "
+                            f"pressed and nothing was committed — the popup is still open on "
+                            f"this field. Press Esc in Drake and tick this box by hand, or "
+                            f"set navigation.headsdown_checkbox_tokens to the token this "
+                            f"build takes (tried, in order: {tokens_tried}).")}
+        # 4) Prove it once more, right before the irreversible Enter. The token loop's own
+        #    check can be several hundred milliseconds old by now, and a checkbox that
+        #    flipped back (a stray key, a repaint) must stop the commit rather than ride
+        #    on a stale reading.
+        ok2, state, chan = self._settle_checkbox(eh, desired, timeout=1.0)
+        if not ok2:
+            return {"ok": False, "halt": True,
+                    "reason": self._checkbox_halt_reason(
+                        fn, desired, state, chan,
+                        "It would not hold that state long enough to be committed, so the "
+                        "Enter was NOT pressed and nothing was written.")}
+        self._keys("{ENTER}")
+        took, how = self._verify_value_committed(base_prompt, value_prompt)
+        if not took:
+            return {"ok": False, "halt": True,
+                    "reason": f"Drake did not accept the tick for field {fn} — it is still "
+                              f"asking for that field's value. NOTHING was committed. Tick "
+                              f"this box by hand.",
+                    "prompt_after_value": how}
+        shown = "ticked" if desired else "clear"
+        return {"ok": True,
+                "read_back": f"checkbox {shown} — confirmed via {chan}",
+                "commit_evidence": how,
+                "checkbox": {"desired": desired, "arrival": arrival if ok0 else None,
+                             "tokens_tried": tokens_tried, "verified_by": chan,
+                             "note": self._last_checkbox_note}}
+
     def headsdown_type(self, field_no, value, *, method: str = "scancode",
-                       settle_after: float = 0.0) -> dict:
+                       settle_after: float = 0.0, kind: Optional[str] = None) -> dict:
         """Enter ONE value BY FIELD NUMBER — race-free, VERIFIED, and model-agnostic — via
         the heads-down popup. Replaces the old open-loop "fire Ctrl+N, sleep, blind-type"
         that raced keystrokes between the popup and the canvas (digits into EIN, 'invalid
@@ -1546,6 +2012,11 @@ class DrakeDriver:
                persistent popup now asking for the value → re-focus its edit, type the value
                           THERE, wait for it to settle, then Enter to commit
              rejected / unknown / error dialog                     → HALT
+          6b. CHECKBOX fields (Box 13) take a different value stage — Drake shows the tick
+             box itself, not a text box — so they route to _enter_checkbox, which reads the
+             TICK instead of counting characters. `kind` comes from the field map; when it
+             is not supplied the popup is asked, and a checkbox appearing where the map
+             expects money or text HALTs as build drift.
           7. PROVE the value was accepted (_verify_value_committed) else HALT
           8. no error dialog after the value?                      else HALT
 
@@ -1636,16 +2107,29 @@ class DrakeDriver:
                                   f"channels to just the steady one."}
             # 6) fire the jump, then OBSERVE what Drake actually did.
             self._keys("{ENTER}")
-            model, dlg = self._classify_after_jump(eh, fn, base_prompt=base_prompt, timeout=2.5)
+            model, dlg = self._classify_after_jump(eh, fn, base_prompt=base_prompt,
+                                                   timeout=self.jump_timeout)
             if model == "error":
                 return {"ok": False, "halt": True,
                         "reason": f"error dialog after jumping to field {fn}: {dlg['summary']}", "dialog": dlg}
             if model == "rejected":
+                # Say what was OBSERVED, not what it means. "Drake refused this number" was
+                # a conclusion the evidence does not support: the popup staying on the
+                # number prompt for the whole budget is equally consistent with Drake being
+                # busy (an employer-lookup auto-fill blocks its UI thread), and reporting
+                # the conclusion sent a live debug down the wrong path — the number 14 was
+                # fine and the jump had simply not landed yet.
                 return {"ok": False, "halt": True,
-                        "reason": f"Drake did NOT accept field number {fn} on this screen — it "
-                                  f"stayed on the field-number prompt. Nothing was entered. "
-                                  f"(Is that number right for this screen? Boxes that are "
-                                  f"greyed out or foreign-address-only decline silently.)"}
+                        "reason": f"the popup never moved off the field-number prompt for "
+                                  f"field {fn} within {self.jump_timeout:g}s, so nothing was "
+                                  f"entered. Either Drake declined that number (greyed-out "
+                                  f"and foreign-address-only boxes decline silently — check "
+                                  f"the number is right for this screen), or it was still "
+                                  f"busy: committing a field can fire Drake's employer "
+                                  f"auto-fill, and the jump lands when that finishes. If the "
+                                  f"screenshot shows the popup ON that field's value box, it "
+                                  f"was the second one — raise "
+                                  f"navigation.headsdown_jump_timeout."}
             if model == "unknown":
                 return {"ok": False, "halt": True,
                         "reason": f"could not read the popup at all after jumping to field {fn} "
@@ -1653,6 +2137,17 @@ class DrakeDriver:
             # read_back stays None on the per-jump path: the canvas exposes no value to read,
             # which is exactly why that path types no trailing Enter.
             committed, commit_evidence, read_back = False, None, None
+            checkbox_info = None
+            if model == "per-jump" and kind == "checkbox":
+                # The caret would be on a canvas checkbox, and the canvas is the surface
+                # that exposes nothing at all — no child window, no UIA value, and no
+                # popup rectangle to look at. A tick typed there could not be confirmed,
+                # and an unconfirmable tick is exactly what this driver does not commit.
+                return {"ok": False, "halt": True,
+                        "reason": f"field {fn} is a checkbox and this build put the caret on "
+                                  f"the CANVAS instead of keeping the popup up. A tick on the "
+                                  f"canvas cannot be read back, so it will not be typed — "
+                                  f"tick this box by hand."}
             if model == "per-jump":
                 # The caret is on the canvas field. HWND-scoped gate first: after the popup
                 # closes the foreground root must be Drake's frame again — retried briefly
@@ -1686,6 +2181,40 @@ class DrakeDriver:
                     return {"ok": False, "halt": True, "reason": f"popup edit not ready for the value: {e}"}
                 if not self._focus_popup_edit(edit, eh):
                     return {"ok": False, "halt": True, "reason": "popup edit never took focus for the value"}
+                # Is this field's value stage a CHECKBOX rather than a text box? Asked of
+                # the popup BEFORE anything is typed — including before _clear_target's
+                # backspaces, which have no business being sent at a checkbox.
+                shows_checkbox = self._popup_checkbox_present(eh, screen=False)
+                if shows_checkbox is True and kind not in (None, "checkbox"):
+                    # Drake is showing a tick box for a field this run believes is money or
+                    # text. That is build drift — the heads-down numbers moved — and typing
+                    # here would put a value in some other box entirely.
+                    return {"ok": False, "halt": True,
+                            "reason": f"Drake is showing a CHECKBOX for field {fn}, but the "
+                                      f"map says this field is {kind!r}. The heads-down field "
+                                      f"numbers have moved on this build — re-verify them "
+                                      f"against the screen before running again. Nothing was "
+                                      f"entered."}
+                if kind == "checkbox" or (kind is None and shows_checkbox is True):
+                    res = self._enter_checkbox(popup, eh, fn, val, base_prompt)
+                    if not res.get("ok"):
+                        return res
+                    checkbox_info = res.get("checkbox")
+                    committed, commit_evidence = True, res.get("commit_evidence")
+                    read_back = res.get("read_back")
+                    if settle_after:
+                        time.sleep(settle_after)
+                    bad = self._detect_unexpected_dialog()
+                    if bad:
+                        return {"ok": False, "halt": True,
+                                "reason": f"error dialog after entering field {fn}: {bad['summary']}",
+                                "dialog": bad}
+                    return {"ok": True, "field_no": field_no, "model": model,
+                            "value_committed": True, "commit_evidence": commit_evidence,
+                            "read_back": read_back, "checkbox": checkbox_info,
+                            "popup_reopened": opened.get("opened"),
+                            "popup_attempts": opened.get("attempts"),
+                            "popup_after_value": self._find_headsdown_popup(timeout=0.2) is not None}
                 pre = self._clear_target(edit)
                 if not pre.get("ok"):
                     return {"ok": False, "halt": True, "reason": pre["reason"]}
@@ -1890,6 +2419,120 @@ class DrakeDriver:
             out["reason"] = str(e)
         return out
 
+    def probe_checkbox_field(self, field_no: str = "47", flip: bool = True) -> dict:
+        """Calibration probe for a CHECKBOX field: what does Drake's popup actually expose,
+        and which token flips the tick?
+
+        Answers the three questions the entry path has to have right, and answers them by
+        measurement rather than by assumption:
+          • is the value stage a checkbox at all, and does UI Automation expose it (Toggle
+            pattern) or is the on-screen glyph the only evidence?
+          • what state does the box arrive in — Drake may pre-tick the field you jumped to,
+            in which case sending a token would CLEAR it;
+          • does the configured token flip it, and is the flip a SET or a TOGGLE?
+
+        Commits nothing: it flips the tick, flips it back, and leaves with Esc. The tick is
+        only ever pending — Enter is what would write it — but this is a probe, so verify
+        the box by eye on the screenshot afterwards regardless. `flip=False` makes it purely
+        observational: it reads the arrival state and leaves without sending a token."""
+        out = {"ok": True, "field_no": str(field_no)}
+        if self.dry_run or self.w32 is None:
+            return {"ok": False, "reason": "no win32 popup connection (run on the VM after connect)"}
+        fn = str(field_no)
+        try:
+            import time
+            self.begin_batch()
+            popup = self._find_headsdown_popup(timeout=0.5)
+            if popup is None:
+                out["ensure_open"] = self._ensure_popup_open(timeout=2.5)
+                popup = self._find_headsdown_popup(timeout=1.0)
+            if popup is None:
+                # Say WHY it did not open. "Click a Drake field first" is one cause among
+                # several, and printing it unconditionally sends the operator to check the
+                # one thing they already did while the real reason sits in the JSON below.
+                why = (out.get("ensure_open") or {}).get("reason")
+                return {"ok": False, "ensure_open": out.get("ensure_open"),
+                        "reason": why or ("the heads-down popup did not open — click a Drake "
+                                          "field so its cursor is blinking, then re-run")}
+            ready = self._popup_ready_for_number(popup)
+            out["popup_ready_for_number"] = ready
+            if not ready.get("ok"):
+                return {"ok": False, "reason": ready.get("reason")}
+            edit = self._popup_edit(popup)
+            edit.wait("ready", timeout=2)
+            eh = int(edit.handle)
+            if not self._focus_popup_edit(edit, eh):
+                return {"ok": False, "reason": "popup edit never took keyboard focus"}
+            pre = self._clear_target(edit)
+            if not pre.get("ok"):
+                return {"ok": False, "reason": pre["reason"]}
+            self._keys(fn)
+            settled, got, chan = self._settle_surface(eh, fn, pre.get("baseline"))
+            out["field_number_settled"] = {"ok": settled, "read": got, "channel": chan}
+            if not settled:
+                out["ok"] = False
+                out["reason"] = f"the popup never showed field number {fn} — nothing typed on"
+                out["disarm"] = self._disarm_popup()
+                return out
+            base_prompt = self._stable_prompt(popup, eh)
+            self._keys("{ENTER}")
+            model, dlg = self._classify_after_jump(eh, fn, base_prompt=base_prompt,
+                                                   timeout=self.jump_timeout)
+            out["model"] = model
+            if model != "persistent":
+                out["ok"] = False
+                out["reason"] = (f"after jumping to field {fn} the popup did not come back "
+                                 f"asking for a value (model={model!r}"
+                                 f"{', dialog: ' + dlg['summary'] if dlg else ''})")
+                out["disarm"] = self._disarm_popup()
+                return out
+            out["prompt_at_value"] = self._stable_prompt(popup, eh)
+            # RAW channel evidence, by name — the same shape probe-popup reports for text,
+            # so a build that exposes nothing says so plainly instead of being inferred.
+            els = self._read_popup_checkbox_uia(eh)
+            out["uia_checkboxes"] = els
+            out["uia_channel"] = ("silent (no answer at all)" if els is None else
+                                  f"{len(els)} checkbox element(s)")
+            out["pixel_tick_visible"] = self._read_popup_checkbox_pixels(eh)
+            out["pixel_error"] = self._last_tick_error
+            ok0, arrival, chan0 = self._settle_checkbox(eh, timeout=2.0)
+            out["arrival_state"] = {"read": ok0, "ticked": arrival, "channel": chan0}
+            out["is_checkbox_field"] = self._popup_checkbox_present(eh)
+            if flip and ok0:
+                flips = []
+                for token in self.checkbox_tokens:
+                    self._keys(token)
+                    ok, st, ch = self._settle_checkbox(eh, not arrival, timeout=1.5)
+                    flips.append({"token": token, "flipped": bool(ok), "state_after": st,
+                                  "channel": ch})
+                    if ok:
+                        break
+                out["token_trials"] = flips
+                out["token_that_worked"] = next((f["token"] for f in flips if f["flipped"]), None)
+                if out["token_that_worked"]:
+                    # Put it back the way it was found. If the same token does NOT restore
+                    # it, the token SETS rather than toggles — worth knowing, and worth
+                    # saying loudly, because the box is then left showing a pending tick.
+                    self._keys(out["token_that_worked"])
+                    ok_r, st_r, ch_r = self._settle_checkbox(eh, arrival, timeout=1.5)
+                    out["restored"] = {"ok": bool(ok_r), "state_after": st_r, "channel": ch_r}
+                    out["token_behaviour"] = "toggle" if ok_r else "set (not a toggle)"
+            elif flip:
+                out["token_trials"] = "skipped — the arrival state could not be read, so a " \
+                                      "token's effect could not be measured either"
+            out["disarm"] = self._disarm_popup()
+            out["popup_open_after_disarm"] = self._find_headsdown_popup(timeout=0.3) is not None
+            out["unexpected_dialog"] = self._detect_unexpected_dialog()
+            out["verdict"] = (
+                "READABLE — the tick can be confirmed before the Enter that commits it"
+                if ok0 else
+                "UNREADABLE — neither UI Automation nor the screen could report the tick "
+                "state, so checkbox fields will HALT rather than commit blind")
+        except Exception as e:
+            out["ok"] = False
+            out["reason"] = str(e)
+        return out
+
     def _probe_read_channels(self, edit_hwnd, edit) -> dict:
         """Try EVERY read channel against the popup and report each one's answer by name.
 
@@ -2043,6 +2686,106 @@ class DrakeDriver:
                     "clicked_abs": [r.left + int(x), r.top + int(y)]}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    def canvas_windows(self) -> list:
+        """Drake's DATA-ENTRY windows — the ones that hold the form, not the app frame.
+
+        This distinction is the whole point. The project's founding measurement, "Drake
+        exposes 0 Edit controls and 0 readable values", was taken against the MAIN FRAME
+        (`Drake 2025 Tax Software`). Drake hosts a return's data-entry screen in a separate
+        top-level window, and that window exposes 253 UIA elements with real values —
+        `12-3456789`, `test employer llc`, `52000`. The canvas was readable all along; the
+        probe was pointed at the wrong window."""
+        if not _WINFN or self.dry_run:
+            return []
+        try:
+            pid = int(self.pid or self.win.element_info.process_id)
+        except Exception:
+            return []
+        out = []
+        for w in _enum_toplevel_windows(pid):
+            if not w.get("visible"):
+                continue
+            if _re.search(self.popup_title_re, w.get("title") or ""):
+                continue      # the heads-down popup is not the canvas
+            r = w.get("rect") or [0, 0, 0, 0]
+            if r[2] < self.min_main_w or r[3] < self.min_main_h:
+                continue      # overlays and the chat bubble
+            if "data entry" not in (w.get("title") or "").lower():
+                continue
+            out.append(int(w["hwnd"]))
+        return out
+
+    def read_canvas_values(self) -> list:
+        """Every value currently readable on Drake's data-entry canvas: [{text, value,
+        control_type, rect}]. Empty list when nothing can be read — never a claim.
+
+        This is the read-back the driver has never had. Everything else verifies what the
+        POPUP echoed, which is what the operator typed — and the live run of 2026-08-04
+        proved that is not the same thing: Drake accepted 'DALLAS' into an empty Box 20
+        locality dropdown, echoed it back in the popup, took the Enter, and left the box on
+        the form EMPTY. Four fields reported OK and wrote nothing."""
+        out, seen = [], set()
+        for h in self.canvas_windows():
+            try:
+                els = self.app.window(handle=h).descendants()
+            except Exception:
+                continue
+            for el in els:
+                try:
+                    ct = str(el.element_info.control_type or "")
+                    tx = (el.window_text() or "").strip()
+                except Exception:
+                    continue
+                val = ""
+                try:
+                    v = el.get_value()
+                    val = str(v).strip() if v is not None else ""
+                except Exception:
+                    pass
+                if not (tx or val):
+                    continue
+                try:
+                    r = el.rectangle()
+                    rect = [int(r.left), int(r.top), int(r.right), int(r.bottom)]
+                except Exception:
+                    rect = None
+                key = (ct, tx, val, tuple(rect or ()))
+                if key in seen:
+                    continue      # the same control is reachable from two window handles
+                seen.add(key)
+                out.append({"control_type": ct, "text": tx, "value": val, "rect": rect})
+        return out
+
+    def audit_canvas(self, entries: list) -> dict:
+        """Which planned values are ACTUALLY on the form afterwards? {ok, missing, checked}.
+
+        Deliberately a presence test and nothing more. It cannot say a value is in the RIGHT
+        box — that needs a field-number-to-control map this build does not have yet — but it
+        does catch the failure the popup gate structurally cannot see: a value that never
+        reached the form at all. Comparison is normalised, because Drake reformats what it
+        stores: an EIN comes back '12-3456789', a ZIP '75001-____', and a city it corrected
+        from the ZIP comes back as its own spelling."""
+        canvas = self.read_canvas_values()
+        if not canvas:
+            return {"ok": False, "reason": "nothing on the data-entry canvas could be read, "
+                                           "so no value could be confirmed on the form",
+                    "missing": [], "checked": 0, "canvas_elements": 0}
+        blobs = {_norm_prompt(f"{c['text']} {c['value']}") for c in canvas}
+        joined = " ".join(blobs)
+        missing = []
+        for e in entries:
+            want = _norm_prompt(str(e.get("value", "")))
+            if not want:
+                continue
+            # A checkbox has no text on the canvas — its state is a glyph, and it was already
+            # proven at entry by reading the widget. Nothing to look for here.
+            if e.get("kind") == "checkbox":
+                continue
+            if want not in joined:
+                missing.append(e)
+        return {"ok": not missing, "missing": missing, "checked": len(entries),
+                "canvas_elements": len(canvas)}
 
     def read_field(self, target: dict) -> dict:
         screen, field = target["screen"], target["field"]
@@ -2581,7 +3324,7 @@ def _dialogish(w) -> bool:
 
 
 def _classify_process_windows(wins, *, popup_title_re, main_hwnd, baseline, benign_seen,
-                              main_enabled):
+                              main_enabled, main_disabled_at_attach=False):
     """The pure decision core of the structural dialog gate — no Windows calls, so it is
     provable offline (simulate_headsdown.py feeds it synthetic snapshots). Given the
     process's top-level windows, decide what (if anything) is actually BLOCKING entry:
@@ -2591,7 +3334,12 @@ def _classify_process_windows(wins, *, popup_title_re, main_hwnd, baseline, beni
       rule 2  main frame DISABLED with no heads-down popup up → a modal is pumping:
               blame a new enabled window if there is one, else an enabled dialog-shaped
               one, else report the modality itself (never blame baseline furniture like
-              the chat overlay by name);
+              the chat overlay by name) — UNLESS the frame was already disabled when we
+              attached, in which case the modality is furniture too: Drake nests its
+              data-entry screens and disables the frames behind them, and blaming that
+              stopped a live run with no dialog anywhere on screen. A modal that arrives
+              LATER still disables the frame and is still caught, because the surviving
+              test is "did this change since attach", not "is the frame disabled";
       else    new non-dialog windows are benign (returned for logging), baseline windows
               are furniture, cosmetic classes/invisible/zero-area windows are ignored.
 
@@ -2629,9 +3377,10 @@ def _classify_process_windows(wins, *, popup_title_re, main_hwnd, baseline, beni
                 b = dict(pool[0])
                 b["why"], b["dialogish"] = "main-disabled", _dialogish(pool[0])
                 return b, [], popup_present
-        b = {"hwnd": 0, "title": None, "class_name": None, "why": "main-disabled",
-             "dialogish": False, "candidates": [w.get("title") for w in cands]}
-        return b, [], popup_present
+        if not main_disabled_at_attach:
+            b = {"hwnd": 0, "title": None, "class_name": None, "why": "main-disabled",
+                 "dialogish": False, "candidates": [w.get("title") for w in cands]}
+            return b, [], popup_present
     return None, new, popup_present
 
 
@@ -2808,6 +3557,168 @@ def _box_center(box):
         return None
     x, y, w, h = box
     return (int(x) + int(w) // 2, int(y) + int(h) // 2)
+
+
+def _looks_like_checkbox(el) -> bool:
+    """Is this UIA element a checkbox? Asked of the element, never of its name.
+
+    Two spellings because pywinauto reports the control type differently depending on
+    version and backend (`element_info.control_type` -> "CheckBox";
+    `friendly_class_name()` -> "CheckBox" / "Check Box"). Both are cheap and either one
+    being right is enough."""
+    for getter in (lambda: el.element_info.control_type,
+                   lambda: el.friendly_class_name()):
+        try:
+            t = str(getter() or "")
+        except Exception:
+            continue
+        if t.replace(" ", "").lower() == "checkbox":
+            return True
+    return False
+
+
+def _element_name(el) -> str:
+    try:
+        return (el.window_text() or "").strip()
+    except Exception:
+        return ""
+
+
+def _element_rect(el):
+    try:
+        r = el.rectangle()
+        return [int(r.left), int(r.top), int(r.right), int(r.bottom)]
+    except Exception:
+        return None
+
+
+def _element_toggle_state(el) -> Optional[bool]:
+    """True (ticked) / False (clear) / None (the element will not say).
+
+    Three ways of asking, because which one answers depends on how the control is
+    implemented: the Toggle pattern is what WPF and WinForms checkboxes expose, and the
+    legacy IAccessible STATE_SYSTEM_CHECKED bit is what an owner-drawn control that only
+    bridges MSAA has. None is returned when NONE of them answered — never a default of
+    False, which would read as "the box is clear" and let a tick that never happened be
+    committed as one that did."""
+    for getter in (lambda: el.get_toggle_state(),
+                   lambda: el.iface_toggle.CurrentToggleState):
+        try:
+            v = getter()
+        except Exception:
+            continue
+        if v in (0, 1):            # 2 = indeterminate: a real answer, but not one to act on
+            return bool(v)
+    try:
+        leg = el.legacy_properties() or {}
+        if "State" in leg:
+            return bool(int(leg["State"]) & 0x10)   # STATE_SYSTEM_CHECKED
+    except Exception:
+        pass
+    return None
+
+
+# A ticked checkbox is a solid accent-coloured square. Measured on the live build
+# (w2-after.png, field 47): a 14x14 blob of RGB(0,103,192) filling 180 of its 196 pixels,
+# with nothing else on the popup within reach of the test — the next largest blue blob was
+# 9 pixels of text anti-aliasing.
+_TICK_MIN_SIDE = 8       # 100% DPI draws ~14px; below this it is anti-aliasing, not a glyph
+_TICK_MAX_SIDE = 34      # 200% DPI draws ~28px; above this it is a picture, not a checkbox
+_TICK_MIN_FILL = 0.80    # the white tick eats into it, so it is never solid — measured 0.918
+_TICK_MIN_CORNER = 0.5   # a SQUARE fills its corners; a round icon does not — see below
+_TICK_MIN_AREA = 60
+
+
+def _is_tick_blue(p) -> bool:
+    """Strongly blue, the way an accent-coloured fill is — not the way anti-aliased black
+    text on a white background is."""
+    r, g, b = p[0], p[1], p[2]
+    return b > 90 and (b - r) > 55 and (b - g) > 35
+
+
+def _find_tick_glyph(img):
+    """The bounding box of a ticked-checkbox glyph in this image, or None.
+
+    Connected components of accent-blue pixels, kept only if the blob is a FILLED SQUARE of
+    checkbox size. Shape is what separates a tick from the other blue things on a Drake
+    screen, and it has to be more than "roughly square": Drake's toolbar has a 22x22 round
+    blue Help icon, which passes every size and aspect test there is. Measured on real
+    screenshots of both —
+
+        ticked checkbox   fill 0.918   corners 0.67 0.78 0.78 0.89
+        Help icon         fill 0.651   corners 0.24 0.24 0.32 0.32
+
+    — so the discriminator is that a square FILLS ITS CORNERS and a circle does not. The
+    production read only ever grabs the popup's own rectangle, which no toolbar is inside;
+    this is the second line of defence, for the day a grab catches something else."""
+    w, h = img.size
+    px = img.load()
+    seen = set()
+    for y in range(h):
+        for x in range(w):
+            if (x, y) in seen or not _is_tick_blue(px[x, y]):
+                continue
+            stack, comp = [(x, y)], []
+            seen.add((x, y))
+            while stack:
+                cx, cy = stack.pop()
+                comp.append((cx, cy))
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1),
+                               (1, 1), (-1, -1), (1, -1), (-1, 1)):
+                    nx, ny = cx + dx, cy + dy
+                    if (0 <= nx < w and 0 <= ny < h and (nx, ny) not in seen
+                            and _is_tick_blue(px[nx, ny])):
+                        seen.add((nx, ny))
+                        stack.append((nx, ny))
+            if len(comp) < _TICK_MIN_AREA:
+                continue
+            xs = [p[0] for p in comp]
+            ys = [p[1] for p in comp]
+            bw, bh = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+            if not (_TICK_MIN_SIDE <= bw <= _TICK_MAX_SIDE
+                    and _TICK_MIN_SIDE <= bh <= _TICK_MAX_SIDE):
+                continue
+            if not (0.6 <= bw / bh <= 1.7):
+                continue
+            if len(comp) / float(bw * bh) < _TICK_MIN_FILL:
+                continue
+            if not _corners_filled(comp, min(xs), min(ys), bw, bh):
+                continue
+            return [min(xs), min(ys), bw, bh]
+    return None
+
+
+def _corners_filled(comp, x0, y0, bw, bh) -> bool:
+    """Does this blob reach into all four corners of its bounding box?
+
+    True for a square (a checkbox), false for a circle (an icon). The corner cell is a
+    quarter of the shorter side so it scales with DPI, and it is judged at half occupancy
+    rather than fully, because the checkbox's own corners are slightly rounded and the
+    yellow caption highlight blends into them."""
+    pts = set(comp)
+    k = max(2, min(bw, bh) // 4)
+    for cx, cy in ((0, 0), (bw - k, 0), (0, bh - k), (bw - k, bh - k)):
+        hit = sum(1 for j in range(k) for i in range(k)
+                  if (x0 + cx + i, y0 + cy + j) in pts)
+        if hit / float(k * k) < _TICK_MIN_CORNER:
+            return False
+    return True
+
+
+_CHECKBOX_ON = {"x", "1", "y", "yes", "true", "t", "on", "checked", "check", "tick", " ",
+                "{space}"}
+_CHECKBOX_OFF = {"0", "n", "no", "false", "f", "off", "unchecked", "clear", "blank"}
+
+
+def _as_checkbox_desired(value) -> Optional[bool]:
+    """What state does this value ask a checkbox to end up in? True / False / None (not a
+    yes-or-no answer, so the caller must halt rather than guess at a tick)."""
+    s = str(value).strip().lower()
+    if s in _CHECKBOX_ON:
+        return True
+    if s in _CHECKBOX_OFF:
+        return False
+    return None
 
 
 def _escape_keys(text: str) -> str:

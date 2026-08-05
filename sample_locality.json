@@ -1,0 +1,17 @@
+{
+  "_comment": "Box 20 LOCALITY test payload — the 4 state rows and their 4 localities, nothing else. Small on purpose: it proves the one thing that failed on 2026-08-04 (a locality that reported OK and stored nothing) in ~8 fields instead of 78, so it can be re-run cheaply after any change to the resolver.",
+  "_what_each_row_proves": "Each row deliberately arrives in a DIFFERENT shape, because a real W-2's Box 20 is free text printed by an employer, not a code: OH 'COLUMBUS' is already Drake's code; IN 'MARION COUNTY' needs the noise suffix cut and then maps by county NAME to the numeric code '49'; NY 'NYC' is a curated alias for code 'NY'; PA 'Philadelphia' matches the full name in mixed case and resolves to 'PL'. If all four land, every resolution path works.",
+  "_expected": "63 -> COLUMBUS, 70 -> 49, 77 -> NY, 84 -> PL. Anything else is a failure, including a box that ends up EMPTY — that is exactly the silent failure this test exists to catch, so check the four Box 20 boxes on the after-screenshot, not just the run's OK count.",
+
+  "box15_state": "OH",
+  "box20_locality": "COLUMBUS",
+
+  "box15_state_2": "IN",
+  "box20_locality_2": "MARION COUNTY",
+
+  "box15_state_3": "NY",
+  "box20_locality_3": "NYC",
+
+  "box15_state_4": "PA",
+  "box20_locality_4": "Philadelphia"
+}

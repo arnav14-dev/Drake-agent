@@ -12,6 +12,11 @@ venv/
 *.png
 *.log
 
+# Halt diagnostics — rewritten on every halt, and the window topology it captures
+# includes the OPEN RETURN'S TITLE (client name + ID). Fine to read locally, never
+# in git history. Send it by hand when a halt needs diagnosing.
+env-dump-halt.json
+
 # OS / editor
 .DS_Store
 Thumbs.db

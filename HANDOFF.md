@@ -4,7 +4,8 @@ You are picking up a project mid-flight. This file is the orientation: what is b
 what is actually true about the target application, what is finished, what is unverified,
 and where the real blockers are. `README.md` is the engineering reference — this is the map.
 
-Written 2026-08-03, at commit `a885be6`.
+Written 2026-08-03 at commit `a885be6`; updated 2026-08-04, the day a full W-2 went into
+Drake end to end for the first time — 20 of 20 fields (see §6).
 
 ---
 
@@ -50,10 +51,72 @@ live mode also stays locked behind `DRAKE_AUTOMATION_AUTHORIZED`.
 Every line here was established against the live application, usually after a wrong assumption
 cost a run. Treat it as fact and do not re-litigate it without new evidence.
 
-**Drake exposes no programmatic read-back on its data-entry grid.** UI Automation reports 0
-edit controls and 0 readable values; the win32 backend sees only outer frame panels; clipboard
+**THE CANVAS IS READABLE — the founding measurement was taken on the wrong window.**
+CONFIRMED 2026-08-04. "UIA reports 0 edit controls and 0 readable values" was measured
+against the MAIN FRAME (`Drake 2025 Tax Software`). Drake hosts a return's data-entry screen
+in a SEPARATE top-level window, and walking *that* window's UIA tree returns **253 elements
+with real values** — `12-3456789`, `test employer llc`, `Addison`, `52000`. `canvas_windows()`
+finds it; `read_canvas_values()` reads it; `audit_canvas()` compares a finished run against it
+and `write-w2` prints the result as FORM CHECK.
+
+This matters more than any other line in this file. Every gate before it verified what the
+POPUP echoed — which is what we typed, not what Drake kept. See the locality entry below for
+what that difference costs. The next piece of work is a field-number → control map so the
+check can say a value is in the RIGHT box, not merely somewhere on the form; the presence
+test already catches "never landed at all", which is the dangerous case.
+
+**Box 20 locality (63/70/77/84) stores a CODE from Drake's own table, not the name on the
+W-2.** RESOLVED 2026-08-05. For a day this was recorded here as "typing into Box 20 stores
+NOTHING" — the dropdown took the keystrokes, the popup echoed them (`84 Phila Phila`, with
+Drake's own title-casing, indistinguishable from the confirmed dropdown behaviour on
+1/9/34/57), the Enter committed, and the box stayed empty. **The founder caught it by eye
+from a screenshot while the run reported all four OK.**
+
+The field was never the problem. The VALUE was. Drake ships `STATELIB\CITY.HLP`, a plain
+`ST,City Code,City Name` table, and the dropdown stores the *code*: `PA,PL` is Philadelphia,
+`NY,NY` is New York City, `IN,49` is Marion County. We typed `PHILA`, `NYC`, `MARION`. Drake
+matched none of them, selected nothing, and a dropdown with nothing selected saves nothing.
+Every gate was reporting truthfully about what it could see.
+
+`w2_map` now reads that table from the LIVE install and resolves a Box 20 string to its code
+— by code, by exact name, by a tiny curated alias set, or by unique name prefix, in that
+order — and REFUSES on anything ambiguous or unknown rather than guessing, because a
+wrong-but-valid code types cleanly, reads back cleanly, and looks exactly like a right one.
+Only 11 states appear in the table (CA DE IN KY MI MO NY OH OR PA); for any other state the
+list is genuinely empty and the row is reported, never attempted. Confirmed live: OH
+`COLUMBUS`→`COLUMBUS`, IN `MARION COUNTY`→`49`, NY `NYC`→`NY`, PA `Philadelphia`→`PL`, all
+four visible on the form afterwards, and Drake grew an "Ohio" tab in response.
+
+`HAND_ENTRY_FIELDS` is now empty. The mechanism stays for the next such field.
+
+**Some boxes silently CAP their length.** Box 14 descriptions (49/51/53/55) hold 8 characters,
+Box 20 locality 9. Drake simply stops accepting keys, so `UNION DUES` settles as `UNION DU` and
+the settle gate halts rather than commit a truncated value. `max_len` in the map trims to the
+real capacity and every trim is REPORTED in the plan — trimming silently would be the lie.
+A locality CODE is the exception: it is refused rather than trimmed, because cutting a code
+short does not shorten a name, it names a different locality.
+
+**Heads-down arms off an ACTIVE CARET, not window focus.** Ctrl+N is a silent no-op with no
+field active — no popup, no error. A finished run leaves the canvas focused with no caret
+and the popup still on screen, which is exactly the state a second back-to-back run starts
+in: on 2026-08-05 run 1 wrote 78/78 and run 2 halted on field 1 having typed nothing. The
+halt is safe, but consecutive UNATTENDED W-2s do not work without a re-arm step. `{ESC}`
+then `{TAB}` then Ctrl+N recovers it — proven live on the stuck state, keyboard-only, no
+coordinates, and Tab moves between boxes rather than altering one. Deliberately NOT built
+in: the founder prefers to clear the popup by hand and be asked first. Build it when the
+backend starts feeding W-2s unattended.
+
+**Two identical runs produce an identical form.** 2026-08-05, first time this was ever
+tested: the same 78-field payload run twice with no edits between, compared box-by-box off
+the canvas rather than by OK count — 72 non-empty boxes, zero differences. Also confirms the
+checkbox read matters: on run 2 all six boxes arrived already ticked and the driver typed
+NOTHING at them, because `X` toggles and a keystroke would have cleared them.
+
+**Drake exposes no programmatic read-back on its data-entry grid** — TRUE ONLY OF THE MAIN
+FRAME, and superseded by the entry above. On the main frame UI Automation reports 0 edit
+controls and 0 readable values, the win32 backend sees only outer frame panels, and clipboard
 copy returns nothing *and* the Ctrl+A/Ctrl+C chord breaks field focus and pops a modal
-validator. The grid is a custom-painted canvas.
+validator. All of that is still true; it is simply not true of the data-entry window.
 
 **Entry goes through heads-down mode (Ctrl+N).** Drake shows a number next to every field; you
 address a field by typing its number. This is coordinate-free — immune to DPI, resolution and
@@ -70,6 +133,46 @@ auto-fill, auto-advances the caret to Box 1 (field 23), and **swallows the next 
 single eaten chord is what originally made every field number type onto the canvas and every
 value land one box too far down. It is handled generically (re-check popup presence before
 every Ctrl+N, retry with a settle), not with a special case.
+
+**A checkbox field's value stage is not a text box.** CONFIRMED live 2026-08-03 on field 47
+(Box 13 "Retirement plan"): the popup keeps its field-number box and puts a **real checkbox
+widget** beside it, captioned with the field's name. The token flips the tick — but a tick is
+a *glyph*, so the text gates, which require the typed token to appear in the popup's text one
+more time than before, can never be satisfied. That is what halted the first 20-field run
+after 16 clean fields. The X had landed and the box was ticked on screen; the driver was
+right to refuse to commit what it could not read. Checkboxes now go through `_enter_checkbox`,
+which reads the **tick** (UIA Toggle state, or the accent-blue glyph on screen) instead of
+counting characters. See §6 for what is still unverified about it.
+
+**A jump can land LATE, and a late jump is not a refusal.** Committing a field can fire
+Drake's own work — an employer-database lookup, a ZIP validation — which blocks its UI thread,
+so the popup sits on the field-number prompt for a while and *then* moves to the value prompt.
+Nothing distinguishes that from a silently declined number except waiting long enough. At a
+2.5s budget the live run of 2026-08-04 called field 14 refused and stopped, while the
+screenshot taken moments later showed the popup already sitting on field 14's value box. The
+budget is now `navigation.headsdown_jump_timeout` (default 8s) and is a **busy** budget, not a
+refusal test: it costs nothing on a healthy field, because the loop returns the instant the
+prompt moves. The halt message reports the observation, not the conclusion.
+
+**Drake rewrites values after you commit them.** Field 8 (employer city) was entered as
+`DALLAS`, read back as `dallas` at commit, and the after-screenshot shows **`Addison`** — the
+USPS city for the ZIP we entered in field 10 (75001 is Addison, TX). Drake validated the ZIP
+and corrected the city. That is Drake being *right*, and our sample data being internally
+inconsistent — but it is proof of a general rule: **a verified commit is not a permanent
+value.** No read-back can catch this, because the canvas exposes nothing; the after-screenshot
+is the only check there is, which is why every run takes one and why the run tells you to look
+at it.
+
+**Drake nests its screens, and the frames behind get `WS_DISABLED`.** Opening a return's
+data-entry screen creates a NEW top-level window (a fresh hwnd each time) and puts the disabled
+bit on the main frame behind it. That is Drake at rest, not a modal — but it is bit-identical
+to one, and the structural gate read it as *"main frame DISABLED by a modal — window not
+identified"* and refused to type a single character (live, 2026-08-04: both commands halted at
+the first gate, the screenshot at the halt showed a clean W-2 screen with no dialog anywhere,
+and every window in the process was already in the baseline). The gate now records the frame's
+disabled bit **at attach** alongside the baseline hwnds: inherited modality is furniture, the
+same rule that keeps the chat overlay from halting runs. A modal that arrives LATER still
+disables the frame and is still caught.
 
 **The heads-down popup owns NO child windows.** `EnumChildWindows` returns `[]` and
 `GetGUIThreadInfo().hwndFocus` **is the popup itself**. Drake paints the input box onto the
@@ -122,16 +225,32 @@ A green suite has been actively misleading **three times** on this project, so t
 higher than usual.
 
 ```
-python simulate_headsdown.py     # 41 cases, ~90 seconds, runs anywhere (no Windows needed)
-python mutants.py                # 23 mutants, ~20 minutes — breaks each guard, suite must go red
+python simulate_headsdown.py            # 61 cases, ~9 min on the laptop, runs anywhere
+python simulate_headsdown.py checkbox   # one family, ~1 min — what you use while iterating
+python mutants.py checkbox              # the 8 checkbox guards, ~15 min
+python mutants.py                       # all 31 guards. HOURS at 9 min a suite — plan for it
 ```
+
+Both harnesses take a substring filter, and they are worth using: the full suite is minutes,
+not the "90 seconds" an earlier version of this file claimed, and the full mutation run is
+`31 x suite`. Each checkbox mutant runs only the checkbox family; running *fewer* cases can
+only turn a kill into a reported GAP, never a survivor into a false kill, so the shortcut
+cannot flatter a guard. A filter that matches nothing exits 1 rather than reporting a pass on
+an empty run.
 
 `simulate_headsdown.py` fakes **Drake**, not pywinauto: the driver's real decision code runs,
 only the Windows primitives are replaced. `mutants.py` edits each safety guard *in the source*,
 in an isolated copy, and requires the suite to fail. **A guard whose mutant survives has no
-test, whatever the suite says.** Two mutants are documented in that file as deliberately not
-gaps (one equivalent mutant, one message-only difference) — read the comments before adding
-them back.
+test, whatever the suite says.** Three mutants are documented in that file as deliberately not
+gaps (one equivalent mutant, one message-only difference, one channel semantic the simulator
+replaces at the boundary) — read the comments before adding them back.
+
+Worth knowing what a *real* gap looks like, because both of the ones found while writing the
+checkbox path passed a plausible-looking test first. The untick guard had no case at all until
+one was written for it. The convergence guard had a case that looked right — one flickering
+frame right after the token — and the mutant **survived** it, because the re-prove step just
+before the Enter caught that particular lie on its own. Only a channel that jitters on *every
+other read*, arrival included, actually needs the two-agreeing-readings rule.
 
 The recurring failure mode to watch for: **a fake that is more generous than the real thing
 hides exactly the bugs it exists to catch.**
@@ -145,27 +264,59 @@ hides exactly the bugs it exists to catch.**
 - An assertion once checked `fake.log` for `"ENTER"`, but the persistent model logs what an
   Enter *did*, never the key itself, so it passed whether or not one had been sent. **A test
   that cannot fail is worse than no test.**
+- The checkbox fake renders the field's caption and *never* the token, and its pixel channel
+  returns `True` or `None` but never `False` — because the real one cannot tell an unticked
+  checkbox from a text box. A fake that answered `False` there would make an untick look
+  verifiable when it is not.
+
+**Run the suite at a console, or with output redirected — both now work.** Five cases used to
+fail only when stdout was a file: Windows gives a redirected stream the ANSI codepage, so
+printing `⚠` raised `UnicodeEncodeError`, which `headsdown_type`'s outer handler reported as a
+HALT with a charmap error in place of the real reason. That would have done the same to a real
+run logged to a file. Fixed in `_say()` and `_utf8_console()`; keep it that way.
 
 ## 6. Where it stands
 
-**Working and verified offline (41/41 cases, 23/23 mutants killed):** the full entry state
+**Working and verified offline (61/61 cases; the 8 checkbox guards all mutation-killed):** the full entry state
 machine — popup discovery by handle, structural identification of the typing box, painted-popup
 reads through UIA/OCR, token-run counting against a per-channel baseline, silent-refusal
 detection, commit proof, the structural dialog gate (which stops the always-present "Drake
-Software Chat" overlay from halting runs), and named-button dismissal of Drake's e-file
-completeness warning.
+Software Chat" overlay from halting runs), named-button dismissal of Drake's e-file
+completeness warning, and the checkbox path (tick read back off the widget, token escalation
+verified between tokens, build-drift guard both ways).
 
-**Verified on the live machine:** `probe-popup` passes; the popup opens, is found, and is
-readable via UIA.
-
-**The immediate next step** — this had not been run when the handoff was written:
+**A FULL W-2 HAS NOW BEEN ENTERED END TO END ON THE LIVE MACHINE — 2026-08-04, 20 of 20
+fields, verified box by box against the after-screenshot.** No cascade, no error dialog, no
+mis-entry. This is the thing that had never happened.
 
 ```
-git pull
+1 TS=T   5 employer name  7 street  8 city  9 state=TX  10 ZIP  14/15 employee name
+23 wages  24 fed W/H  25 SS wages  26 SS W/H  27 Medicare wages  28 Medicare W/H
+34 box12a code=D  35 box12a amount  47 Box 13 retirement plan (TICKED)
+57 state=TX  58 state ID  59 state wages
+```
+
+Settled by that run, each previously an unknown:
+
+- **The persistent command-bar protocol holds for a whole run.**
+- **Dropdowns take a typed code.** 1, 9, 34 and 57 all read back as the code *and* the entry
+  Drake selected (`T T`, `TX TX`, `D D`). `w2_map.DROPDOWNS_CONFIRMED` records which.
+- **The checkbox path works live**: `checkbox ticked — confirmed via uia+pixel`. Both
+  channels independently agreed — the accessibility Toggle state *and* the glyph on screen.
+- **`X` TOGGLES, it does not set** (`probe-checkbox`, measured). Sending it at an already-ticked
+  box would CLEAR it. The entry path types nothing when the box already holds the wanted state,
+  which is the only reason this run is not silently wrong.
+
+**The run to repeat:**
+
+```
+python agent.py probe-checkbox --binding binding.json --field 47   # once, per build
 python agent.py write-w2 --binding binding.json --json sample_w2.json --skip-field 4 --ts T
 ```
 
-`--skip-field 4` leaves the employer EIN alone, at the founder's explicit instruction.
+`--skip-field 4` leaves the employer EIN alone, at the founder's explicit instruction. Both
+commands leave the heads-down popup open — press **Esc** in Drake between runs, or the next
+one refuses to start (correctly: an inherited popup's state is unknown).
 
 ### Where we are lagging — the honest list
 
@@ -174,16 +325,16 @@ this may touch a real client return. It is the single thing standing between a w
 and a usable product, and no amount of code fixes it. The parallel track is CCH Axcess, which
 has a real API and needs a partner conversation.
 
-**A full W-2 has never been entered end-to-end on the live machine.** Every live run so far has
-halted on field 1 or earlier. Each halt has been a genuine driver bug, found and fixed — but
-the sequence past field 1 is still unproven against real Drake.
+**A full W-2 has now been entered end to end (2026-08-04, 20/20).** What is still unproven is
+REPETITION and BREADTH: one clean run on one test return with one employer is not the same as
+a reliable adapter. Nothing here has been run twice in a row without a code change in between.
 
 **Unconfirmed on this build, flagged at runtime rather than assumed:**
-- **Dropdown fields** (1, 9, 34, 57 and others in `w2_map.DROPDOWN_FIELDS`) — typing the code
-  usually selects the entry, but this is untested. **Field 1 is a dropdown**, so it is the next
-  thing likely to speak up.
-- **The checkbox token `X`** for Box 13 (fields 46/47/48). `1` works on some builds. False is
-  never entered at all, rather than risk clearing a human's tick.
+- **The dropdowns past 57**: the rest of `w2_map.DROPDOWN_FIELDS` (63/64/70/71/77/78/84 and the
+  box-12 codes 37/40/43). Typing the code is confirmed on 1, 9, 34 and 57, so these are likely
+  fine — but likely is not confirmed.
+- **Multiple W-2s, and any employer whose EIN is NOT skipped.** Every live run so far has used
+  `--skip-field 4`; the EIN auto-fill path is handled in code and proven offline, never live.
 - Fields mapped but never actually entered: box 14, box 12 years, state rows 2-4.
 - Whether Drake's numeric boxes accept `.` and `-` as typed.
 

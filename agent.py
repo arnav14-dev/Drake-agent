@@ -30,6 +30,12 @@ Modes (run in this order the first time):
   probe-popup READ-ONLY: dump the "Heads Down Data Entry" popup's real control tree + test
              a number round-trip + report whether it closes after Enter. Run ONCE first to
              lock in the exact edit control the driver binds to. Writes no field value.
+  probe-checkbox
+             Calibration for a Box 13 CHECKBOX field (46/47/48), whose value stage is a tick
+             box rather than a text box: reports whether the tick is readable (accessibility
+             Toggle state and/or the on-screen glyph), what state the box arrives in, and
+             which token flips it. Ticks and unticks to measure, then leaves with Esc —
+             never presses Enter, so nothing is committed.
   envdump    READ-ONLY: write the Drake process's full window topology to JSON — every
              top-level window (class/style/owner/enabled/visible + children), where the
              keyboard would land, and the structural dialog gate's verdict per window.
@@ -350,17 +356,26 @@ def _headsdown_run(driver, entries, *, method, settle_after=0.0):
     skipped: with field 4 out of the batch, a popup that vanishes after a value no longer
     means "the known EIN auto-advance" — it means some OTHER field auto-advanced, which is
     now the single most interesting anomaly the run can surface."""
+    import time
     driver.begin_batch()  # a popup inherited from a previous run is foreign, not ours
     rows = []
     halted, reason = False, None
     for e in entries:
         num, val = str(e["field_no"]), str(e["value"])
-        res = driver.headsdown_type(num, val, method=method, settle_after=settle_after)
-        rows.append({"num": num, "val": val, "label": e.get("label", ""),
+        # `kind` travels with the entry so the driver knows a Box 13 tick box from a money
+        # box BEFORE it types. --seq entries carry no kind; there the driver asks the popup.
+        t0 = time.time()
+        res = driver.headsdown_type(num, val, method=method, settle_after=settle_after,
+                                    kind=e.get("kind"))
+        # Per-field wall clock. "It feels slow" is not something you can optimise; a column
+        # of seconds tells you WHICH field and therefore which gate is costing the time.
+        secs = time.time() - t0
+        rows.append({"secs": secs,
+                     "num": num, "val": val, "label": e.get("label", ""),
                      "ok": bool(res.get("ok")), "reason": res.get("reason"),
                      "model": res.get("model"), "committed": res.get("value_committed"),
                      "evidence": res.get("commit_evidence"), "read_back": res.get("read_back"),
-                     "attempts": res.get("popup_attempts"),
+                     "attempts": res.get("popup_attempts"), "checkbox": res.get("checkbox"),
                      "popup_after": res.get("popup_after_value")})
         if not res.get("ok"):
             halted, reason = True, res.get("reason")
@@ -394,7 +409,8 @@ def _print_seq_outcome(rows, halted, reason, plan=None) -> int:
             extra = f"   (read back {r['read_back']!r})" if r.get("read_back") else ""
         else:
             extra = f"   <-- {r['reason']}"
-        print(f"  [{mark}] field {r['num']:<3}{name:<34} = {r['val']!r}{extra}")
+        secs = f"{r['secs']:5.1f}s " if r.get("secs") is not None else ""
+        print(f"  [{mark}] {secs}field {r['num']:<3}{name:<34} = {r['val']!r}{extra}")
 
     models = {r["model"] for r in rows if r["model"]}
     if models:
@@ -415,6 +431,29 @@ def _print_seq_outcome(rows, halted, reason, plan=None) -> int:
         print(f"NOTE: Ctrl+N had to be retried on field(s) {', '.join(swallowed)} — Drake was "
               f"busy committing. Recovered; informational.")
 
+    # Checkbox fields are the one place a value is proven by reading a WIDGET rather than
+    # text, so say which channel proved it and which token this build actually takes —
+    # that is the line to copy into binding.json after the first successful run.
+    checks = [r for r in rows if r.get("checkbox")]
+    if checks:
+        for r in checks:
+            cb = r["checkbox"]
+            tok = cb.get("tokens_tried") or []
+            how = (f"token {tok[-1]!r}" if tok else "no keystroke needed (already in state)")
+            print(f"NOTE: field {r['num']} checkbox -> "
+                  f"{'ticked' if cb.get('desired') else 'cleared'} via {how}, confirmed by "
+                  f"{cb.get('verified_by')}"
+                  f"{'; arrived already ' + ('ticked' if cb.get('arrival') else 'clear') if cb.get('arrival') is not None else ''}.")
+        pixel_only = [r["num"] for r in checks if r["checkbox"].get("verified_by") == "pixel"]
+        if pixel_only:
+            print(f"      field(s) {', '.join(pixel_only)} were confirmed by the SCREEN GLYPH "
+                  f"only (Drake exposed no checkbox to accessibility) — the tick was seen, "
+                  f"but check those boxes on the screenshot.")
+        multi = sorted({tuple(r["checkbox"].get("tokens_tried") or []) for r in checks})
+        if any(len(t) > 1 for t in multi):
+            print(f"      more than one token was needed — pin the one that worked in "
+                  f"binding.json as navigation.headsdown_checkbox_true to save the retries.")
+
     if halted:
         print(f"\nSTOP — human needed. The batch halted BEFORE mis-entering: {reason}")
         print("Nothing was committed past the failure. Review Drake, then we adjust.")
@@ -434,6 +473,9 @@ def _print_seq_outcome(rows, halted, reason, plan=None) -> int:
               f"{', '.join(str(e['field_no']) for e in held)}")
     for e in not_here:
         print(f"NOT ENTERED — {e['key']} has no box on this screen: {e['why']}")
+    for e in (plan or {}).get("hand_entry", []):
+        print(f"BY HAND — field {e['field_no']} {e['label']}: {e['value']!r} was NOT typed. "
+              f"{e['why']}")
     if rejected:
         print(f"\n{len(rejected)} field(s) were REJECTED and are STILL BLANK in Drake — "
               f"enter them by hand:")
@@ -585,6 +627,31 @@ def cmd_write_w2(args) -> int:
                                           method=args.toggle_method,
                                           settle_after=args.settle_after)
     code = _print_seq_outcome(rows, halted, reason, plan=plan)
+
+    # THE FORM-LEVEL CHECK. Everything above verifies what the POPUP showed, which is what
+    # we typed — and that is not the same as what Drake KEPT. Live proof (2026-08-04):
+    # 'DALLAS' typed into an empty Box 20 locality dropdown echoed back in the popup, took
+    # the Enter, and left the box on the form empty. Four fields reported OK and wrote
+    # nothing. So the last thing a run does is read the canvas back and say which planned
+    # values are not on it.
+    entered = [r for r in rows if r["ok"]]
+    audit = driver.audit_canvas([e for e in plan["entries"]
+                                 if str(e["field_no"]) in {r["num"] for r in entered}])
+    print()
+    if audit.get("canvas_elements"):
+        if audit["ok"]:
+            print(f"FORM CHECK: all {audit['checked']} entered value(s) are readable on the "
+                  f"data-entry form ({audit['canvas_elements']} controls read).")
+        else:
+            print(f"FORM CHECK — {len(audit['missing'])} value(s) reported entered are NOT on "
+                  f"the form. Drake took the keystrokes and kept nothing:")
+            for e in audit["missing"]:
+                print(f"    field {e['field_no']:<4} {e['label']:<32} = {e['value']!r}")
+            print("    A dropdown with no matching entry does this: it accepts the typing,")
+            print("    echoes it in the popup, and stores nothing. Enter these by hand.")
+            code = max(code, 3)
+    else:
+        print(f"FORM CHECK: unavailable — {audit.get('reason')}")
     s = driver.save_screenshot(args.shot)
     print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
     print("\nVERIFY THE SCREENSHOT before doing anything else in Drake. This agent has no")
@@ -650,6 +717,66 @@ def cmd_probe_popup(args) -> int:
               "next field number will be committed as a value. (The entry driver will "
               "refuse to start in that state rather than mis-enter.)")
     return 0 if res.get("ok") else 2
+
+
+def cmd_probe_checkbox(args) -> int:
+    """Calibration probe for a CHECKBOX field (Box 13: 46/47/48).
+
+    Drake's heads-down popup does NOT give a checkbox field a text box — it shows the tick
+    box itself, so entry has to read the WIDGET, not the typed character. This probe reports
+    what this build actually exposes (accessibility Toggle state, the on-screen glyph, or
+    neither), what state the box arrives in, and which token flips it. It ticks and unticks
+    to measure that, then leaves with Esc — it never presses Enter, so nothing is committed.
+    Verify the box by eye afterwards regardless."""
+    import time
+    driver = DrakeDriver(load_binding(args.binding))
+    driver.connect()
+    wi = driver.window_info()
+    print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
+    print(f"win32 popup connection: {'OK' if driver.w32 is not None else 'FAILED'}")
+    print(f"tokens to try: {driver.checkbox_tokens}   channels: {driver.checkbox_channels}")
+    print("\nOpen the W-2 screen, CLICK into any field so its cursor is blinking, then hands off.")
+    print("Probing in ", end="", flush=True)
+    for n in range(max(1, args.delay), 0, -1):
+        print(f"{n}… ", end="", flush=True)
+        time.sleep(1)
+    print()
+    res = driver.probe_checkbox_field(field_no=args.field_no, flip=not args.no_flip)
+    print("\n===== CHECKBOX FIELD PROBE =====")
+    print(json.dumps(res, indent=2, default=str))
+    print("================================")
+    if not res.get("ok"):
+        print(f"\n⚠ {res.get('reason')}")
+        return 2
+    print(f"\nfield:            {res.get('field_no')}   (value prompt: {res.get('prompt_at_value')!r})")
+    print(f"UIA checkboxes:   {res.get('uia_channel')}")
+    for el in (res.get("uia_checkboxes") or []):
+        print(f"    {el.get('name')!r}  state={el.get('state')}  rect={el.get('rect')}")
+    print(f"screen glyph:     {'a ticked box is visible' if res.get('pixel_tick_visible') else 'no tick visible'}"
+          f"{'  [' + str(res.get('pixel_error'))[:70] + ']' if res.get('pixel_error') else ''}")
+    a = res.get("arrival_state") or {}
+    print(f"arrival state:    {'ticked' if a.get('ticked') else 'clear'} "
+          f"(read={a.get('read')}, via {a.get('channel')})")
+    if a.get("ticked"):
+        print("    ^ Drake arrives with this box ALREADY TICKED. Entry types nothing in that "
+              "state — a token there would clear it.")
+    for t in (res.get("token_trials") or []) if isinstance(res.get("token_trials"), list) else []:
+        print(f"    token {t['token']!r:<10} {'FLIPPED it' if t['flipped'] else 'did nothing'} "
+              f"(state after: {t['state_after']}, via {t['channel']})")
+    if res.get("token_that_worked"):
+        print(f"token to use:     {res['token_that_worked']!r}  ({res.get('token_behaviour')})")
+        print(f"    put it in binding.json as navigation.headsdown_checkbox_true")
+        r = res.get("restored") or {}
+        if not r.get("ok"):
+            print("    ⚠ the box was NOT restored to how it was found — it is showing a "
+                  "PENDING state. Esc was sent and nothing was committed, but LOOK at box 13 "
+                  "in Drake before doing anything else.")
+    print(f"\nverdict:          {res.get('verdict')}")
+    dis = res.get("disarm") or {}
+    print(f"disarm:           {dis.get('note')}")
+    if res.get("popup_open_after_disarm"):
+        print("\n⚠ Drake is STILL ARMED — press Esc in Drake before the next run.")
+    return 0
 
 
 def cmd_envdump(args) -> int:
@@ -808,7 +935,24 @@ def _set_dpi_aware() -> None:
         pass
 
 
+def _utf8_console() -> None:
+    """Make this process's output UTF-8, replacing anything the console cannot spell.
+
+    Windows gives a REDIRECTED stdout the legacy ANSI codepage, so `agent.py write-w2 …
+    > run.log` — keeping the audit artifact, i.e. the normal thing to do with a run you
+    care about — turns every '⚠' in a message into a UnicodeEncodeError. Inside the entry
+    loop that surfaces as a HALT with a charmap error in place of the real reason, on a
+    field that entered perfectly. errors='replace' so a missing glyph costs a '?' and
+    never a run."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main() -> int:
+    _utf8_console()
     _set_dpi_aware()
     p = argparse.ArgumentParser(description="Fynn Drake agent (pywinauto). Never files.")
     # --binding lives on a shared parent so it works AFTER the subcommand too,
@@ -823,6 +967,7 @@ def main() -> int:
     stt = sub.add_parser("typetest", parents=[common]); stt.add_argument("--text", default="52000", help="value to type into the field you click; a COMMA-separated list cascades through fields (e.g. 11111,22222,33333)"); stt.add_argument("--click-xy", dest="click_xy", help="AGENT clicks this window-relative x,y first (e.g. 420,180), then types — diagnoses whether the programmatic click lands"); stt.add_argument("--advance", default="", help="key pressed between values when --text is a list, e.g. ENTER (default) or TAB"); stt.add_argument("--delay", type=int, default=15, help="seconds to click into a Drake field before typing fires"); stt.add_argument("--shot", help="save a screenshot here after typing"); stt.add_argument("--unicode", action="store_true", help="force the modern Unicode-packet keystroke method (default is legacy scancode/VK, which Drake needs)"); stt.set_defaults(func=cmd_typetest)
     shd = sub.add_parser("headsdown", parents=[common]); shd.add_argument("--screen", default="W2", help="Drake screen code to open by keyboard, e.g. W2"); shd.add_argument("--field", action="append", metavar="N=VALUE", help="one field to enter, repeatable — the comma-safe alternative to --seq (e.g. --field '5=ACME, INC')"); shd.add_argument("--allow-unconfirmed", dest="allow_unconfirmed", action="store_true", help="permit W-2 field numbers above the highest confirmed one (87)"); shd.add_argument("--allow-protected", dest="allow_protected", action="store_true", help="permit the protected W-2 header fields 1/2/3 and the EIN (4)"); shd.add_argument("--seq", help='comma list of fieldNo=value to type BY NUMBER, e.g. "5=TEST EMPLOYER,23=52000,24=6000" (numbers are Drake heads-down field numbers — see w2_map.W2_FIELD_MAP; a value containing a comma needs --field)'); shd.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected: scancode (low-level hardware keys, default/best for Drake), vkhold (pywinauto Ctrl-held), pywinauto (high-level ^n)"); shd.add_argument("--shot", default="heads.png", help="screenshot after toggling/typing (read the field numbers off it)"); shd.add_argument("--settle", type=float, default=0.6, help="seconds to wait after open and after Ctrl+N"); shd.add_argument("--manual", action="store_true", help="YOU click a field first (active caret), then the agent drives heads-down by number — the confirmed-working bootstrap"); shd.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before entry fires, in --manual mode"); shd.set_defaults(func=cmd_headsdown)
     spp = sub.add_parser("probe-popup", parents=[common]); spp.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the probe runs"); spp.add_argument("--probe-field", dest="probe_field", default="6", help="which field number the probe jumps to. Default 6 (employer 'Name cont.' — normally empty and inert). NEVER use 4: it is the EIN, it auto-fills, and it is the do-not-touch box"); spp.set_defaults(func=cmd_probe_popup)
+    spc = sub.add_parser("probe-checkbox", parents=[common]); spc.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the probe runs"); spc.add_argument("--field", dest="field_no", default="47", help="which CHECKBOX field to probe. Default 47 (Box 13 retirement plan); 46 statutory employee, 48 sick pay"); spc.add_argument("--no-flip", dest="no_flip", action="store_true", help="observe only — read the arrival state and leave without sending any token"); spc.set_defaults(func=cmd_probe_checkbox)
     sw2 = sub.add_parser("write-w2", parents=[common]); sw2.add_argument("--json", required=True, help="extracted W-2 JSON (the LLM's structured output — see w2_map.W2_SCHEMA_KEYS)"); sw2.add_argument("--dry-run", action="store_true", help="resolve and PRINT the plan without touching Drake — run this first, works anywhere"); sw2.add_argument("--skip-field", dest="skip_field", type=int, action="append", metavar="N", help="do NOT enter this field number, even if the extraction has a value for it; repeatable. Use --skip-field 4 to leave the employer EIN alone (it also avoids Drake's auto-fill + auto-advance)"); sw2.add_argument("--ts", choices=["T", "S"], help="whose W-2 this is (field 1). Drake defaults to T; on a JOINT return an unset TS files the spouse's W-2 under the taxpayer"); sw2.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="proceed even if some extracted values could not be resolved (they stay blank in Drake for you to key by hand)"); sw2.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero (default: skip — a blank box is zero on a tax form)"); sw2.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); sw2.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field (auto-fill/validation)"); sw2.add_argument("--delay", type=int, default=10, help="seconds to click into the W-2 screen before entry fires"); sw2.add_argument("--shot", default="w2-after.png", help="screenshot saved after the run — the verification artifact"); sw2.set_defaults(func=cmd_write_w2)
     sev = sub.add_parser("envdump", parents=[common]); sev.add_argument("--out", default="env-dump.json", help="where to write the window-topology JSON"); sev.add_argument("--delay", type=int, default=0, help="seconds before capture — time to click a field / open heads-down first"); sev.set_defaults(func=cmd_envdump)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)

@@ -24,6 +24,9 @@ which is why the whole plan can be reviewed with `--dry-run` on any machine.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 # Fields that exist on the screen but must NEVER be written by this map:
 #   FOREIGN_ONLY  render only under a foreign address; 11 and 20 are "<Click to Access>"
 #                 sub-screens, not edit boxes at all.
@@ -122,6 +125,18 @@ W2_FIELD_MAP = {
                                 "confirm": True},
     "box13_retirement":        {"field_no": 47, "kind": "checkbox", "label": "Box 13 retirement plan",
                                 "confirm": True},
+    # --- bottom-of-screen flags (85/86/87) -------------------------------------
+    # Read off the live screen 2026-08-04 and legible without ambiguity. They are Drake
+    # bookkeeping flags rather than W-2 boxes, and each one MEANS something on the return,
+    # so all three carry confirm=True: a stray tick on "Corrected W-2" is a claim about the
+    # document, not a typo. FALSE is never entered (see _clean_checkbox), so an extractor
+    # that says nothing about them leaves them exactly as the preparer left them.
+    "w2_altered_handwritten":  {"field_no": 85, "kind": "checkbox", "confirm": True,
+                                "label": "W-2 altered or handwritten (nonstandard)"},
+    "w2_corrected":            {"field_no": 86, "kind": "checkbox", "confirm": True,
+                                "label": "Corrected W-2"},
+    "w2_do_not_update":        {"field_no": 87, "kind": "checkbox", "confirm": True,
+                                "label": "Do not update to next year"},
     "box13_third_party_sick":  {"field_no": 48, "kind": "checkbox", "label": "Box 13 third-party sick pay",
                                 "confirm": True},
     # --- box 14 "Other" (4 rows x 2 columns: 49/50, 51/52, 53/54, 55/56) -------
@@ -130,19 +145,19 @@ W2_FIELD_MAP = {
     # the screen layout, NOT confirmed by entry. Every one carries confirm=True and
     # build_plan emits a loud warning. Verify the first one you enter by eye.
     "box14_1_desc":            {"field_no": 49, "kind": "text",     "label": "Box 14 line 1 description",
-                                "confirm": True},
+                                "confirm": True, "max_len": 8},
     "box14_1_amount":          {"field_no": 50, "kind": "money",    "label": "Box 14 line 1 amount",
                                 "confirm": True},
     "box14_2_desc":            {"field_no": 51, "kind": "text",     "label": "Box 14 line 2 description",
-                                "confirm": True},
+                                "confirm": True, "max_len": 8},
     "box14_2_amount":          {"field_no": 52, "kind": "money",    "label": "Box 14 line 2 amount",
                                 "confirm": True},
     "box14_3_desc":            {"field_no": 53, "kind": "text",     "label": "Box 14 line 3 description",
-                                "confirm": True},
+                                "confirm": True, "max_len": 8},
     "box14_3_amount":          {"field_no": 54, "kind": "money",    "label": "Box 14 line 3 amount",
                                 "confirm": True},
     "box14_4_desc":            {"field_no": 55, "kind": "text",     "label": "Box 14 line 4 description",
-                                "confirm": True},
+                                "confirm": True, "max_len": 8},
     "box14_4_amount":          {"field_no": 56, "kind": "money",    "label": "Box 14 line 4 amount",
                                 "confirm": True},
     # --- boxes 15-20, state/local (4 rows of 7: 57-63, 64-70, 71-77, 78-84) ----
@@ -154,28 +169,28 @@ W2_FIELD_MAP = {
     "box17_state_wh":          {"field_no": 60, "kind": "money",    "label": "Box 17 state income tax"},
     "box18_local_wages":       {"field_no": 61, "kind": "money",    "label": "Box 18 local wages"},
     "box19_local_wh":          {"field_no": 62, "kind": "money",    "label": "Box 19 local income tax"},
-    "box20_locality":          {"field_no": 63, "kind": "text",     "label": "Box 20 locality name"},
+    "box20_locality":          {"field_no": 63, "kind": "text",     "label": "Box 20 locality name", "max_len": 9},
     "box15_state_2":           {"field_no": 64, "kind": "state",    "label": "Box 15 state (row 2)"},
     "box15_state_id_2":        {"field_no": 65, "kind": "text",     "label": "Box 15 state ID (row 2)"},
     "box16_state_wages_2":     {"field_no": 66, "kind": "money",    "label": "Box 16 state wages (row 2)"},
     "box17_state_wh_2":        {"field_no": 67, "kind": "money",    "label": "Box 17 state tax (row 2)"},
     "box18_local_wages_2":     {"field_no": 68, "kind": "money",    "label": "Box 18 local wages (row 2)"},
     "box19_local_wh_2":        {"field_no": 69, "kind": "money",    "label": "Box 19 local tax (row 2)"},
-    "box20_locality_2":        {"field_no": 70, "kind": "text",     "label": "Box 20 locality (row 2)"},
+    "box20_locality_2":        {"field_no": 70, "kind": "text",     "label": "Box 20 locality (row 2)", "max_len": 9},
     "box15_state_3":           {"field_no": 71, "kind": "state",    "label": "Box 15 state (row 3)"},
     "box15_state_id_3":        {"field_no": 72, "kind": "text",     "label": "Box 15 state ID (row 3)"},
     "box16_state_wages_3":     {"field_no": 73, "kind": "money",    "label": "Box 16 state wages (row 3)"},
     "box17_state_wh_3":        {"field_no": 74, "kind": "money",    "label": "Box 17 state tax (row 3)"},
     "box18_local_wages_3":     {"field_no": 75, "kind": "money",    "label": "Box 18 local wages (row 3)"},
     "box19_local_wh_3":        {"field_no": 76, "kind": "money",    "label": "Box 19 local tax (row 3)"},
-    "box20_locality_3":        {"field_no": 77, "kind": "text",     "label": "Box 20 locality (row 3)"},
+    "box20_locality_3":        {"field_no": 77, "kind": "text",     "label": "Box 20 locality (row 3)", "max_len": 9},
     "box15_state_4":           {"field_no": 78, "kind": "state",    "label": "Box 15 state (row 4)"},
     "box15_state_id_4":        {"field_no": 79, "kind": "text",     "label": "Box 15 state ID (row 4)"},
     "box16_state_wages_4":     {"field_no": 80, "kind": "money",    "label": "Box 16 state wages (row 4)"},
     "box17_state_wh_4":        {"field_no": 81, "kind": "money",    "label": "Box 17 state tax (row 4)"},
     "box18_local_wages_4":     {"field_no": 82, "kind": "money",    "label": "Box 18 local wages (row 4)"},
     "box19_local_wh_4":        {"field_no": 83, "kind": "money",    "label": "Box 19 local tax (row 4)"},
-    "box20_locality_4":        {"field_no": 84, "kind": "text",     "label": "Box 20 locality (row 4)"},
+    "box20_locality_4":        {"field_no": 84, "kind": "text",     "label": "Box 20 locality (row 4)", "max_len": 9},
 }
 
 # The exact key set the LLM extractor may emit. Includes the keys that have no box here, so
@@ -183,9 +198,66 @@ W2_FIELD_MAP = {
 W2_SCHEMA_KEYS = tuple(W2_FIELD_MAP.keys()) + tuple(NOT_ON_THIS_SCREEN)
 
 # Fields whose number is a dropdown/selection on Drake's screen rather than a free-text box.
-# Typing the code usually selects it, but this has NOT been confirmed on this build — the
-# plan flags them so a human looks at those boxes first.
 DROPDOWN_FIELDS = {1, 9, 18, 34, 37, 40, 43, 57, 63, 64, 70, 71, 77, 78, 84}
+
+# Dropdowns CONFIRMED to take a typed code on this build — live run 2026-08-03, which read
+# each of them back as the code plus the entry Drake selected ('T T', 'TX TX', 'D D'). They
+# are still worth a human's eye on a NEW build, but they are no longer unknowns, and saying
+# so keeps the plan's warnings pointed at what actually is one. 57 joined them on the
+# 2026-08-04 end-to-end run ('57 TX TX').
+DROPDOWNS_CONFIRMED = {1, 9, 34, 57}
+
+# Fields whose typed value is CONFIRMED not to stick on this build, whatever is typed.
+# Empty on purpose: Box 20 locality (63/70/77/84) lived here until 2026-08-05, when the
+# cause turned out to be the VALUE and not the field — see the locality section below.
+# The mechanism stays because the next such field will want it.
+HAND_ENTRY_FIELDS: dict[int, str] = {}
+
+# --- Box 20 locality --------------------------------------------------------------------
+# Box 20 is not a free-text box and never was. It is a dropdown whose entries come from
+# Drake's OWN lookup table — STATELIB\CITY.HLP, three columns, "ST,City Code,City Name" —
+# and the value Drake stores is the CODE, not the name printed on the W-2.
+#
+# That is the entire reason four locality fields reported OK and wrote nothing on
+# 2026-08-04. We typed 'PHILA', 'NYC' and 'MARION'. The codes are 'PL', 'NY' and '49'.
+# Drake matched none of them, selected nothing, and a dropdown with nothing selected
+# stores nothing — while the heads-down popup still echoed the characters back, which is
+# why the per-field gate passed. The gate was right about what it could see; the value
+# was wrong. Nothing about the gate is relaxed here — the entry is now simply correct.
+#
+# Only 11 states appear in the table at all (CA DE IN KY MI MO NY OH OR PA). For any other
+# state the list is genuinely EMPTY: no local income tax Drake tracks, no code to select,
+# nothing a human could pick either. Those rows are reported, never attempted.
+#
+# The table is read from the LIVE install, so it tracks Drake's updates instead of drifting
+# against a copy. If it cannot be found, resolution is disabled and every locality is handed
+# to a human WITH that reason — it never falls back to typing an unvalidated string.
+
+# locality field -> the payload key holding the Box 15 state on the SAME row. The list is
+# per-state, so a locality means nothing without knowing which row's state it belongs to.
+LOCALITY_FIELDS = {63: "box15_state", 70: "box15_state_2",
+                   77: "box15_state_3", 84: "box15_state_4"}
+
+CITY_HLP_CANDIDATES = (
+    r"C:\DRAKE25\STATELIB\CITY.HLP",
+    r"C:\Drake25\STATELIB\CITY.HLP",
+)
+
+# Real W-2s print the locality's NAME, and a few common ones are written in a form no
+# prefix match reaches. Hand-curated, deliberately tiny, consulted only after both code
+# and name matching have failed. Anything not here that does not match falls through to a
+# rejection that names the codes Drake does list — a wrong guess is worse than a question.
+LOCALITY_ALIASES = {
+    ("NY", "NYC"): "NY",
+    ("NY", "NEW YORK"): "NY",
+    ("PA", "PHL"): "PL",
+    ("MO", "KCMO"): "KC",
+    ("MO", "STL"): "SL",
+    ("MI", "DET"): "DT",
+}
+
+_LOCALITY_TABLE: dict[str, dict[str, str]] | None = None
+_LOCALITY_SOURCE: str | None = None
 
 # Box 14's description/amount column assignment is inferred from the screen layout, not
 # from a confirmed entry. Kept as data so the warning can name the exact fields.
@@ -387,6 +459,130 @@ def sanitize(kind: str, value, *, checkbox_token: str = "X") -> str | None:
     return _clean_text(value)
 
 
+def _city_hlp_path() -> Path | None:
+    """Where Drake's locality table lives. DRAKE_CITY_HLP overrides, for a non-default install."""
+    env = os.environ.get("DRAKE_CITY_HLP")
+    for p in ([env] if env else []) + list(CITY_HLP_CANDIDATES):
+        try:
+            if p and Path(p).is_file():
+                return Path(p)
+        except OSError:
+            continue
+    return None
+
+
+def load_locality_table(force: bool = False) -> dict[str, dict[str, str]]:
+    """Parse CITY.HLP into {'PA': {'PL': 'Philadelphia', ...}, ...}. {} if not found.
+
+    Cached, because build_plan asks once per locality field and the file does not change
+    mid-run. `force=True` re-reads it (after a Drake update, or in tests).
+    """
+    global _LOCALITY_TABLE, _LOCALITY_SOURCE
+    if _LOCALITY_TABLE is not None and not force:
+        return _LOCALITY_TABLE
+    table: dict[str, dict[str, str]] = {}
+    path = _city_hlp_path()
+    if path is not None:
+        try:
+            # latin-1 never raises on a byte, which matters for a vendor file we do not
+            # control: a stray high byte in one city name must not cost us the other 900.
+            text = path.read_text(encoding="latin-1")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            parts = line.split(",")
+            if len(parts) < 3:
+                continue
+            st = parts[0].strip().upper()
+            code = parts[1].strip().upper()
+            name = ",".join(parts[2:]).strip()
+            if len(st) != 2 or st == "ST" or not code or not name:
+                continue                      # drops the "ST,City Code,City Name" header
+            table.setdefault(st, {})[code] = name
+        _LOCALITY_SOURCE = str(path)
+    _LOCALITY_TABLE = table
+    return table
+
+
+def locality_source() -> str | None:
+    """Path the locality table was read from, for the plan to cite. None if not found."""
+    load_locality_table()
+    return _LOCALITY_SOURCE
+
+
+def _normalize_locality(raw) -> str:
+    """'  Marion County ' -> 'MARION'. Only suffixes that are unambiguously noise are cut:
+    ' CITY' is NOT, because Michigan really does list 'Albion City' and 'Portland City'."""
+    s = " ".join(str(raw).strip().upper().split())
+    for suffix in (" COUNTY", " CO."):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+    return s
+
+
+def resolve_locality(state, raw) -> dict:
+    """Resolve a Box 20 locality to the CODE Drake's dropdown stores.
+
+    Returns {"code", "name", "how", "reason", "candidates"}. `code` is None when the value
+    cannot be resolved, and `reason` then says why in terms a preparer can act on. It never
+    guesses: an ambiguous match is a rejection that lists what Drake actually offers.
+    """
+    out = {"code": None, "name": None, "how": None, "reason": None, "candidates": []}
+    table = load_locality_table()
+    if not table:
+        out["reason"] = ("Drake's locality table (STATELIB\\CITY.HLP) was not found on this "
+                         "machine, so the code behind a Box 20 name cannot be looked up. Set "
+                         "DRAKE_CITY_HLP to its path, or pick this locality from the dropdown "
+                         "by hand.")
+        return out
+    st = str(state or "").strip().upper()
+    if not st:
+        out["reason"] = ("the Box 15 state on this row is empty. Drake's locality list is "
+                         "per-state, so there is no list to match against — fill Box 15 on "
+                         "this row first.")
+        return out
+    entries = table.get(st) or {}
+    if not entries:
+        out["reason"] = (f"{st} has no localities in Drake's table — it levies no local income "
+                         f"tax Drake tracks, so the Box 20 dropdown on that row is EMPTY. There "
+                         f"is nothing to select there, by robot or by hand.")
+        return out
+
+    def _hit(code, how):
+        out.update({"code": code, "name": entries[code], "how": how})
+        return out
+
+    def _ambiguous(codes, why):
+        shown = sorted(codes)[:12]
+        out["candidates"] = [f"{c} ({entries[c]})" for c in shown]
+        more = f" (+{len(codes) - len(shown)} more)" if len(codes) > len(shown) else ""
+        out["reason"] = f"{why} Drake lists: {', '.join(out['candidates'])}{more}."
+        return out
+
+    text = _normalize_locality(raw)
+    if text in entries:                                        # already the code
+        return _hit(text, "code")
+    by_name = [c for c, n in entries.items() if n.strip().upper() == text]
+    if len(by_name) == 1:
+        return _hit(by_name[0], "name")
+    if len(by_name) > 1:
+        # Several codes genuinely share one name (California lists four for Voluntary Plan
+        # DI). Picking one at random would be a coin flip on the return.
+        return _ambiguous(by_name, f"{text!r} matches {len(by_name)} different codes in {st}.")
+    alias = LOCALITY_ALIASES.get((st, text))
+    if alias and alias in entries:
+        return _hit(alias, "alias")
+    prefix = [c for c, n in entries.items() if n.strip().upper().startswith(text)]
+    if len(prefix) == 1:
+        return _hit(prefix[0], "prefix")
+    if len(prefix) > 1:
+        return _ambiguous(prefix, f"{text!r} is the start of {len(prefix)} locality names in {st}.")
+    out["reason"] = (f"{text!r} is not a locality Drake lists for {st} ({len(entries)} on file), "
+                     f"so its dropdown has nothing to select and would store nothing. Check the "
+                     f"spelling against Box 20 on the W-2, or pick it by hand.")
+    return out
+
+
 def build_plan(payload: dict, *, checkbox_token: str = "X", include_zeros: bool = False,
                skip_fields=None, ts=None) -> dict:
     """Turn extracted W-2 JSON into an ordered, fully-resolved entry plan.
@@ -410,6 +606,7 @@ def build_plan(payload: dict, *, checkbox_token: str = "X", include_zeros: bool 
     """
     skip = {int(n) for n in (skip_fields or [])}
     entries, skipped, by_request, not_on_screen = [], [], [], []
+    hand_entry = []
     unknown, warnings = [], []
     payload = dict(payload or {})
     if ts is not None:
@@ -425,7 +622,50 @@ def build_plan(payload: dict, *, checkbox_token: str = "X", include_zeros: bool 
         if spec is None:
             unknown.append(key)
             continue
+        # Box 20 resolves against Drake's own locality table before anything else, because
+        # what gets typed is the CODE and the name on the W-2 is only the way in. An empty
+        # box still falls through to the ordinary "nothing to enter" path below.
+        if spec["field_no"] in LOCALITY_FIELDS and _has_content(raw):
+            row_state = payload.get(LOCALITY_FIELDS[spec["field_no"]])
+            res = resolve_locality(row_state, raw)
+            row = {"key": key, "field_no": spec["field_no"], "label": spec["label"],
+                   "kind": spec["kind"], "value": res["code"], "raw": raw,
+                   "confirm": True, "trimmed_from": None,
+                   "resolved_from": _clean_text(raw), "locality_name": res["name"]}
+            cap = spec.get("max_len")
+            if res["code"] and cap and len(res["code"]) > int(cap):
+                # A code is not text: cutting it short does not shorten a name, it names a
+                # DIFFERENT locality. Refuse rather than truncate.
+                res = {**res, "code": None,
+                       "reason": f"Drake's code for it ({res['code']!r}) is longer than the "
+                                 f"{cap}-character box, so it cannot be typed without becoming "
+                                 f"a different code."}
+                row["value"] = None
+            if res["code"] is None:
+                row["value"] = _clean_text(raw)
+                row["why"] = res["reason"]
+                hand_entry.append(row)
+                continue
+            warnings.append(
+                f"field {spec['field_no']} ({spec['label']}): {_clean_text(raw)!r} resolved to "
+                f"Drake's locality code {res['code']!r} ({res['name']}) for "
+                f"{str(row_state).strip().upper()}, matched by {res['how']}. The CODE is what is "
+                f"typed and what Drake stores — the box will then show Drake's own name for it.")
+            if spec["field_no"] in skip:
+                by_request.append(row)
+            else:
+                entries.append(row)
+            continue
         val = sanitize(spec["kind"], raw, checkbox_token=checkbox_token)
+        # Drake enforces a maximum length on some boxes and simply STOPS accepting
+        # characters — measured live on field 49 (Box 14 description), which caps at 8:
+        # 'UNION DUES' settled as 'UNION DU' and the run halted rather than commit a value
+        # it could not confirm. Trimming to the box's real capacity is what a preparer does
+        # by hand; doing it SILENTLY is not, so every trim is reported.
+        trimmed_from = None
+        maxlen = spec.get("max_len")
+        if val is not None and maxlen and len(val) > int(maxlen):
+            trimmed_from, val = val, val[:int(maxlen)]
         if val is None and include_zeros and spec["kind"] == "money":
             val = "0" if str(raw).strip() not in ("", "None") else None
         if val is None:
@@ -451,10 +691,21 @@ def build_plan(payload: dict, *, checkbox_token: str = "X", include_zeros: bool 
             "value": val,
             "raw": raw,
             # Flags a human should eyeball on the first run of a new Drake build.
-            "confirm": bool(spec.get("confirm")) or spec["field_no"] in DROPDOWN_FIELDS,
+            "confirm": bool(spec.get("confirm")) or spec["field_no"] in DROPDOWN_FIELDS
+                       or trimmed_from is not None,
+            "trimmed_from": trimmed_from,
         }
+        if trimmed_from is not None:
+            warnings.append(f"field {spec['field_no']} ({spec['label']}): {trimmed_from!r} was "
+                            f"TRUNCATED to {val!r} — Drake's box holds {maxlen} characters. "
+                            f"The short form is what will be on the return; check it still "
+                            f"says what it needs to.")
         if spec["field_no"] in skip:
             by_request.append(row)
+            continue
+        if spec["field_no"] in HAND_ENTRY_FIELDS:
+            row["why"] = HAND_ENTRY_FIELDS[spec["field_no"]]
+            hand_entry.append(row)
             continue
         entries.append(row)
 
@@ -478,14 +729,24 @@ def build_plan(payload: dict, *, checkbox_token: str = "X", include_zeros: bool 
         warnings.append(f"{len(unknown)} key(s) not in the W-2 field map were IGNORED: "
                         f"{', '.join(sorted(unknown))}")
     dropdowns = sorted({e["field_no"] for e in entries if e["field_no"] in DROPDOWN_FIELDS})
-    if dropdowns:
-        warnings.append(f"field(s) {dropdowns} are dropdowns on Drake's screen — typing the "
-                        f"code usually selects it, but this is UNCONFIRMED on this build; "
+    unconfirmed = [n for n in dropdowns if n not in DROPDOWNS_CONFIRMED]
+    confirmed = [n for n in dropdowns if n in DROPDOWNS_CONFIRMED]
+    if unconfirmed:
+        warnings.append(f"field(s) {unconfirmed} are dropdowns on Drake's screen whose typed "
+                        f"code has NOT been confirmed to select an entry on this build — "
                         f"check those boxes on the screenshot.")
+    if confirmed:
+        warnings.append(f"field(s) {confirmed} are dropdowns; typing the code IS confirmed to "
+                        f"select the entry on this build (read back as code + entry). Still "
+                        f"worth an eye after a Drake version bump.")
     if any(e["kind"] == "checkbox" for e in entries):
-        warnings.append(f"checkbox fields are entered as {checkbox_token!r} "
-                        f"(binding: navigation.headsdown_checkbox_true) — UNCONFIRMED on this "
-                        f"build; if Drake rejects it the run HALTs rather than mis-entering.")
+        warnings.append(f"checkbox field(s) — Drake's heads-down popup shows the TICK BOX "
+                        f"itself for these, not a text box, so the tick is read back off the "
+                        f"widget before it is committed. {checkbox_token!r} is tried first "
+                        f"(binding: navigation.headsdown_checkbox_true), then the other "
+                        f"tokens; if none of them flips the tick the run HALTs with the box "
+                        f"untouched. Run `agent.py probe-checkbox` once per build to learn "
+                        f"which token this one takes.")
     box14 = sorted({e["field_no"] for e in entries
                     if e["field_no"] in BOX14_DESC_FIELDS | BOX14_AMOUNT_FIELDS})
     if box14:
@@ -493,8 +754,21 @@ def build_plan(payload: dict, *, checkbox_token: str = "X", include_zeros: bool 
                         f"({sorted(BOX14_DESC_FIELDS)}) and which is AMOUNT "
                         f"({sorted(BOX14_AMOUNT_FIELDS)}) is inferred from the screen layout "
                         f"and NOT confirmed by entry — verify these boxes by eye first.")
+    if any(e["field_no"] in LOCALITY_FIELDS for e in entries + hand_entry):
+        src = locality_source()
+        warnings.append(
+            f"Box 20 locality codes were resolved against Drake's own table at {src} — the "
+            f"live file, so it tracks Drake's updates rather than a copy of them."
+            if src else
+            "Drake's locality table (STATELIB\\CITY.HLP) was NOT found, so no Box 20 value "
+            "could be resolved to the code Drake stores. Every locality is left for a human. "
+            "Set DRAKE_CITY_HLP if Drake is installed somewhere other than C:\\DRAKE25.")
+    for e in hand_entry:
+        warnings.append(f"field {e['field_no']} ({e['label']}) = {e['value']!r} will NOT be "
+                        f"typed: {e['why']}")
     return {"entries": entries, "skipped": skipped, "skipped_by_request": by_request,
-            "not_on_screen": not_on_screen, "unknown_keys": unknown, "warnings": warnings}
+            "not_on_screen": not_on_screen, "hand_entry": hand_entry,
+            "unknown_keys": unknown, "warnings": warnings}
 
 
 def format_plan(plan: dict) -> str:
@@ -505,7 +779,12 @@ def format_plan(plan: dict) -> str:
     lines.append(f"  {'-'*4}  {'-'*32} {'-'*24} {'-'*24}")
     for e in plan["entries"]:
         mark = " *" if e["confirm"] else "  "
-        lines.append(f"  {e['field_no']:>4}{mark}{e['label']:<32} {e['value']:<24} {e['key']}")
+        val = e["value"]
+        # A locality's code is meaningless on its own — show what it came from, so the
+        # reviewer can check the resolution and not just the two characters being typed.
+        if e.get("resolved_from") and e["resolved_from"] != val:
+            val = f"{val} <- {e['resolved_from']}"
+        lines.append(f"  {e['field_no']:>4}{mark}{e['label']:<32} {val:<24} {e['key']}")
     if any(e["confirm"] for e in plan["entries"]):
         lines.append("")
         lines.append("  * = verify this box by eye on the screenshot (dropdown, checkbox, or identity field)")
