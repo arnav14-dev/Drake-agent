@@ -239,9 +239,24 @@ FAMILY.update({n: "locality" for n in MUTANTS if n.startswith("locality:")})
 FAMILY.update({n: "caret" for n in MUTANTS if n.startswith("caret:")})
 
 
+# Per-mutant wall clock. A BROKEN guard does not only fail cases — it stops the driver
+# short-circuiting, so cases that normally end at the first refusal run every retry and
+# timeout to the end. One mutant took the suite from ~3 minutes to over 30 and blew the old
+# 1800s cap, which then raised TimeoutExpired out of run() and killed the whole sweep on its
+# fifth mutant. The cap is generous now, and — more importantly — expiring it is a RESULT,
+# not a crash: a sweep that dies partway reports nothing about the mutants it never reached.
+RUN_TIMEOUT = 3600
+
+
 def run(dirpath, only=None):
     cmd = [sys.executable, "simulate_headsdown.py"] + ([only] if only else [])
-    p = subprocess.run(cmd, cwd=dirpath, capture_output=True, text=True, timeout=1800)
+    try:
+        p = subprocess.run(cmd, cwd=dirpath, capture_output=True, text=True, timeout=RUN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # Treated as KILLED (non-zero), and labelled so it is not mistaken for a clean red:
+        # the guard's absence was detected, just not within the budget. Worth a look if it
+        # keeps happening — it usually means a mutant removed an early exit.
+        return 124, f"TIMED OUT after {RUN_TIMEOUT}s (suite never finished)"
     tail = [l for l in p.stdout.splitlines() if "cases pass" in l]
     return p.returncode, (tail[-1] if tail else "?")
 

@@ -659,6 +659,172 @@ def cmd_write_w2(args) -> int:
     return code
 
 
+def _enter_one_payload(driver, payload: dict, args, *, token: str) -> dict:
+    """Plan one extracted W-2 and enter it. Returns a report; never files, never raises.
+
+    Composes the SAME helpers `write-w2` uses — build_plan, _headsdown_run, audit_canvas —
+    rather than reimplementing them, so the watcher cannot drift into a second, less-tested
+    entry path. Every gate that protects a hand-run protects this one.
+    """
+    from w2_map import build_plan, format_plan
+
+    report: dict = {"ok": False, "halted": False, "entered": 0, "planned": 0, "reason": None}
+    try:
+        plan = build_plan(payload, checkbox_token=token, include_zeros=args.include_zeros,
+                          skip_fields=None, ts=args.ts)
+    except Exception as e:
+        report["reason"] = f"the payload could not be planned: {type(e).__name__}: {e}"
+        return report
+
+    print(format_plan(plan))
+    report["planned"] = len(plan["entries"])
+    report["warnings"] = plan["warnings"]
+    report["hand_entry"] = [{"field_no": h["field_no"], "label": h["label"],
+                             "value": h["value"], "why": h["why"]} for h in plan["hand_entry"]]
+    if not plan["entries"]:
+        report["reason"] = "the payload resolved to zero enterable fields"
+        return report
+
+    # Same refusal as a hand-run: a value the map could not resolve would otherwise sit
+    # blank while the run reported success. Nothing has been typed yet, so stopping is free.
+    rejected = [s for s in plan["skipped"] if s.get("rejected")]
+    if rejected and not args.allow_rejected:
+        report["reason"] = (f"{len(rejected)} extracted value(s) could not be resolved: "
+                            + ", ".join(f"field {s['field_no']} ({s['label']})" for s in rejected))
+        report["rejected"] = [{"field_no": s["field_no"], "label": s["label"], "raw": s["raw"]}
+                              for s in rejected]
+        return report
+
+    rows, halted, reason = _headsdown_run(driver, plan["entries"],
+                                          method=args.toggle_method,
+                                          settle_after=args.settle_after)
+    code = _print_seq_outcome(rows, halted, reason, plan=plan)
+    entered = [r for r in rows if r["ok"]]
+    report.update({"entered": len(entered), "halted": bool(halted), "reason": reason,
+                   "fields": [{"field_no": r["num"], "ok": r["ok"], "value": r.get("value"),
+                               "reason": r.get("reason")} for r in rows]})
+
+    # The form-level check: everything above verifies what the POPUP showed, which is what
+    # we typed — not what Drake KEPT.
+    audit = driver.audit_canvas([e for e in plan["entries"]
+                                 if str(e["field_no"]) in {r["num"] for r in entered}])
+    report["form_check"] = audit
+    if audit.get("canvas_elements"):
+        if audit["ok"]:
+            print(f"\nFORM CHECK: all {audit['checked']} entered value(s) are readable on the "
+                  f"data-entry form ({audit['canvas_elements']} controls read).")
+        else:
+            print(f"\nFORM CHECK — {len(audit['missing'])} value(s) reported entered are NOT on "
+                  f"the form:")
+            for e in audit["missing"]:
+                print(f"    field {e['field_no']:<4} {e['label']:<32} = {e['value']!r}")
+            code = max(code, 3)
+    else:
+        print(f"\nFORM CHECK: unavailable — {audit.get('reason')}")
+
+    report["ok"] = (code == 0)
+    return report
+
+
+def cmd_watch(args) -> int:
+    """Watch a folder for W-2 payloads and enter each one into Drake.
+
+    This is the transport between Fynn's backend and Drake. The backend writes
+    `w2-<docId>.json` into the folder (atomically — it renames a `.part` file into place, so
+    a half-written payload is never visible); this picks it up, enters it through the same
+    verified heads-down path as `write-w2`, and moves it to `done/` or `failed/` with a
+    `.report.json` beside it saying exactly what happened, field by field.
+
+    A folder is the transport on purpose. It needs no inbound port on the firm's machine, no
+    socket to keep alive, and it survives either side restarting — the queue is just files.
+
+    ONE AT A TIME, and it STOPS on the first halt. Drake is a single keyboard and a halt
+    means the screen is in a state a human has not seen; starting the next W-2 on top of
+    that is how one bad return becomes five. `--keep-going` overrides that, and says so
+    loudly. There is no file/e-file command here either — a human still reviews and executes.
+    """
+    import time
+    from pathlib import Path
+
+    root = Path(args.dir).expanduser()
+    if not root.is_dir():
+        print(f"watch folder does not exist: {root}", file=sys.stderr)
+        return 1
+    done_dir, failed_dir = root / "done", root / "failed"
+    for d in (done_dir, failed_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    binding = load_binding(args.binding)
+    token = (binding.get("navigation", {}) or {}).get("headsdown_checkbox_true", "X")
+    driver = DrakeDriver(binding)
+    driver.connect()
+    wi = driver.window_info()
+    print(f"Bound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
+    if driver.w32 is None:
+        print("  could not open the win32 popup connection — heads-down entry needs it.",
+              file=sys.stderr)
+        return 1
+
+    print(f"\nWatching {root} for W-2 payloads. Open Drake on the W-2 screen of the return "
+          f"you want filled.\nCtrl+C to stop.\n")
+    processed = 0
+    try:
+        while True:
+            # Oldest first, and NEVER a '.part' — the backend renames into place, so a name
+            # ending .json is a file that is completely written.
+            queue = sorted((p for p in root.glob("*.json") if not p.name.endswith(".part")),
+                           key=lambda p: p.stat().st_mtime)
+            for path in queue:
+                print("=" * 74)
+                print(f"ENTERING {path.name}")
+                print("=" * 74)
+                # UNATTENDED BOOTSTRAP. `write-w2` gets this for free: it tells a human to
+                # click a Drake field, and that click both brings Drake to the FOREGROUND
+                # and arms the caret. Nobody clicks for a watcher. Without this the popup is
+                # up, holds the keyboard, passes every gate — and the keystrokes go to
+                # whatever window is actually in front, so the run halts on field 1 with
+                # "the popup never showed field number '1'". Focusing a real data-entry box
+                # through UIA does both jobs at once, and is the same call the caret re-arm
+                # uses. It changes no value; it only decides where the next key lands.
+                if not driver._focus_canvas_field():
+                    print("could not put the caret on a Drake data-entry box — is a return's "
+                          "W-2 screen open? Nothing was typed.", file=sys.stderr)
+                    return 2
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+                except Exception as e:
+                    report = {"ok": False, "reason": f"unreadable JSON: {type(e).__name__}: {e}"}
+                else:
+                    report = _enter_one_payload(driver, payload, args, token=token)
+                processed += 1
+
+                shot = driver.save_screenshot(str(root / f"{path.stem}.png"))
+                if shot.get("ok"):
+                    report["screenshot"] = shot["path"]
+                    print(f"screenshot -> {shot['path']}")
+                dest = (done_dir if report.get("ok") else failed_dir) / path.name
+                path.replace(dest)
+                (dest.with_suffix(".report.json")).write_text(
+                    json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
+                print(f"-> {dest}")
+                print("Values are IN Drake but NOT filed: a human still reviews and executes.")
+
+                if not report.get("ok") and not args.keep_going:
+                    print("\nSTOPPING. That payload did not complete cleanly, and Drake's screen "
+                          "is in a state nobody has looked at yet — entering the next W-2 on top "
+                          "of it is how one bad return becomes five. Review Drake, then restart "
+                          "the watcher (or pass --keep-going if you accept that risk).",
+                          file=sys.stderr)
+                    return 2
+            if args.once:
+                print(f"--once: queue drained ({processed} payload(s)).")
+                return 0
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print(f"\nstopped — {processed} payload(s) entered this session.")
+        return 0
+
+
 def _try_load_binding(path: str) -> dict:
     """Binding if it's there, else {} — so --dry-run works on a machine that has no
     binding.json (it's per-VM and gitignored). Only affects the checkbox token."""
@@ -969,6 +1135,7 @@ def main() -> int:
     spp = sub.add_parser("probe-popup", parents=[common]); spp.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the probe runs"); spp.add_argument("--probe-field", dest="probe_field", default="6", help="which field number the probe jumps to. Default 6 (employer 'Name cont.' — normally empty and inert). NEVER use 4: it is the EIN, it auto-fills, and it is the do-not-touch box"); spp.set_defaults(func=cmd_probe_popup)
     spc = sub.add_parser("probe-checkbox", parents=[common]); spc.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the probe runs"); spc.add_argument("--field", dest="field_no", default="47", help="which CHECKBOX field to probe. Default 47 (Box 13 retirement plan); 46 statutory employee, 48 sick pay"); spc.add_argument("--no-flip", dest="no_flip", action="store_true", help="observe only — read the arrival state and leave without sending any token"); spc.set_defaults(func=cmd_probe_checkbox)
     sw2 = sub.add_parser("write-w2", parents=[common]); sw2.add_argument("--json", required=True, help="extracted W-2 JSON (the LLM's structured output — see w2_map.W2_SCHEMA_KEYS)"); sw2.add_argument("--dry-run", action="store_true", help="resolve and PRINT the plan without touching Drake — run this first, works anywhere"); sw2.add_argument("--skip-field", dest="skip_field", type=int, action="append", metavar="N", help="do NOT enter this field number, even if the extraction has a value for it; repeatable. Use --skip-field 4 to leave the employer EIN alone (it also avoids Drake's auto-fill + auto-advance)"); sw2.add_argument("--ts", choices=["T", "S"], help="whose W-2 this is (field 1). Drake defaults to T; on a JOINT return an unset TS files the spouse's W-2 under the taxpayer"); sw2.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="proceed even if some extracted values could not be resolved (they stay blank in Drake for you to key by hand)"); sw2.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero (default: skip — a blank box is zero on a tax form)"); sw2.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); sw2.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field (auto-fill/validation)"); sw2.add_argument("--delay", type=int, default=10, help="seconds to click into the W-2 screen before entry fires"); sw2.add_argument("--shot", default="w2-after.png", help="screenshot saved after the run — the verification artifact"); sw2.set_defaults(func=cmd_write_w2)
+    swt = sub.add_parser("watch", parents=[common]); swt.add_argument("--dir", required=True, help="folder the backend drops W-2 payloads into (its DRAKE_HANDOFF_DIR). Entered oldest-first, one at a time, then moved to done/ or failed/ with a .report.json"); swt.add_argument("--interval", type=float, default=2.0, help="seconds between folder checks"); swt.add_argument("--once", action="store_true", help="enter whatever is queued right now, then exit (what to use for a test)"); swt.add_argument("--keep-going", dest="keep_going", action="store_true", help="carry on to the next payload after one fails. OFF by default: a halt leaves Drake's screen in a state nobody has reviewed, and entering the next W-2 on top of it turns one bad return into several"); swt.add_argument("--ts", choices=["T", "S"], help="whose W-2 these are (field 1), when the payload does not say"); swt.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="enter the rest even when some extracted values could not be resolved (they stay blank for you to key by hand)"); swt.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero"); swt.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); swt.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field"); swt.set_defaults(func=cmd_watch)
     sev = sub.add_parser("envdump", parents=[common]); sev.add_argument("--out", default="env-dump.json", help="where to write the window-topology JSON"); sev.add_argument("--delay", type=int, default=0, help="seconds before capture — time to click a field / open heads-down first"); sev.set_defaults(func=cmd_envdump)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)

@@ -2952,8 +2952,23 @@ class DrakeDriver:
             # proven at entry by reading the widget. Nothing to look for here.
             if e.get("kind") == "checkbox":
                 continue
-            if want not in joined:
-                missing.append(e)
+            if want in joined:
+                continue
+            # DRAKE ROUNDS MONEY TO WHOLE DOLLARS on this screen — 29476.71 is stored and
+            # shown as 29477 — which is what the IRS expects and what a preparer keying by
+            # hand would produce. Before this, the check called every amount with cents
+            # "not on the form": the first real W-2 through the pipeline reported 9 of 25
+            # values missing, and all nine were present and correct. A check that cries wolf
+            # on normal behaviour is worse than no check, because it teaches people to
+            # ignore the one time it is right.
+            #
+            # This is NOT a looser gate. Only the value ROUNDED HALF-UP is accepted as well,
+            # so 29476.71 matches 29477 and nothing else: 29470, 2947 and 294770 all still
+            # fail, which are the transpositions and lost/extra digits that actually matter.
+            rounded = _whole_dollars(e.get("value"))
+            if rounded is not None and rounded in joined:
+                continue
+            missing.append(e)
         return {"ok": not missing, "missing": missing, "checked": len(entries),
                 "canvas_elements": len(canvas)}
 
@@ -3760,6 +3775,26 @@ def _element_rect(el):
         return [int(r.left), int(r.top), int(r.right), int(r.bottom)]
     except Exception:
         return None
+
+
+def _whole_dollars(value) -> Optional[str]:
+    """'29476.71' -> '29477', the way Drake stores money on the W-2 screen. None if the
+    value is not a plain decimal number, or already has no cents to round.
+
+    ROUND_HALF_UP, not Python's round(), which is banker's rounding and would turn 0.5 to
+    the nearest EVEN — 2448.50 would become 2448 while Drake makes it 2449, and the check
+    would then report a value that is genuinely on the form as missing. Measured against
+    Drake on the first real W-2: .71 .92 .56 .72 all rounded up, .41 .31 down.
+    """
+    from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+    s = str(value if value is not None else "").strip().replace(",", "")
+    if "." not in s:
+        return None                       # nothing to round; the exact match already ran
+    try:
+        d = Decimal(s)
+    except (InvalidOperation, ValueError):
+        return None
+    return str(d.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def _element_has_keyboard_focus(el) -> Optional[bool]:

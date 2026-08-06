@@ -2157,6 +2157,50 @@ def case_rearm_works_but_headsdown_is_off():
     return ok
 
 
+def case_form_check_whole_dollars():
+    """Drake rounds money to whole dollars on the W-2 screen. The form check must know.
+
+    The first REAL W-2 through the pipeline (2026-08-06) reported 9 of 25 values missing
+    from the form. All nine were present and correct — they were the nine with cents, and
+    Drake had rounded them: 29476.71 was sitting in Box 1 as 29477. A check that fires on
+    normal behaviour is worse than no check, because people learn to ignore it.
+
+    So the rounded form is accepted TOO — and nothing else. The second half of this case is
+    the important half: the near-misses that matter must still be caught.
+    """
+    from drake_driver import _whole_dollars
+    checks = [
+        # Measured against Drake on that run: .71 .92 .56 .72 up, .41 .31 down.
+        ("29476.71 -> 29477", _whole_dollars("29476.71") == "29477"),
+        ("5400.92 -> 5401", _whole_dollars("5400.92") == "5401"),
+        ("1827.56 -> 1828", _whole_dollars("1827.56") == "1828"),
+        ("427.41 -> 427", _whole_dollars("427.41") == "427"),
+        ("353.72 -> 354", _whole_dollars("353.72") == "354"),
+        ("2448.31 -> 2448", _whole_dollars("2448.31") == "2448"),
+        # HALF-UP, not banker's rounding. Python's round() sends .5 to the nearest EVEN, so
+        # 2448.50 would become 2448 while Drake makes it 2449 — and the check would report a
+        # value that is genuinely on the form as missing.
+        ("2448.50 -> 2449, not 2448 (half-up, not banker's)", _whole_dollars("2448.50") == "2449"),
+        ("2447.50 -> 2448 (same rule, odd side)", _whole_dollars("2447.50") == "2448"),
+        ("commas are not digits: '29,476.71' -> 29477", _whole_dollars("29,476.71") == "29477"),
+        # No cents means nothing to round: the exact match already ran, and returning a value
+        # here would only widen what counts as a match for no reason.
+        ("52000 -> None (nothing to round)", _whole_dollars("52000") is None),
+        ("text -> None", _whole_dollars("CA SDI") is None),
+        ("empty -> None", _whole_dollars("") is None),
+        ("None -> None", _whole_dollars(None) is None),
+    ]
+    # The near-misses. Rounding must not become "close enough": a dropped digit, an extra
+    # one, and a transposition are exactly the errors this whole project exists to catch.
+    for bad in ("29470", "2947", "294770", "29477.71", "2477"):
+        checks.append((f"29476.71 must NOT match {bad!r}", _whole_dollars("29476.71") != bad))
+    ok = all(v for _, v in checks)
+    _check("form check knows Drake rounds money to whole dollars", ok)
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
 def case_locality_resolution():
     """Box 20 stores a CODE, not the name on the W-2.
 
@@ -2276,6 +2320,7 @@ def main() -> int:
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),
         ('caret_rearm_impossible_halts', lambda: case_rearm_that_cannot_work_halts_clean()),
         ('caret_headsdown_off_halts', lambda: case_rearm_works_but_headsdown_is_off()),
+        ('form_check_whole_dollars', lambda: case_form_check_whole_dollars()),
         ('locality_resolves_to_drake_code', lambda: case_locality_resolution()),
         ('full_sequence "persistent"', lambda: case_full_sequence("persistent")),
         ('full_sequence "per-jump"', lambda: case_full_sequence("per-jump")),
