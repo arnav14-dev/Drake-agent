@@ -218,13 +218,62 @@ MUTANTS = {
     "locality: an unresolvable value is entered anyway (the 2026-08-04 bug, restored)": (
         '            if res["code"] is None:',
         "            if False:"),
+    # -- navigation (drake_nav.py) ----------------------------------------------------
+    # These guards decide WHICH RETURN gets typed into. A survivor here is worse than a
+    # survivor anywhere else in this file: every other guard protects a value, and these
+    # protect the identity of the person the values belong to. A wrong-client entry passes
+    # every read-back, every form check and every audit — it is invisible downstream.
+    "nav: the open return's SSN is never checked against the one asked for": (
+        '    if parsed["id"] != want:',
+        "    if False:"),
+    "nav: the open return's NAME is never checked": (
+        '        nm = names_match(parsed["name"], first_name, last_name)\n        if not nm["ok"]:',
+        '        nm = names_match(parsed["name"], first_name, last_name)\n        if False:'),
+    "nav: two clients sharing an SSN — take the first instead of refusing": (
+        '    if len(hits) == 1:\n        return {"ok": True, "row": hits[0], "reason": ""}',
+        '    if hits:\n        return {"ok": True, "row": hits[0], "reason": ""}'),
+    "nav: a row id of an unknown shape yields a partial id instead of nothing": (
+        '    m = re.fullmatch(r"(\\d+)-(\\d+)", tail)\n    return m.group(1) if m else ""',
+        '    return tail.split("-")[0]'),
+    "nav: screen code matched by prefix (W2 also opens W2G, 1 also opens 1099)": (
+        '    hits = [lk for lk, p in parsed if p and p["code"] == want]',
+        '    hits = [lk for lk, p in parsed if p and p["code"].startswith(want)]'),
+    "nav: the surname is never compared": (
+        '    if want_last and got["last"] and want_last != got["last"]:',
+        "    if False:"),
+    "nav: given names compared by substring ('ANN' matches 'DEANNA')": (
+        "    wt, gt = want.split(), got.split()\n"
+        "    return all(w in gt for w in wt) or all(g in wt for g in gt)",
+        "    return want in got or got in want"),
+    "nav: an unreadable client name counts as a match": (
+        '    if not got["last"] and not got["given"]:',
+        "    if False:"),
+    "nav: a client row borrows whatever name is nearest": (
+        '            if top <= mid <= bottom:',
+        "            if True:"),
+    "nav: a window carrying BOTH menu and form markers is called a form": (
+        '    if is_form and not is_menu:\n        return "form"',
+        '    if is_form:\n        return "form"'),
+    "nav: the duplicate-W2 check removed (re-sending doubles the client's wages)": (
+        '            if normalize_id(v.get("value")) == want:',
+        "            if False:"),
+    "nav: an unreadable form counts as an empty record (types over existing data)": (
+        '    if not state or not state.get("ok"):',
+        "    if not state:"),
+    "nav: stray text counts as a real W-2 again (the 2026-08-07 live halt)": (
+        '    return "w2" if any(_looks_numeric(v) for v in vals) else "fragment"',
+        '    return "w2"'),
+    "nav: a real W-2 is mistaken for stray text (types over an existing W-2)": (
+        '    return "w2" if any(_looks_numeric(v) for v in vals) else "fragment"',
+        '    return "fragment"'),
 }
 
 # Which source file each mutant edits. drake_driver.py unless named here — the guards that
 # decide what gets TYPED do not all live in the driver, and a mutation harness that can only
 # reach one file quietly reports "all covered" about the other.
 TARGET = {n: "w2_map.py" for n in MUTANTS if n.startswith("locality:")}
-MUTABLE_FILES = ("drake_driver.py", "w2_map.py")
+TARGET.update({n: "drake_nav.py" for n in MUTANTS if n.startswith("nav:")})
+MUTABLE_FILES = ("drake_driver.py", "w2_map.py", "drake_nav.py")
 
 
 # Mutants whose guard belongs to one family of cases may name that family, so the harness
@@ -237,6 +286,7 @@ FAMILY.update({n: "jump" for n in MUTANTS if "jump budget" in n})
 FAMILY.update({n: "ctrln" for n in MUTANTS if "inert popup" in n or "double-toggle cascade" in n})
 FAMILY.update({n: "locality" for n in MUTANTS if n.startswith("locality:")})
 FAMILY.update({n: "caret" for n in MUTANTS if n.startswith("caret:")})
+FAMILY.update({n: "nav" for n in MUTANTS if n.startswith("nav:")})
 
 
 # Per-mutant wall clock. A BROKEN guard does not only fail cases — it stops the driver
@@ -267,7 +317,8 @@ if pick:
     print(f"(only mutants matching {pick!r})\n")
 
 base_dir = tempfile.mkdtemp()
-for f in ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py"):
+for f in ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py",
+          "drake_nav.py"):
     shutil.copy(SRC / f, base_dir)
 todo = {k: v for k, v in MUTANTS.items() if not pick or pick.lower() in k.lower()}
 if not todo:
@@ -297,7 +348,8 @@ for name, (anchor, repl) in todo.items():
         survived.append(name)
         continue
     d = tempfile.mkdtemp()
-    for f in ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py"):
+    for f in ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py",
+          "drake_nav.py"):
         shutil.copy(SRC / f, d)
     (pathlib.Path(d) / target).write_text(original.replace(anchor, repl), encoding="utf-8")
     fam = FAMILY.get(name)

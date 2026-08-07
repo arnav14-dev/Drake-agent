@@ -659,6 +659,89 @@ def cmd_write_w2(args) -> int:
     return code
 
 
+def _payload_target(payload: dict) -> dict:
+    """Who and what this payload is for: {ssn, first, last, ein, screen}.
+
+    The backend already sends all of it — employee_ssn, employee_first_name,
+    employee_last_name and employer_ein have been in the handoff since the field map was
+    widened to 78. `screen` lets a future 1099/INT payload pick its own Drake screen
+    without another change here; W2 stays the default because it is the only screen with a
+    verified field map.
+    """
+    g = lambda k: str(payload.get(k) or "").strip()
+    return {"ssn": g("employee_ssn"), "first": g("employee_first_name"),
+            "last": g("employee_last_name"), "ein": g("employer_ein"),
+            "screen": (g("drake_screen") or "W2").upper()}
+
+
+def _navigate_for_payload(driver, payload: dict, args) -> dict:
+    """Open the right client, the right screen, and the right RECORD. {ok, reason, steps}.
+
+    Runs before a single key is typed, and every failure returns ok=False having typed
+    nothing. This is where the agent stops being "types into whatever is in front of it"
+    and starts being answerable for the target it chose — so it is also where the identity
+    check lives, and the check is against Drake's own window title rather than our record
+    of what we asked for.
+    """
+    import drake_nav as nav
+    t = _payload_target(payload)
+    steps: list = []
+    out = {"ok": False, "reason": None, "steps": steps, "target": t}
+
+    if not t["ssn"]:
+        out["reason"] = ("the payload has no employee SSN, so the agent cannot tell which "
+                         "return this W-2 belongs to")
+        return out
+
+    r = nav.open_client(driver, t["ssn"], first_name=t["first"], last_name=t["last"],
+                        timeout=args.nav_timeout)
+    steps.append({"step": "client", **{k: r.get(k) for k in ("ok", "reason", "step")}})
+    if not r["ok"]:
+        out["reason"] = r["reason"]
+        out["not_found"] = bool(r.get("not_found"))
+        return out
+    out["return_title"] = r.get("title")
+
+    s = nav.open_screen(driver, t["screen"], timeout=args.nav_timeout)
+    steps.append({"step": "screen", **{k: s.get(k) for k in ("ok", "reason", "step")}})
+    if not s["ok"]:
+        out["reason"] = s["reason"]
+        return out
+
+    state = driver.form_record_state()
+    plan = nav.plan_record_use(state, t["ein"], allow_new=not args.no_new_record)
+    steps.append({"step": "record", "action": plan["action"], "reason": plan["reason"],
+                  "index": state.get("index"), "count": state.get("count"),
+                  "populated": state.get("populated")})
+    print(f"  record: {plan['reason']}")
+    if plan["action"] == "refuse":
+        out["reason"] = plan["reason"]
+        return out
+    if plan["action"] == "new":
+        n = driver.form_new_record(timeout=args.nav_timeout)
+        steps.append({"step": "new-record", **{k: n.get(k) for k in ("ok", "reason",
+                                                                     "index", "count")}})
+        if not n["ok"]:
+            out["reason"] = n["reason"]
+            return out
+        print(f"  opened a new W-2 record ({n['index']} of {n['count']})")
+        out["record"] = {"index": n["index"], "count": n["count"]}
+    else:
+        out["record"] = {"index": state.get("index"), "count": state.get("count")}
+
+    # Everything the agent just did to Drake's windows is now the expected resting state:
+    # a return is open, so a data-entry window exists and the frames behind it are
+    # disabled. Taken at attach — on the home screen — that state reads as a modal
+    # arriving, and the dialog gate halts on field 1 having typed nothing. Re-baselining
+    # HERE and nowhere else is what keeps the gate honest: it happens only once the return
+    # has been verified against Drake's own title.
+    driver.rebaseline(why="opening the return")
+
+    out["ok"] = True
+    out["reason"] = f"{r['reason']} / {s['reason']}"
+    return out
+
+
 def _enter_one_payload(driver, payload: dict, args, *, token: str) -> dict:
     """Plan one extracted W-2 and enter it. Returns a report; never files, never raises.
 
@@ -786,16 +869,46 @@ def cmd_watch(args) -> int:
                 # "the popup never showed field number '1'". Focusing a real data-entry box
                 # through UIA does both jobs at once, and is the same call the caret re-arm
                 # uses. It changes no value; it only decides where the next key lands.
-                if not driver._focus_canvas_field():
-                    print("could not put the caret on a Drake data-entry box — is a return's "
-                          "W-2 screen open? Nothing was typed.", file=sys.stderr)
-                    return 2
+                navr = None
                 try:
                     payload = json.loads(path.read_text(encoding="utf-8-sig"))
                 except Exception as e:
                     report = {"ok": False, "reason": f"unreadable JSON: {type(e).__name__}: {e}"}
+                    payload = None
                 else:
-                    report = _enter_one_payload(driver, payload, args, token=token)
+                    report = None
+
+                # NAVIGATE FIRST. Until now this step was a human: they opened the client
+                # and the W-2 screen, and the agent typed into whatever was in front of it.
+                # Doing it in code is what lets an operator just open Drake — and it is
+                # also the first time the agent is answerable for WHICH return it picked,
+                # so it ends with an identity check against Drake's own title and refuses
+                # on any mismatch. Nothing is typed until it passes.
+                if payload is not None and not args.no_navigate:
+                    navr = _navigate_for_payload(driver, payload, args)
+                    if not navr["ok"]:
+                        report = {"ok": False, "reason": navr["reason"],
+                                  "navigation": navr["steps"], "entered": 0,
+                                  "not_found": navr.get("not_found", False)}
+                        print(f"\nNAVIGATION STOPPED: {navr['reason']}", file=sys.stderr)
+                    else:
+                        report = None
+
+                if report is None:
+                    # The caret Drake needs to arm heads-down. Navigation leaves the form
+                    # open but not necessarily carrying a caret, and Ctrl+N is a silent
+                    # no-op without one.
+                    if not driver._focus_canvas_field():
+                        report = {"ok": False, "entered": 0,
+                                  "reason": "could not put the caret on a Drake data-entry "
+                                            "box after navigating. Nothing was typed."}
+                        print(f"\n{report['reason']}", file=sys.stderr)
+                    else:
+                        report = _enter_one_payload(driver, payload, args, token=token)
+                        if navr is not None:
+                            report["navigation"] = navr["steps"]
+                            report["return_title"] = navr.get("return_title")
+                            report["record"] = navr.get("record")
                 processed += 1
 
                 shot = driver.save_screenshot(str(root / f"{path.stem}.png"))
@@ -984,6 +1097,141 @@ def cmd_envdump(args) -> int:
     return 0
 
 
+_INTERESTING_TYPES = {"Button", "Edit", "ComboBox", "List", "ListItem", "MenuItem", "Tab",
+                      "TabItem", "CheckBox", "RadioButton", "Tree", "TreeItem", "DataGrid",
+                      "DataItem", "Table", "Hyperlink", "SplitButton", "Document"}
+
+
+def _explore_sort_key(e: dict):
+    """Reading order: top, then left. Elements with no rectangle sort last so they never
+    push a real control out of position."""
+    r = e.get("rect")
+    return (0, int(r[1]), int(r[0])) if r else (1, 0, 0)
+
+
+def cmd_explore(args) -> int:
+    """Show what Drake is displaying RIGHT NOW — every visible window and its controls.
+
+    READ-ONLY. It presses nothing, clicks nothing, focuses nothing. Safe to run at any
+    moment, including mid-return, including with a dialog up.
+
+    This is the tool that has to come before any navigation code. `open_return()` and
+    `open_screen()` in the driver were written from an assumption about how Drake probably
+    works and have never been confirmed against the real thing; the last time this project
+    built on that kind of assumption — the caret re-arm — it failed live three times in a
+    row. Run this at each step you want automated (home screen, client selector, data entry
+    menu) and the navigation gets built against what Drake actually shows.
+    """
+    import time
+    driver = DrakeDriver(load_binding(args.binding))
+    driver.connect()
+    wi = driver.window_info()
+    print(f"\nBound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
+    if args.delay:
+        print("Capturing in ", end="", flush=True)
+        for n in range(args.delay, 0, -1):
+            print(f"{n}… ", end="", flush=True)
+            time.sleep(1)
+        print()
+
+    dump = driver.explore_screen(cap=args.cap)
+    if not dump.get("ok"):
+        print(f"explore failed: {dump.get('error')}", file=sys.stderr)
+        return 1
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(dump, f, indent=2, default=str)
+
+    for w in dump["windows"]:
+        r = w.get("rect") or [0, 0, 0, 0]
+        tags = " [MAIN]" if w.get("is_main") else ""
+        if int(w["hwnd"]) in (dump.get("canvas_windows") or []):
+            tags += " [CANVAS]"
+        print("\n" + "=" * 78)
+        print(f"hwnd={w['hwnd']}  {w.get('title')!r}{tags}")
+        print(f"  class={w.get('class_name')}  {r[2]}x{r[3]} at ({r[0]},{r[1]})  "
+              f"enabled={w.get('enabled')}")
+        if w.get("note"):
+            print(f"  note: {w['note']}")
+        els = w.get("elements") or []
+        shown = els if args.all else [
+            e for e in els
+            if e.get("name") or e.get("value") or e.get("automation_id")
+            or e.get("control_type") in _INTERESTING_TYPES]
+        print(f"  {len(els)} element(s)" + (f", {len(shown)} with content" if not args.all else "")
+              + ("  — TRUNCATED, raise --cap" if w.get("truncated") else ""))
+        for e in sorted(shown, key=_explore_sort_key):
+            r2 = e.get("rect") or [0, 0, 0, 0]
+            bits = []
+            if e.get("value"):
+                bits.append(f"= {e['value']!r}")
+            if e.get("automation_id"):
+                bits.append(f"id={e['automation_id']}")
+            if e.get("toggle") is not None:
+                bits.append(f"checked={e['toggle']}")
+            if e.get("enabled") is False:
+                bits.append("DISABLED")
+            if e.get("focused"):
+                bits.append("<<< KEYBOARD")
+            name = (e.get("name") or "")[:44]
+            print(f"    {e.get('control_type', ''):<13} {name!r:<46} "
+                  f"@({r2[0]},{r2[1]}) {'  '.join(bits)}")
+
+    kt = dump.get("keyboard_target") or {}
+    print("\n" + "=" * 78)
+    print(f"keyboard lands in: {kt.get('root_title')!r} (hwnd={kt.get('root')})")
+    print(f"data-entry canvas windows: {dump.get('canvas_windows') or 'none — no return open'}")
+    if args.shot:
+        s = driver.save_screenshot(args.shot)
+        print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
+    print(f"full detail -> {args.out}")
+    print("\nNothing was pressed, clicked or changed. This command only looks.")
+    return 0
+
+
+def cmd_navigate(args) -> int:
+    """Open a client's return and a data-entry screen — and NOTHING else.
+
+    Deliberately separate from entry so navigation can be proven on its own before it is
+    ever allowed to run in front of the typing path. It opens, verifies, and stops; no
+    value is entered, so a wrong turn here costs a screen change and nothing more.
+    """
+    import drake_nav as nav
+
+    driver = DrakeDriver(load_binding(args.binding))
+    driver.connect()
+    wi = driver.window_info()
+    print(f"Bound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}\n")
+
+    cur = driver.nav_data_entry_window()
+    print(f"before: {cur['kind']} — {cur['title']!r}")
+
+    r = nav.open_client(driver, args.ssn, first_name=args.first, last_name=args.last,
+                        timeout=args.timeout)
+    if not r["ok"]:
+        print(f"\nSTOPPED at '{r['step']}': {r['reason']}", file=sys.stderr)
+        if r.get("candidates"):
+            print(f"  what Drake offered: {r['candidates']}", file=sys.stderr)
+        return 2
+    print(f"client OK ({r['step']}): {r['reason']}")
+
+    if args.screen:
+        s = nav.open_screen(driver, args.screen, timeout=args.timeout)
+        if not s["ok"]:
+            print(f"\nSTOPPED at '{s['step']}': {s['reason']}", file=sys.stderr)
+            if s.get("candidates"):
+                print(f"  screens on this menu: {', '.join(s['candidates'])}", file=sys.stderr)
+            return 2
+        print(f"screen OK: {s['reason']}")
+
+    after = driver.nav_data_entry_window()
+    print(f"\nafter: {after['kind']} — {after['title']!r}")
+    if args.shot:
+        sh = driver.save_screenshot(args.shot)
+        print(f"screenshot -> {sh['path']}" if sh.get("ok") else f"(screenshot failed: {sh.get('error')})")
+    print("\nNothing was typed. This command only navigates.")
+    return 0
+
+
 def _values_match(got, exp) -> bool:
     """Compare a read-back to the expected value. Delegates to the driver's comparator so
     selftest and live entry apply the SAME rule — the local alnum-only copy that used to
@@ -1135,8 +1383,23 @@ def main() -> int:
     spp = sub.add_parser("probe-popup", parents=[common]); spp.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the probe runs"); spp.add_argument("--probe-field", dest="probe_field", default="6", help="which field number the probe jumps to. Default 6 (employer 'Name cont.' — normally empty and inert). NEVER use 4: it is the EIN, it auto-fills, and it is the do-not-touch box"); spp.set_defaults(func=cmd_probe_popup)
     spc = sub.add_parser("probe-checkbox", parents=[common]); spc.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the probe runs"); spc.add_argument("--field", dest="field_no", default="47", help="which CHECKBOX field to probe. Default 47 (Box 13 retirement plan); 46 statutory employee, 48 sick pay"); spc.add_argument("--no-flip", dest="no_flip", action="store_true", help="observe only — read the arrival state and leave without sending any token"); spc.set_defaults(func=cmd_probe_checkbox)
     sw2 = sub.add_parser("write-w2", parents=[common]); sw2.add_argument("--json", required=True, help="extracted W-2 JSON (the LLM's structured output — see w2_map.W2_SCHEMA_KEYS)"); sw2.add_argument("--dry-run", action="store_true", help="resolve and PRINT the plan without touching Drake — run this first, works anywhere"); sw2.add_argument("--skip-field", dest="skip_field", type=int, action="append", metavar="N", help="do NOT enter this field number, even if the extraction has a value for it; repeatable. Use --skip-field 4 to leave the employer EIN alone (it also avoids Drake's auto-fill + auto-advance)"); sw2.add_argument("--ts", choices=["T", "S"], help="whose W-2 this is (field 1). Drake defaults to T; on a JOINT return an unset TS files the spouse's W-2 under the taxpayer"); sw2.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="proceed even if some extracted values could not be resolved (they stay blank in Drake for you to key by hand)"); sw2.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero (default: skip — a blank box is zero on a tax form)"); sw2.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); sw2.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field (auto-fill/validation)"); sw2.add_argument("--delay", type=int, default=10, help="seconds to click into the W-2 screen before entry fires"); sw2.add_argument("--shot", default="w2-after.png", help="screenshot saved after the run — the verification artifact"); sw2.set_defaults(func=cmd_write_w2)
-    swt = sub.add_parser("watch", parents=[common]); swt.add_argument("--dir", required=True, help="folder the backend drops W-2 payloads into (its DRAKE_HANDOFF_DIR). Entered oldest-first, one at a time, then moved to done/ or failed/ with a .report.json"); swt.add_argument("--interval", type=float, default=2.0, help="seconds between folder checks"); swt.add_argument("--once", action="store_true", help="enter whatever is queued right now, then exit (what to use for a test)"); swt.add_argument("--keep-going", dest="keep_going", action="store_true", help="carry on to the next payload after one fails. OFF by default: a halt leaves Drake's screen in a state nobody has reviewed, and entering the next W-2 on top of it turns one bad return into several"); swt.add_argument("--ts", choices=["T", "S"], help="whose W-2 these are (field 1), when the payload does not say"); swt.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="enter the rest even when some extracted values could not be resolved (they stay blank for you to key by hand)"); swt.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero"); swt.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); swt.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field"); swt.set_defaults(func=cmd_watch)
+    swt = sub.add_parser("watch", parents=[common]); swt.add_argument("--dir", required=True, help="folder the backend drops W-2 payloads into (its DRAKE_HANDOFF_DIR). Entered oldest-first, one at a time, then moved to done/ or failed/ with a .report.json"); swt.add_argument("--interval", type=float, default=2.0, help="seconds between folder checks"); swt.add_argument("--once", action="store_true", help="enter whatever is queued right now, then exit (what to use for a test)"); swt.add_argument("--keep-going", dest="keep_going", action="store_true", help="carry on to the next payload after one fails. OFF by default: a halt leaves Drake's screen in a state nobody has reviewed, and entering the next W-2 on top of it turns one bad return into several"); swt.add_argument("--ts", choices=["T", "S"], help="whose W-2 these are (field 1), when the payload does not say"); swt.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="enter the rest even when some extracted values could not be resolved (they stay blank for you to key by hand)"); swt.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero"); swt.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); swt.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field"); swt.add_argument("--no-navigate", dest="no_navigate", action="store_true", help="do NOT open the client and screen — go back to typing into whatever a human already opened. The identity check goes away with it"); swt.add_argument("--nav-timeout", dest="nav_timeout", type=float, default=12.0, help="seconds to wait for each Drake window while navigating"); swt.add_argument("--no-new-record", dest="no_new_record", action="store_true", help="refuse instead of pressing Page Down when the open W-2 record already has another employer on it"); swt.set_defaults(func=cmd_watch)
     sev = sub.add_parser("envdump", parents=[common]); sev.add_argument("--out", default="env-dump.json", help="where to write the window-topology JSON"); sev.add_argument("--delay", type=int, default=0, help="seconds before capture — time to click a field / open heads-down first"); sev.set_defaults(func=cmd_envdump)
+    sx = sub.add_parser("explore", parents=[common], help="read-only: show every window and control Drake is displaying right now")
+    sx.add_argument("--out", default="explore.json", help="where to write the full JSON dump")
+    sx.add_argument("--delay", type=int, default=0, help="seconds before capture — time to arrange the Drake screen you want looked at")
+    sx.add_argument("--cap", type=int, default=1500, help="max UIA elements to walk before truncating")
+    sx.add_argument("--all", action="store_true", help="show every element, including nameless layout containers")
+    sx.add_argument("--shot", help="also save a window screenshot here")
+    sx.set_defaults(func=cmd_explore)
+    sn = sub.add_parser("navigate", parents=[common], help="open a client's return and a screen — types no values")
+    sn.add_argument("--ssn", required=True, help="the taxpayer's SSN/EIN, with or without dashes")
+    sn.add_argument("--first", help="employee first name — checked against Drake's client record")
+    sn.add_argument("--last", help="employee last name — checked against Drake's client record")
+    sn.add_argument("--screen", default="W2", help="screen code to open (W2, 1099, INT...). Empty to stop at the menu")
+    sn.add_argument("--timeout", type=float, default=10.0, help="seconds to wait for each Drake window")
+    sn.add_argument("--shot", help="save a screenshot when it lands")
+    sn.set_defaults(func=cmd_navigate)
     sc = sub.add_parser("calibrate", parents=[common]); sc.add_argument("--screen"); sc.set_defaults(func=cmd_calibrate)
     ss = sub.add_parser("selftest", parents=[common]); ss.add_argument("--plan", default="selftest.plan.json"); ss.add_argument("--dry-run", action="store_true"); ss.add_argument("--slow", action="store_true", help="slower keystrokes + pauses so you can watch Drake"); ss.add_argument("--shot", help="save a window screenshot here after the run (human-verify floor / OCR-box source)"); ss.set_defaults(func=cmd_selftest)
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)

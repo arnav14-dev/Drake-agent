@@ -17,6 +17,13 @@ venv/
 # in git history. Send it by hand when a halt needs diagnosing.
 env-dump-halt.json
 
+# Screen reconnaissance dumps (`agent.py explore --out ...`). Worse than the halt dump:
+# they capture the WHOLE client list, and Drake puts each client's FULL UNMASKED SSN in
+# the search-result rows' automation ids — the visible cell is masked to 'XXXXX6789', the
+# id behind it is not. That property is exactly why navigation can match a client safely,
+# and exactly why these files must never reach a repo.
+explore*.json
+
 # OS / editor
 .DS_Store
 Thumbs.db

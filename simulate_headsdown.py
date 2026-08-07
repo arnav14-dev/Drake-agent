@@ -2291,6 +2291,283 @@ def case_locality_resolution():
         m._LOCALITY_TABLE, m._LOCALITY_SOURCE = saved_table, saved_src
 
 
+def _table(title, checks) -> bool:
+    """Run a list of (description, boolean) and report. Shared by the navigation cases."""
+    ok = all(v for _, v in checks)
+    _check(title, ok)
+    for name, v in checks:
+        print(f"    {'ok  ' if v else 'FAIL'}: {name}")
+    return ok
+
+
+def case_nav_identity_from_title():
+    """The gate that stands between a mis-click and 78 verified values in a stranger's
+    return. Every string here is a real Drake 2025 window title from an explore dump."""
+    from drake_nav import parse_data_entry_title, verify_open_return
+    T = "Drake 2025 - Data Entry (123456789 - fynn, Test) - (CONTAINS SENSITIVE DATA)"
+    HOME = "Drake 2025 Tax Software"
+    p = parse_data_entry_title(T)
+    checks = [
+        ("the live title parses to id + name",
+         p is not None and p["id"] == "123456789" and p["name"] == "fynn, Test"),
+        # The W-2 screen's title carries a TRAILING SPACE that the menu's does not. Both are
+        # the same return; a parser that keeps it would compare unequal forever.
+        ("the trailing-space variant parses identically",
+         parse_data_entry_title(T + " ") == p),
+        ("the home screen is not a return", parse_data_entry_title(HOME) is None),
+        ("a hyphenated SSN in the title normalises",
+         (parse_data_entry_title("Data Entry (123-45-6789 - fynn, Test)") or {})["id"]
+         == "123456789"),
+
+        ("the right return passes", verify_open_return(T, "123456789", "Test", "fynn")["ok"]),
+        ("a dashed SSN from the payload still passes",
+         verify_open_return(T, "123-45-6789", "Test", "fynn")["ok"]),
+        # The whole point of the module.
+        ("a DIFFERENT return is refused",
+         not verify_open_return(T, "500001007", "Media", "Blogger")["ok"]),
+        ("the refusal names both ids so the operator can see what happened",
+         "123456789" in verify_open_return(T, "500001007")["reason"]
+         and "500001007" in verify_open_return(T, "500001007")["reason"]),
+        # Off-by-one and prefix errors are how a wrong-client bug actually looks.
+        ("an id that is a PREFIX of the open one is refused",
+         not verify_open_return(T, "12345678")["ok"]),
+        ("an id with one digit changed is refused",
+         not verify_open_return(T, "123456780")["ok"]),
+        ("no return open at all is refused", not verify_open_return(HOME, "123456789")["ok"]),
+        ("an empty title is refused", not verify_open_return("", "123456789")["ok"]),
+        ("no id to check against is refused, not waved through",
+         not verify_open_return(T, "")["ok"]),
+        # Right family, wrong person — the id matched but the name did not.
+        ("matching id with a mismatched surname is refused",
+         not verify_open_return(T, "123456789", "Test", "Smith")["ok"]),
+        ("a payload with no name still passes on the id alone",
+         verify_open_return(T, "123456789")["ok"]),
+    ]
+    return _table("navigation: the open return is proved from Drake's own title", checks)
+
+
+def case_nav_name_matching():
+    """Strict on surname, forgiving on given name — and never treating an unreadable
+    name as agreement."""
+    from drake_nav import names_match, split_drake_name
+    ok_ = lambda d, f, l: names_match(d, f, l)["ok"]
+    checks = [
+        ("'fynn, Test' matches Test fynn", ok_("fynn, Test", "Test", "fynn")),
+        ("case and spacing are ignored", ok_("  FYNN ,  TEST ", "test", "FYNN")),
+        ("'WATERSON, MINERAL' matches Mineral Waterson",
+         ok_("WATERSON, MINERAL", "Mineral", "Waterson")),
+        # Joint returns: a spouse's W-2 belongs in this return too.
+        ("a joint return accepts the first spouse",
+         ok_("BLOGGER, MEDIA & NICHE", "Media", "Blogger")),
+        ("a joint return accepts the SECOND spouse",
+         ok_("BLOGGER, MEDIA & NICHE", "Niche", "Blogger")),
+        ("a middle name on one side only still matches",
+         ok_("RUNNER, MILES LANE", "Miles", "Runner")),
+        ("punctuation differences are noise", ok_("O'BRIEN, SEAN", "Sean", "OBrien")),
+        ("a generational suffix is noise", ok_("SMITH JR, JOHN", "John", "Smith")),
+
+        ("a different surname is refused", not ok_("SHOEMAKER, OXFORD", "Oxford", "Loafer")),
+        ("a different given name is refused", not ok_("fynn, Test", "Other", "fynn")),
+        # Substring matching would pass this. It is a different person.
+        ("'ANN' does not match 'DEANNA'", not ok_("SMITH, DEANNA", "Ann", "Smith")),
+        ("'ROB' does not match 'ROBERT'", not ok_("SMITH, ROBERT", "Rob", "Smith")),
+        ("an unreadable Drake name is refused, not assumed", not ok_("", "Test", "fynn")),
+        ("a payload with no name at all is refused here", not ok_("fynn, Test", "", "")),
+
+        ("'BLOGGER, MEDIA & NICHE' splits into a surname and two given names",
+         split_drake_name("BLOGGER, MEDIA & NICHE")
+         == {"last": "BLOGGER", "given": ["MEDIA", "NICHE"]}),
+        ("a name with no comma treats the last token as the surname",
+         split_drake_name("Test fynn")["last"] == "FYNN"),
+    ]
+    return _table("navigation: client name matching", checks)
+
+
+def case_nav_row_selection():
+    """Which search-result row is this taxpayer? Matched on the full id in the row's
+    automation id — never the masked cell, never the name, never 'the only row'."""
+    from drake_nav import choose_client_row, row_client_id
+    P = "ClientSelectionUC_DataGridSearchResultsClientsItem"
+    rows = [                                    # straight from the live explore dump
+        {"automation_id": P + "500001007-0", "name": "BLOGGER, MEDIA & NICHE"},
+        {"automation_id": P + "500001008-1", "name": "CATAMARAN, LEEWARD & STARBOARD"},
+        {"automation_id": P + "123456789-8", "name": "fynn, Test"},
+    ]
+    pick = lambda ssn: choose_client_row(rows, ssn)
+    checks = [
+        ("the full id is read out of the row's automation id",
+         row_client_id(P + "123456789-8") == "123456789"),
+        ("a row id of another shape yields nothing, not a wrong match",
+         row_client_id("SomeOtherControl") == "" and row_client_id(P + "abc-1") == ""),
+        ("the right row is chosen", pick("123456789")["row"]["name"] == "fynn, Test"),
+        ("a dashed SSN finds the same row", pick("123-45-6789")["row"]["name"] == "fynn, Test"),
+        ("an id nobody has is refused", not pick("999999999")["ok"]),
+        ("...and is reported as not-found, so the caller can offer to create",
+         pick("999999999").get("not_found") is True),
+        # The visible cell shows XXXXX6789. Four digits are not an identity.
+        ("the masked suffix alone does not select a row", not pick("6789")["ok"]),
+        ("an empty id is refused", not pick("")["ok"]),
+        ("no rows at all is refused", not choose_client_row([], "123456789")["ok"]),
+        ("two rows claiming one id refuse rather than pick the first",
+         not choose_client_row(rows + [{"automation_id": P + "123456789-9",
+                                        "name": "SOMEONE, Else"}], "123456789")["ok"]),
+    ]
+    return _table("navigation: choosing the client row", checks)
+
+
+def case_nav_row_name_pairing():
+    """The row carries the id, a separate 'ClientName' Text carries the name, and only
+    geometry relates them. Rectangles below are the real ones from the live dump."""
+    from drake_nav import collect_client_rows, choose_client_row
+    P = "ClientSelectionUC_DataGridSearchResultsClientsItem"
+    els = [
+        {"automation_id": P + "500001007-0", "name": "row", "rect": [417, 259, 827, 277]},
+        {"automation_id": "ClientName", "name": "BLOGGER, MEDIA & NICHE", "rect": [423, 260, 700, 275]},
+        {"automation_id": "MaskedId", "name": "XXXXX1007", "rect": [882, 260, 940, 275]},
+        {"automation_id": P + "123456789-8", "name": "row", "rect": [417, 411, 827, 429]},
+        {"automation_id": "ClientName", "name": "fynn, Test", "rect": [423, 412, 700, 427]},
+    ]
+    got = collect_client_rows(els)
+    by_id = {r["automation_id"]: r["name"] for r in got}
+    orphan = collect_client_rows([e for e in els if e["automation_id"] != "ClientName"])
+    checks = [
+        ("both rows are found", len(got) == 2),
+        ("each row gets the name sitting in ITS band",
+         by_id.get(P + "500001007-0") == "BLOGGER, MEDIA & NICHE"
+         and by_id.get(P + "123456789-8") == "fynn, Test"),
+        # 152 pixels apart in the real dialog. Nearest-match would still be wrong.
+        ("a row does NOT borrow the next row's name",
+         by_id.get(P + "123456789-8") != "BLOGGER, MEDIA & NICHE"),
+        ("a row with no name cell keeps name='' rather than a neighbour's",
+         all(r["name"] == "" for r in orphan)),
+        ("...and that empty name then fails the identity check, which is the point",
+         not choose_client_row(orphan, "123456789")["ok"]
+         or orphan[0]["name"] == ""),
+        ("the masked-id cell is never mistaken for a name",
+         "XXXXX1007" not in by_id.values()),
+        ("no elements at all yields no rows", collect_client_rows([]) == []),
+    ]
+    return _table("navigation: pairing a client row with its displayed name", checks)
+
+
+def case_nav_record_safety():
+    """A W-2 screen is ONE employer. Getting this wrong duplicates a client's wages, and
+    no read-back would catch it — every value would verify perfectly."""
+    from drake_nav import parse_record_position, plan_record_use
+    blank = {"ok": True, "index": 1, "count": 1, "populated": 0, "values": []}
+    occupied = {"ok": True, "index": 1, "count": 1, "populated": 3, "values": [
+        {"value": "93-4517345"}, {"value": "your tax team ca"}, {"value": "29477"}]}
+    unreadable = {"ok": False, "reason": "the form's control tree could not be read",
+                  "index": None, "count": None, "populated": 0, "values": []}
+    # What the first live navigate-and-fill run actually met: leftover City/State, no
+    # employer, no money. Classifying this as a real W-2 is what made the run halt.
+    fragment = {"ok": True, "index": 1, "count": 1, "populated": 2, "values": [
+        {"value": "Van Nuys"}, {"value": "CA"}]}
+    act = lambda s, ein=None, **kw: plan_record_use(s, ein, **kw)["action"]
+    checks = [
+        ("'Record 1 of 1' parses",
+         parse_record_position("Record 1 of 1") == {"index": 1, "count": 1}),
+        ("'Record 2 of 3' parses",
+         parse_record_position("Record 2 of 3") == {"index": 2, "count": 3}),
+        ("unrelated status text is not a record position",
+         parse_record_position("Press Page Down for New Screen") is None),
+
+        ("a blank record is used", act(blank) == "use"),
+        ("a blank record is used even when an EIN is supplied",
+         act(blank, "934517345") == "use"),
+        # The dangerous one.
+        ("re-sending the SAME employer REFUSES rather than duplicating wages",
+         act(occupied, "93-4517345") == "refuse"),
+        ("...and the refusal explains the consequence, not just the fact",
+         "double" in plan_record_use(occupied, "934517345")["reason"]),
+        ("a DIFFERENT employer opens a new record (a second job is normal)",
+         act(occupied, "99-1112222") == "new"),
+        ("an occupied record with no EIN to compare still opens a new record",
+         act(occupied) == "new"),
+        ("...but refuses instead when opening new records is disabled",
+         act(occupied, allow_new=False) == "refuse"),
+        # 'I could not look' must never mean 'nothing is there'.
+        # The live halt of 2026-08-07: leftover City/State classified as a real W-2, so the
+        # run pressed Page Down, Drake refused to leave an incomplete screen, and nothing
+        # happened. The values are not a W-2 — no employer, no money.
+        ("stray text with no employer and no money is FILLED IN, not paged past",
+         act(fragment) == "use"),
+        ("...and the reason says why, so the operator is not guessing",
+         "not a W-2" in plan_record_use(fragment)["reason"]),
+        ("a record holding only a ZIP still counts as real (errs towards keeping data)",
+         act({"ok": True, "index": 1, "count": 1, "populated": 1,
+              "values": [{"value": "75001"}]}) == "new"),
+        ("a record holding only an amount counts as real",
+         act({"ok": True, "index": 1, "count": 1, "populated": 1,
+              "values": [{"value": "52,000.00"}]}) == "new"),
+        ("a record with a street address but no numbers is still a fragment",
+         act({"ok": True, "index": 1, "count": 1, "populated": 1,
+              "values": [{"value": "MAIN ST"}]}) == "use"),
+        ("an UNREADABLE form refuses rather than assuming it is blank",
+         act(unreadable) == "refuse"),
+        ("a missing state refuses", act(None) == "refuse"),
+        ("the EIN comparison ignores dash formatting",
+         act({"ok": True, "index": 1, "count": 1, "populated": 1,
+              "values": [{"value": "934517345"}]}, "93-4517345") == "refuse"),
+    ]
+    return _table("navigation: one W-2 record per employer", checks)
+
+
+def case_nav_screen_link():
+    """'W2' must open Wages and never Gambling Income. The two buttons sit nineteen
+    pixels apart on Drake's General tab, and any prefix rule confuses them."""
+    from drake_nav import parse_screen_link, choose_screen_link
+    links = [                                   # straight from the live explore dump
+        {"automation_id": "LINK_0_Col0_Sel10", "name": "W2|Wages"},
+        {"automation_id": "LINK_0_Col0_Sel11", "name": "W2G|Gambling Income"},
+        {"automation_id": "LINK_0_Col0_Sel12", "name": "1099|1099-R, Retirement"},
+        {"automation_id": "LINK_0_Col0_Sel17", "name": "99N|1099-NEC, Nonemployee Compensation"},
+        {"automation_id": "LINK_0_Col0_Sel1", "name": "1|Name and Address"},
+    ]
+    pick = lambda c: choose_screen_link(links, c)
+    checks = [
+        ("'W2|Wages' parses into code and title",
+         parse_screen_link("W2|Wages") == {"code": "W2", "title": "Wages"}),
+        ("a label with no pipe is not a screen link",
+         parse_screen_link("Import W2") is None),
+        ("W2 opens Wages", pick("W2")["link"]["automation_id"] == "LINK_0_Col0_Sel10"),
+        # The bug this rule exists to prevent.
+        ("W2 does NOT open W2G", pick("W2")["link"]["name"] == "W2|Wages"),
+        ("W2G still resolves to itself",
+         pick("W2G")["link"]["automation_id"] == "LINK_0_Col0_Sel11"),
+        ("lower case is accepted", pick("w2")["link"]["name"] == "W2|Wages"),
+        ("a numeric code works", pick("1")["link"]["name"] == "1|Name and Address"),
+        # '1' is a prefix of '1099'. A startswith rule opens the wrong screen here.
+        ("'1' does not open '1099'", pick("1")["link"]["name"] != "1099|1099-R, Retirement"),
+        ("a code that is not on the menu is refused", not pick("SCHC")["ok"]),
+        ("...and the refusal lists what IS there", "W2" in pick("SCHC")["candidates"]),
+        ("an empty code is refused", not pick("")["ok"]),
+        ("two buttons claiming one code refuse rather than pick the first",
+         not choose_screen_link(links + [{"automation_id": "LINK_0_Col1_Sel99",
+                                          "name": "W2|Wages (duplicate)"}], "W2")["ok"]),
+    ]
+    return _table("navigation: choosing the screen link", checks)
+
+
+def case_nav_menu_is_not_the_form():
+    """Both windows are titled 'Data Entry (...)'. Telling them apart by structure is what
+    stops a run from arming its caret in the menu's screen-search box and typing field
+    numbers into it."""
+    from drake_nav import classify_data_entry_window
+    MENU = ["menuTabControl", "MenuScreenWindow_TextBoxSearch", "statusbar", "txtReturnStatus"]
+    FORM = ["taxTabControl", "ucTaxForm", "TAB_7_0", "Textbox_2", "Dropdown_1"]
+    checks = [
+        ("the Data Entry Menu is recognised", classify_data_entry_window(MENU) == "menu"),
+        ("a tax form screen is recognised", classify_data_entry_window(FORM) == "form"),
+        ("a window with neither marker is 'unknown', not guessed",
+         classify_data_entry_window(["Minimize", "Close"]) == "unknown"),
+        ("an empty tree is 'unknown'", classify_data_entry_window([]) == "unknown"),
+        ("a window carrying BOTH markers is 'unknown', not silently called a form",
+         classify_data_entry_window(MENU + FORM) == "unknown"),
+    ]
+    return _table("navigation: the menu screen is not the form screen", checks)
+
+
 def main() -> int:
     # The suite prints '⚠' and '·', and a REDIRECTED stdout on Windows is cp1252 — which
     # raised UnicodeEncodeError inside the driver, was caught by headsdown_type's outer
@@ -2316,6 +2593,13 @@ def main() -> int:
     # once per mutant — being able to run only the family a mutant touches is the
     # difference between a 30-minute check and an all-day one.
     cases = [
+        ('nav_identity_from_title', lambda: case_nav_identity_from_title()),
+        ('nav_name_matching', lambda: case_nav_name_matching()),
+        ('nav_row_selection', lambda: case_nav_row_selection()),
+        ('nav_row_name_pairing', lambda: case_nav_row_name_pairing()),
+        ('nav_record_safety', lambda: case_nav_record_safety()),
+        ('nav_screen_link', lambda: case_nav_screen_link()),
+        ('nav_menu_is_not_the_form', lambda: case_nav_menu_is_not_the_form()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),
         ('caret_rearm_impossible_halts', lambda: case_rearm_that_cannot_work_halts_clean()),

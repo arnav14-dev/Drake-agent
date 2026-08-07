@@ -1195,6 +1195,26 @@ class DrakeDriver:
             _say(f"  · {len(extras)} other window(s) in the Drake process at attach — "
                   f"benign baseline, ignored unless one blocks input: {names}")
 
+    def rebaseline(self, why: str = "") -> None:
+        """Re-take the window baseline after the AGENT itself changed Drake's screen.
+
+        The dialog gate's question is "did this change since we attached", which is exactly
+        right while a human does the navigating and the agent only types. The moment the
+        agent opens returns for itself, that question has a stale answer: opening a return
+        creates a new top-level window and disables the frames behind it — structurally
+        identical to a modal arriving. It halted the first live navigate-and-fill run on
+        field 1, reporting a modal, with nothing typed and no dialog anywhere on screen.
+
+        Called ONLY after navigation has proved from Drake's OWN window title that the
+        right return is open. That is not a weakened gate: a window the agent opened on
+        purpose and then verified is the definition of expected, and anything appearing
+        after this point still halts exactly as before.
+        """
+        self._snapshot_baseline()
+        if why:
+            _say(f"  · window baseline re-taken after {why} — the return's own window is "
+                 f"now Drake at rest, not a blocker")
+
     def _note_benign(self, w) -> None:
         line = (f"ignoring benign window {w.get('title')!r} "
                 f"(class={w.get('class_name')}, hwnd={w.get('hwnd')}) — non-modal, not a dialog")
@@ -1608,6 +1628,16 @@ class DrakeDriver:
                     continue
                 if int(r.top) < self._canvas_form_top:
                     continue                     # toolbar / tab strip, not the form
+                # The Data Entry MENU is titled 'Data Entry (...)' too, so canvas_windows()
+                # accepts it — and the only Edit on it is the screen-search box at the
+                # bottom. Arming the caret there would send field numbers into a search
+                # field. Callers gate on nav_data_entry_window()['kind'] == 'form'; this
+                # is the belt to that braces.
+                try:
+                    if str(el.element_info.automation_id or "") == "MenuScreenWindow_TextBoxSearch":
+                        continue
+                except Exception:
+                    pass
                 key = (int(r.top), int(r.left))
                 if best is None or key < best[0]:
                     best = (key, el)
@@ -2927,6 +2957,308 @@ class DrakeDriver:
                 out.append({"control_type": ct, "text": tx, "value": val, "rect": rect})
         return out
 
+    def explore_screen(self, *, cap: int = 1500) -> dict:
+        """READ-ONLY reconnaissance: everything Drake is showing right now.
+
+        Presses nothing, clicks nothing, focuses nothing, changes nothing. Its only job is
+        to answer "what is ACTUALLY on screen" so navigation can be built against Drake as
+        it is, rather than against a guess about how it probably works.
+
+        This tool exists because of a specific failure. The caret re-arm of 2026-08-05 was
+        reasoned about instead of looked at — Esc would reach the popup, Tab would move
+        focus, a changed focus HWND would prove it worked — and every one of those was
+        wrong, live, three times. `open_return()` and `open_screen()` in this file are
+        still guesses of exactly that kind. Nothing gets built on them until this has
+        shown what the screens really contain.
+
+        Returns every visible top-level window of the Drake process and, for each, its UIA
+        tree: control type, name, value, automation id, rect, enabled, and which element
+        holds the keyboard.
+        """
+        if not _WINFN or self.dry_run or self.app is None:
+            return {"ok": False, "error": "explore runs on Windows with a live connection"}
+        try:
+            pid = int(self.pid or self.win.element_info.process_id)
+        except Exception as e:
+            return {"ok": False, "error": f"no Drake process: {type(e).__name__}: {e}"}
+
+        windows, budget = [], int(cap)
+        for w in _enum_toplevel_windows(pid):
+            if not w.get("visible"):
+                continue
+            r = w.get("rect") or [0, 0, 0, 0]
+            entry = {"hwnd": int(w["hwnd"]), "title": w.get("title"),
+                     "class_name": w.get("class_name"), "rect": r,
+                     "enabled": w.get("enabled"),
+                     "is_main": bool(self.main_hwnd and int(w["hwnd"]) == int(self.main_hwnd)),
+                     "elements": [], "truncated": False}
+            if r[2] < 120 or r[3] < 60:
+                entry["note"] = "too small to be a screen — not walked"
+                windows.append(entry)
+                continue
+            try:
+                els = self.app.window(handle=int(w["hwnd"])).descendants()
+            except Exception as e:
+                entry["note"] = f"UIA tree unavailable: {type(e).__name__}: {e}"
+                windows.append(entry)
+                continue
+            for el in els:
+                if budget <= 0:
+                    entry["truncated"] = True
+                    break
+                budget -= 1
+                entry["elements"].append(_describe_element(el))
+            windows.append(entry)
+
+        return {"ok": True, "takenAt": _now(), "pid": pid, "main_hwnd": self.main_hwnd,
+                "keyboard_target": _keyboard_target_info(),
+                "canvas_windows": self.canvas_windows(),
+                "budget_left": budget, "windows": windows}
+
+    # -- navigation primitives --------------------------------------------------------
+    # These only ACT. Every decision about whether acting is safe — which client, which
+    # screen, whether the right return is open — lives in drake_nav.py, where it can be
+    # tested without Drake. Nothing here chooses a target.
+
+    def nav_find_window(self, title_re: str, *, timeout: float = 8.0):
+        """hwnd of a visible Drake window whose title matches, or None after `timeout`.
+
+        Polls, because Drake's windows appear on their own schedule: the Open/Create dialog
+        takes a beat, and a return with a lot of screens takes longer. A fixed sleep would
+        be either too short on a slow box or wasted time on a fast one.
+        """
+        import time
+        deadline = time.time() + float(timeout)
+        while True:
+            try:
+                pid = int(self.pid or self.win.element_info.process_id)
+                for w in _enum_toplevel_windows(pid):
+                    if w.get("visible") and _re.search(title_re, w.get("title") or ""):
+                        return int(w["hwnd"])
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.1)
+
+    def nav_wait_gone(self, hwnd, *, timeout: float = 8.0) -> bool:
+        """Wait for a window to close. Used to confirm the Open/Create dialog actually
+        went away — a dialog still on screen means the click did not take, and pressing on
+        would send keystrokes into it."""
+        import time
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            try:
+                pid = int(self.pid or self.win.element_info.process_id)
+                alive = any(int(w["hwnd"]) == int(hwnd) and w.get("visible")
+                            for w in _enum_toplevel_windows(pid))
+            except Exception:
+                alive = False
+            if not alive:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def nav_window_title(self, hwnd) -> str:
+        try:
+            for w in _enum_toplevel_windows(int(self.pid or self.win.element_info.process_id)):
+                if int(w["hwnd"]) == int(hwnd):
+                    return w.get("title") or ""
+        except Exception:
+            pass
+        return ""
+
+    def nav_elements(self, hwnd) -> list:
+        """Every element in a window's UIA tree, flattened. The list drake_nav's choosers
+        pick from — they receive data, never live COM handles, which is what lets the same
+        choosing logic be tested offline against dumps of the real screens."""
+        try:
+            els = self.app.window(handle=int(hwnd)).descendants()
+        except Exception:
+            return []
+        out = []
+        for el in els:
+            d = _describe_element(el)
+            d["_el"] = el                 # the live handle, for nav_act; never serialised
+            out.append(d)
+        return out
+
+    def nav_act(self, element: dict, *, want: str = "invoke") -> dict:
+        """Press/select one element. {'ok', 'how', 'error'}.
+
+        Tries the accessibility patterns first and a real mouse click only as a last
+        resort. Invoke and Select are coordinate-free: they cannot land on the wrong
+        control because the window moved, was partly off-screen, or was overlapped — and
+        Drake's own client list is a WPF grid whose rows scroll under a fixed header.
+        `how` is reported so a run's log says which one Drake accepted.
+        """
+        el = (element or {}).get("_el")
+        if el is None:
+            return {"ok": False, "how": None, "error": "no live element to act on"}
+        order = ({"invoke": ["invoke", "select", "click"],
+                  "select": ["select", "invoke", "click"]}).get(want, ["invoke", "select", "click"])
+        errors = []
+        for how in order:
+            try:
+                if how == "invoke":
+                    el.invoke()
+                elif how == "select":
+                    el.select()
+                else:
+                    el.click_input()
+                return {"ok": True, "how": how, "error": None}
+            except Exception as e:
+                errors.append(f"{how}: {type(e).__name__}")
+        return {"ok": False, "how": None, "error": "; ".join(errors)}
+
+    def nav_type_into(self, element: dict, text: str) -> dict:
+        """Clear a text box and type into it the way a person would — focus, select all,
+        delete, then keystrokes. {'ok', 'error'}.
+
+        NOT a programmatic set_text. Drake's client search filters its grid as characters
+        arrive; a value poked straight into the control can leave the bound list showing
+        the results of the PREVIOUS search, and the row we then pick would belong to
+        whoever was on screen before. Typing makes Drake do its own filtering.
+        """
+        el = (element or {}).get("_el")
+        if el is None:
+            return {"ok": False, "error": "no live element to type into"}
+        try:
+            el.set_focus()
+        except Exception as e:
+            return {"ok": False, "error": f"could not focus the box: {type(e).__name__}: {e}"}
+        try:
+            self._keys("^a{DELETE}")
+            self._keys(_escape_keys(str(text)))
+            return {"ok": True, "error": None}
+        except Exception as e:
+            return {"ok": False, "error": f"could not type: {type(e).__name__}: {e}"}
+
+    def form_record_state(self) -> dict:
+        """What is already on the CURRENT data-entry record.
+
+        {ok, index, count, values, populated, reason}
+
+        Drake screens are RECORDS, not pages: one W-2 screen holds one employer, and Page
+        Down opens another. Nothing in this project ever looked, so every run typed into
+        whatever record happened to be showing — fine while a human picked the screen, and
+        a way to overwrite an existing W-2 or duplicate one the moment the agent navigates
+        for itself. Duplicating a W-2 does not look like a bug; it looks like a client who
+        earned twice as much.
+
+        Values come from UIA, which is trustworthy here: the blue blocks on Drake's form
+        are FLAGGED-field highlights, not masked data, and the first end-to-end read an EIN
+        back through this same channel. An unreadable form returns ok=False rather than an
+        empty list, because "I could not look" must not be mistaken for "nothing is there".
+        """
+        de = self.nav_data_entry_window()
+        if de["kind"] != "form":
+            return {"ok": False, "reason": f"no data-entry form is open (kind={de['kind']})",
+                    "index": None, "count": None, "values": [], "populated": 0}
+        els = self.nav_elements(de["hwnd"])
+        if not els:
+            return {"ok": False, "reason": "the form's control tree could not be read",
+                    "index": None, "count": None, "values": [], "populated": 0}
+
+        index = count = None
+        for e in els:
+            if e.get("automation_id") == "txtInstance":
+                from drake_nav import parse_record_position
+                pos = parse_record_position(e.get("name"))
+                if pos:
+                    index, count = pos["index"], pos["count"]
+                break
+
+        values, seen = [], set()
+        for e in els:
+            if e.get("control_type") not in ("Edit", "ComboBox"):
+                continue
+            r = e.get("rect")
+            if not r or int(r[1]) < self._canvas_form_top:
+                continue                      # toolbar / tab strip, not the form
+            v = (e.get("value") or "").strip()
+            if not v:
+                continue
+            # A ComboBox and its inner PART_EditableTextBox are the same box twice.
+            key = (int(r[1]), int(r[0]), v)
+            if key in seen:
+                continue
+            seen.add(key)
+            values.append({"automation_id": e.get("automation_id"), "value": v,
+                           "rect": r})
+        return {"ok": True, "reason": "", "index": index, "count": count,
+                "values": values, "populated": len(values)}
+
+    def form_new_record(self, *, timeout: float = 6.0) -> dict:
+        """Page Down to a fresh blank record on the open screen. {ok, index, count, reason}.
+
+        Verifies afterwards that the record really is blank. Drake's own status bar says
+        'Press Page Down for New Screen', but a keystroke that silently did nothing would
+        otherwise leave the run typing a second W-2 on top of the first.
+        """
+        import time
+        before = self.form_record_state()
+        if not before["ok"]:
+            return {"ok": False, "reason": before["reason"]}
+        if not self._focus_canvas_field():
+            return {"ok": False, "reason": "could not put the caret on the form before Page Down"}
+        try:
+            self._keys("{PGDN}")
+        except Exception as e:
+            return {"ok": False, "reason": f"Page Down failed: {type(e).__name__}: {e}"}
+
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            after = self.form_record_state()
+            if after["ok"] and after["populated"] == 0 and (
+                    after["index"] != before["index"] or after["count"] != before["count"]):
+                return {"ok": True, "index": after["index"], "count": after["count"],
+                        "reason": ""}
+            time.sleep(0.15)
+        # WHY it did not work matters more than that it did not. Drake answers a Page Down
+        # off an incomplete screen with a modal — "There are fields on this screen that must
+        # contain data if you are planning to e-file this return" — and reporting that as
+        # "Page Down did not work" sends the operator looking at the keyboard instead of at
+        # the question Drake is actually asking them.
+        #
+        # It is NOT auto-answered here. The two buttons mean opposite things ("enter the
+        # data now" keeps this record, "exit this screen" leaves it), so the choice decides
+        # which record the next 78 values land in. binding.json's auto_dismiss rule answers
+        # OK for the ENTRY path, where staying put is right; that answer is wrong here, and
+        # a rule that is right in one place and wrong in another is worse than no rule.
+        after = self.form_record_state()
+        dlg = self._detect_unexpected_dialog()
+        if dlg:
+            said = " ".join(str(dlg.get("text") or dlg.get("summary") or "").split())[:300]
+            return {"ok": False, "index": after.get("index"), "count": after.get("count"),
+                    "dialog": {"title": dlg.get("title"), "text": said},
+                    "reason": f"Drake is asking a question instead of opening a new record — "
+                              f"{dlg.get('title')!r}: {said!r}. This normally means the W-2 "
+                              f"record already on screen is incomplete. Answer it in Drake "
+                              f"(or clear that record), then re-send. Nothing was typed."}
+        return {"ok": False, "index": after.get("index"), "count": after.get("count"),
+                "reason": f"Page Down did not produce a blank record (still "
+                          f"{after.get('populated')} value(s) on record "
+                          f"{after.get('index')} of {after.get('count')})"}
+
+    def nav_data_entry_window(self) -> dict:
+        """The open return's window and WHICH KIND it is: {'hwnd', 'title', 'kind'}.
+
+        kind is 'menu' (the Data Entry Menu), 'form' (a tax screen), 'unknown', or 'none'.
+        Both real windows are titled 'Data Entry (...)', so the title cannot tell them
+        apart, and the difference decides everything downstream: `_focus_canvas_field()`
+        picks the topmost Edit in a data-entry window, and on the MENU the only Edit is the
+        screen-search box — a run starting there would arm its caret in a search field and
+        type field numbers into it.
+        """
+        from drake_nav import classify_data_entry_window, DATA_ENTRY_TITLE_RE
+        hwnd = self.nav_find_window(DATA_ENTRY_TITLE_RE, timeout=0.0)
+        if not hwnd:
+            return {"hwnd": None, "title": "", "kind": "none"}
+        ids = [e.get("automation_id") for e in self.nav_elements(hwnd)]
+        return {"hwnd": hwnd, "title": self.nav_window_title(hwnd),
+                "kind": classify_data_entry_window(ids)}
+
     def audit_canvas(self, entries: list) -> dict:
         """Which planned values are ACTUALLY on the form afterwards? {ok, missing, checked}.
 
@@ -3775,6 +4107,41 @@ def _element_rect(el):
         return [int(r.left), int(r.top), int(r.right), int(r.bottom)]
     except Exception:
         return None
+
+
+def _describe_element(el) -> dict:
+    """One UIA element flattened to plain data. Never raises — a control that refuses to
+    answer a property reports that property empty rather than aborting the walk, because a
+    reconnaissance dump that dies halfway is worth less than a partial one."""
+    d: dict = {}
+    try:
+        info = el.element_info
+    except Exception as e:
+        return {"error": f"no element_info: {type(e).__name__}"}
+    try:
+        d["control_type"] = str(info.control_type or "")
+    except Exception:
+        d["control_type"] = ""
+    d["name"] = _element_name(el)
+    for key, attr in (("automation_id", "automation_id"), ("class_name", "class_name")):
+        try:
+            d[key] = str(getattr(info, attr, "") or "")
+        except Exception:
+            d[key] = ""
+    try:
+        v = el.get_value()
+        d["value"] = str(v).strip() if v is not None else ""
+    except Exception:
+        d["value"] = ""
+    d["rect"] = _element_rect(el)
+    for key, get in (("enabled", el.is_enabled), ("visible", el.is_visible)):
+        try:
+            d[key] = bool(get())
+        except Exception:
+            d[key] = None
+    d["focused"] = _element_has_keyboard_focus(el)
+    d["toggle"] = _element_toggle_state(el)
+    return d
 
 
 def _whole_dollars(value) -> Optional[str]:
