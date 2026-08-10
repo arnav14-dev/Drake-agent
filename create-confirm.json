@@ -1,0 +1,3685 @@
+{
+  "ok": true,
+  "takenAt": "2026-08-07T19:36:44.136011+00:00",
+  "pid": 6904,
+  "main_hwnd": 1903734,
+  "keyboard_target": {
+    "foreground": 1903734,
+    "root": 1903734,
+    "focus": 1903734,
+    "root_title": "Drake 2025 Tax Software",
+    "root_class": "HwndWrapper[DrakeTax2025;;92002fed-bb87-4185-9cb4-a1a1fa5c2fa0]",
+    "root_pid": 6904
+  },
+  "canvas_windows": [],
+  "budget_left": 1289,
+  "windows": [
+    {
+      "hwnd": 18549230,
+      "title": "Drake 2025 - Open Return",
+      "class_name": "HwndWrapper[DrakeTax2025;;6d4d347c-d213-4a23-93c4-6bd94e859d63]",
+      "rect": [
+        517,
+        286,
+        333,
+        157
+      ],
+      "enabled": true,
+      "is_main": false,
+      "elements": [
+        {
+          "control_type": "TitleBar",
+          "name": "",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            525,
+            289,
+            842,
+            317
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Close",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            809,
+            287,
+            843,
+            317
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "CustomMessageBoxWindow_ImageMessageBox",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            555,
+            335,
+            587,
+            367
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "999001111 does not exist.\nWould you like to create a new return?",
+          "automation_id": "CustomMessageBoxWindow_TextBlockMessage",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            599,
+            339,
+            801,
+            369
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "No",
+          "automation_id": "CustomMessageBoxWindow_ButtonNo",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            742,
+            398,
+            830,
+            424
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_No",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            778,
+            404,
+            794,
+            419
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Yes",
+          "automation_id": "CustomMessageBoxWindow_ButtonYes",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            640,
+            398,
+            728,
+            424
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_Yes",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            676,
+            404,
+            693,
+            419
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        }
+      ],
+      "truncated": false
+    },
+    {
+      "hwnd": 5179812,
+      "title": "Drake Software Chat",
+      "class_name": "HwndWrapper[DrakeTax2025;;b08c9322-fb35-4d70-b9cb-6afee0f23ea5]",
+      "rect": [
+        1262,
+        674,
+        84,
+        84
+      ],
+      "enabled": true,
+      "is_main": false,
+      "elements": [],
+      "truncated": false,
+      "note": "too small to be a screen \u2014 not walked"
+    },
+    {
+      "hwnd": 9177456,
+      "title": "Drake 2025 - Open / Create a Return",
+      "class_name": "HwndWrapper[DrakeTax2025;;4b2d1441-7543-4e59-8f3e-91f34b202836]",
+      "rect": [
+        398,
+        114,
+        570,
+        500
+      ],
+      "enabled": false,
+      "is_main": false,
+      "elements": [
+        {
+          "control_type": "TitleBar",
+          "name": "",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            406,
+            117,
+            960,
+            145
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Close",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            927,
+            115,
+            961,
+            145
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Custom",
+          "name": "",
+          "automation_id": "FileOpenCreateWindow_ClientSelectionUserControl",
+          "class_name": "ClientSelectionUC",
+          "value": "",
+          "rect": [
+            416,
+            155,
+            950,
+            550
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Enter a SSN, ITIN, or EIN to open an existing return or to create a new return.",
+          "automation_id": "ClientSelectionUC_TextBlockInstructions",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            416,
+            155,
+            950,
+            171
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Client Selection",
+          "automation_id": "ClientSelectionUC_TextBlockClientSelection",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            416,
+            178,
+            950,
+            194
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Custom",
+          "name": "",
+          "automation_id": "ClientSelectionUC_TextBoxSearch",
+          "class_name": "ClearableWatermarkTextbox",
+          "value": "",
+          "rect": [
+            416,
+            199,
+            800,
+            223
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Edit",
+          "name": "999001111",
+          "automation_id": "ClearableWatermarkTextbox_TextBoxInput",
+          "class_name": "TextBox",
+          "value": "999001111",
+          "rect": [
+            418,
+            199,
+            761,
+            223
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "\u00cf",
+          "automation_id": "ClearableWatermarkTextbox_ButtonClear",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            780,
+            201,
+            800,
+            219
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "\u00cf",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            782,
+            201,
+            797,
+            219
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "ComboBox",
+          "name": "",
+          "automation_id": "ClientSelectionUC_ComboBoxFilterSingle",
+          "class_name": "ComboBox",
+          "value": "",
+          "rect": [
+            810,
+            200,
+            950,
+            222
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "DataGrid",
+          "name": "",
+          "automation_id": "ClientSelectionUC_DataGridSearchResultsClients",
+          "class_name": "DataGrid",
+          "value": "",
+          "rect": [
+            416,
+            234,
+            950,
+            550
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Header",
+          "name": "",
+          "automation_id": "PART_ColumnHeadersPresenter",
+          "class_name": "DataGridColumnHeadersPresenter",
+          "value": "",
+          "rect": [
+            417,
+            235,
+            949,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "HeaderItem",
+          "name": "Client Name",
+          "automation_id": "ClientSelectionUC_DataGridSearchResultsClientsClientNameColumn",
+          "class_name": "DataGridColumnHeader",
+          "value": "",
+          "rect": [
+            417,
+            235,
+            827,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Client Name",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            422,
+            239,
+            491,
+            255
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Thumb",
+          "name": "",
+          "automation_id": "PART_RightHeaderGripper",
+          "class_name": "Thumb",
+          "value": "",
+          "rect": [
+            819,
+            235,
+            827,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "HeaderItem",
+          "name": "Type",
+          "automation_id": "ClientSelectionUC_DataGridSearchResultsClientsTypeColumn",
+          "class_name": "DataGridColumnHeader",
+          "value": "",
+          "rect": [
+            827,
+            235,
+            877,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Type",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            832,
+            239,
+            858,
+            255
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Thumb",
+          "name": "",
+          "automation_id": "PART_LeftHeaderGripper",
+          "class_name": "Thumb",
+          "value": "",
+          "rect": [
+            827,
+            235,
+            835,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Thumb",
+          "name": "",
+          "automation_id": "PART_RightHeaderGripper",
+          "class_name": "Thumb",
+          "value": "",
+          "rect": [
+            869,
+            235,
+            877,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "HeaderItem",
+          "name": "ID Number",
+          "automation_id": "ClientSelectionUC_DataGridSearchResultsClientsIDNumberColumn",
+          "class_name": "DataGridColumnHeader",
+          "value": "",
+          "rect": [
+            877,
+            235,
+            949,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "ID Number",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            882,
+            239,
+            944,
+            255
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Thumb",
+          "name": "",
+          "automation_id": "PART_LeftHeaderGripper",
+          "class_name": "Thumb",
+          "value": "",
+          "rect": [
+            877,
+            235,
+            885,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Thumb",
+          "name": "",
+          "automation_id": "PART_RightHeaderGripper",
+          "class_name": "Thumb",
+          "value": "",
+          "rect": [
+            941,
+            235,
+            949,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "FileOpenCreateWindow_Separator1",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            406,
+            560,
+            960,
+            561
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "OK",
+          "automation_id": "FileOpenCreateWindow_ButtonOK",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            800,
+            570,
+            870,
+            596
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_OK",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            827,
+            575,
+            843,
+            591
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Cancel",
+          "automation_id": "FileOpenCreateWindow_ButtonCancel",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            880,
+            570,
+            950,
+            596
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_Cancel",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            897,
+            575,
+            933,
+            591
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Help",
+          "automation_id": "FileOpenCreateWindow_ButtonHelp",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            416,
+            570,
+            486,
+            596
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_Help",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            439,
+            575,
+            463,
+            591
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "CheckBox",
+          "name": "Create return using temporary ITIN",
+          "automation_id": "FileOpenCreateWindow_CheckBoxTemporaryITIN",
+          "class_name": "CheckBox",
+          "value": "",
+          "rect": [
+            496,
+            575,
+            701,
+            591
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Create return using temporary ITIN",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            516,
+            574,
+            701,
+            590
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        }
+      ],
+      "truncated": false
+    },
+    {
+      "hwnd": 1903734,
+      "title": "Drake 2025 Tax Software",
+      "class_name": "HwndWrapper[DrakeTax2025;;92002fed-bb87-4185-9cb4-a1a1fa5c2fa0]",
+      "rect": [
+        -8,
+        -8,
+        1382,
+        744
+      ],
+      "enabled": false,
+      "is_main": true,
+      "elements": [
+        {
+          "control_type": "Window",
+          "name": "Drake 2025 - Open / Create a Return",
+          "automation_id": "FileOpenCreateWindow_Window",
+          "class_name": "Window",
+          "value": "",
+          "rect": [
+            398,
+            114,
+            968,
+            614
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "TitleBar",
+          "name": "",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            406,
+            117,
+            960,
+            145
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Close",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            927,
+            115,
+            961,
+            145
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Custom",
+          "name": "",
+          "automation_id": "FileOpenCreateWindow_ClientSelectionUserControl",
+          "class_name": "ClientSelectionUC",
+          "value": "",
+          "rect": [
+            416,
+            155,
+            950,
+            550
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Enter a SSN, ITIN, or EIN to open an existing return or to create a new return.",
+          "automation_id": "ClientSelectionUC_TextBlockInstructions",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            416,
+            155,
+            950,
+            171
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Client Selection",
+          "automation_id": "ClientSelectionUC_TextBlockClientSelection",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            416,
+            178,
+            950,
+            194
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Custom",
+          "name": "",
+          "automation_id": "ClientSelectionUC_TextBoxSearch",
+          "class_name": "ClearableWatermarkTextbox",
+          "value": "",
+          "rect": [
+            416,
+            199,
+            800,
+            223
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Edit",
+          "name": "999001111",
+          "automation_id": "ClearableWatermarkTextbox_TextBoxInput",
+          "class_name": "TextBox",
+          "value": "999001111",
+          "rect": [
+            418,
+            199,
+            761,
+            223
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "\u00cf",
+          "automation_id": "ClearableWatermarkTextbox_ButtonClear",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            780,
+            201,
+            800,
+            219
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "\u00cf",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            782,
+            201,
+            797,
+            219
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "ComboBox",
+          "name": "",
+          "automation_id": "ClientSelectionUC_ComboBoxFilterSingle",
+          "class_name": "ComboBox",
+          "value": "",
+          "rect": [
+            810,
+            200,
+            950,
+            222
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "DataGrid",
+          "name": "",
+          "automation_id": "ClientSelectionUC_DataGridSearchResultsClients",
+          "class_name": "DataGrid",
+          "value": "",
+          "rect": [
+            416,
+            234,
+            950,
+            550
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Header",
+          "name": "",
+          "automation_id": "PART_ColumnHeadersPresenter",
+          "class_name": "DataGridColumnHeadersPresenter",
+          "value": "",
+          "rect": [
+            417,
+            235,
+            949,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "HeaderItem",
+          "name": "Client Name",
+          "automation_id": "ClientSelectionUC_DataGridSearchResultsClientsClientNameColumn",
+          "class_name": "DataGridColumnHeader",
+          "value": "",
+          "rect": [
+            417,
+            235,
+            827,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Client Name",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            422,
+            239,
+            491,
+            255
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Thumb",
+          "name": "",
+          "automation_id": "PART_RightHeaderGripper",
+          "class_name": "Thumb",
+          "value": "",
+          "rect": [
+            819,
+            235,
+            827,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "HeaderItem",
+          "name": "Type",
+          "automation_id": "ClientSelectionUC_DataGridSearchResultsClientsTypeColumn",
+          "class_name": "DataGridColumnHeader",
+          "value": "",
+          "rect": [
+            827,
+            235,
+            877,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Type",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            832,
+            239,
+            858,
+            255
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Thumb",
+          "name": "",
+          "automation_id": "PART_LeftHeaderGripper",
+          "class_name": "Thumb",
+          "value": "",
+          "rect": [
+            827,
+            235,
+            835,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Thumb",
+          "name": "",
+          "automation_id": "PART_RightHeaderGripper",
+          "class_name": "Thumb",
+          "value": "",
+          "rect": [
+            869,
+            235,
+            877,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "HeaderItem",
+          "name": "ID Number",
+          "automation_id": "ClientSelectionUC_DataGridSearchResultsClientsIDNumberColumn",
+          "class_name": "DataGridColumnHeader",
+          "value": "",
+          "rect": [
+            877,
+            235,
+            949,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "ID Number",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            882,
+            239,
+            944,
+            255
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Thumb",
+          "name": "",
+          "automation_id": "PART_LeftHeaderGripper",
+          "class_name": "Thumb",
+          "value": "",
+          "rect": [
+            877,
+            235,
+            885,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Thumb",
+          "name": "",
+          "automation_id": "PART_RightHeaderGripper",
+          "class_name": "Thumb",
+          "value": "",
+          "rect": [
+            941,
+            235,
+            949,
+            259
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "FileOpenCreateWindow_Separator1",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            406,
+            560,
+            960,
+            561
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "OK",
+          "automation_id": "FileOpenCreateWindow_ButtonOK",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            800,
+            570,
+            870,
+            596
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_OK",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            827,
+            575,
+            843,
+            591
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Cancel",
+          "automation_id": "FileOpenCreateWindow_ButtonCancel",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            880,
+            570,
+            950,
+            596
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_Cancel",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            897,
+            575,
+            933,
+            591
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Help",
+          "automation_id": "FileOpenCreateWindow_ButtonHelp",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            416,
+            570,
+            486,
+            596
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_Help",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            439,
+            575,
+            463,
+            591
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "CheckBox",
+          "name": "Create return using temporary ITIN",
+          "automation_id": "FileOpenCreateWindow_CheckBoxTemporaryITIN",
+          "class_name": "CheckBox",
+          "value": "",
+          "rect": [
+            496,
+            575,
+            701,
+            591
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Create return using temporary ITIN",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            516,
+            574,
+            701,
+            590
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "TitleBar",
+          "name": "",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            16,
+            -5,
+            1366,
+            23
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuBar",
+          "name": "System",
+          "automation_id": "MenuBar",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            0,
+            0,
+            22,
+            22
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "System",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            0,
+            0,
+            22,
+            22
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Minimize",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            1225,
+            8,
+            1272,
+            22
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Restore",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            1272,
+            8,
+            1318,
+            22
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Close",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            1318,
+            8,
+            1374,
+            22
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Menu",
+          "name": "",
+          "automation_id": "MainWindow_MenuMainMenu",
+          "class_name": "Menu",
+          "value": "",
+          "rect": [
+            0,
+            23,
+            1366,
+            42
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "File",
+          "automation_id": "MainWindow_MenuItemFile",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            0,
+            23,
+            34,
+            42
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_File",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            7,
+            24,
+            27,
+            41
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "EF",
+          "automation_id": "MainWindow_MenuItemEF",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            34,
+            23,
+            62,
+            42
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_EF",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            41,
+            24,
+            54,
+            41
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "Tools",
+          "automation_id": "MainWindow_MenuItemTools",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            62,
+            23,
+            105,
+            42
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_Tools",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            69,
+            24,
+            98,
+            41
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "Reports",
+          "automation_id": "MainWindow_MenuItemReports",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            105,
+            23,
+            163,
+            42
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_Reports",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            113,
+            24,
+            156,
+            41
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "Last Year Data",
+          "automation_id": "MainWindow_MenuItemLYD",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            163,
+            23,
+            257,
+            42
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_Last Year Data",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            171,
+            24,
+            250,
+            41
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "Setup",
+          "automation_id": "MainWindow_MenuItemMenuSetup",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            257,
+            23,
+            304,
+            42
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_Setup",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            265,
+            24,
+            297,
+            41
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "Help",
+          "automation_id": "MainWindow_MenuItemHelp",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            304,
+            23,
+            346,
+            42
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "_Help",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            312,
+            24,
+            338,
+            41
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "ToolBar",
+          "name": "",
+          "automation_id": "MainWindow_ToolBarTop",
+          "class_name": "ToolBar",
+          "value": "",
+          "rect": [
+            -5,
+            42,
+            1377,
+            106
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "OverflowButton",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            1360,
+            43,
+            1376,
+            105
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Menu",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Menu",
+          "value": "",
+          "rect": [
+            -2,
+            44,
+            986,
+            103
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemFileOpenReturn",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            -2,
+            45,
+            67,
+            102
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "MainWindow_ButtonFileOpen",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            1,
+            46,
+            64,
+            105
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            11,
+            46,
+            54,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Open/Create",
+          "automation_id": "MainWindow_TextBlockToolbarOpenCreate",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            -2,
+            85,
+            67,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Separator7",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            69,
+            46,
+            70,
+            101
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemFileCalc",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            72,
+            45,
+            141,
+            102
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "MainWindow_ButtonFileCalculate",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            75,
+            46,
+            138,
+            105
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            86,
+            46,
+            128,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Calculate",
+          "automation_id": "MainWindow_TextBlockToolbarCalculate",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            72,
+            85,
+            141,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemFilePrint",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            141,
+            45,
+            210,
+            102
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "MainWindow_ButtonFilePrint",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            145,
+            46,
+            207,
+            105
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            155,
+            46,
+            197,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Print",
+          "automation_id": "MainWindow_TextBlockToolbarPrint",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            141,
+            85,
+            210,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemFileView",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            210,
+            45,
+            280,
+            102
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "MainWindow_ButtonFileView",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            214,
+            46,
+            276,
+            105
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            224,
+            46,
+            266,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "View",
+          "automation_id": "MainWindow_TextBlockToolbarView",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            210,
+            85,
+            280,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemCheckEFileStatus",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            280,
+            45,
+            349,
+            103
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            293,
+            46,
+            335,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "e-File Status",
+          "automation_id": "MainWindow_TextBlockToolbarCheckEFileStatus",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            280,
+            85,
+            349,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Separator11",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            351,
+            46,
+            352,
+            101
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemCSM",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            354,
+            45,
+            423,
+            102
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "MainWindow_ButtonReportsClientStatus",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            357,
+            46,
+            420,
+            105
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            367,
+            46,
+            410,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "CSM",
+          "automation_id": "MainWindow_TextBlockToolbarCSM",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            354,
+            85,
+            423,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemScheduler",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            423,
+            45,
+            492,
+            102
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "MainWindow_ButtonScheduler",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            426,
+            46,
+            489,
+            105
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            436,
+            46,
+            479,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Scheduler",
+          "automation_id": "MainWindow_TextBlockToolbarScheduler",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            423,
+            85,
+            492,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemDrakeDocs",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            492,
+            45,
+            561,
+            102
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "MainWindow_ButtonToolsDocs",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            495,
+            46,
+            558,
+            105
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            505,
+            46,
+            548,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Documents",
+          "automation_id": "MainWindow_TextBlockToolbarDocuments",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            492,
+            85,
+            561,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemDrakePortals",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            561,
+            45,
+            630,
+            102
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "MainWindow_ButtonToolsPortals",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            564,
+            46,
+            627,
+            105
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            574,
+            46,
+            617,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Portals",
+          "automation_id": "MainWindow_TextBlockToolbarPortals",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            561,
+            85,
+            630,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemPartners",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            630,
+            45,
+            699,
+            103
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            644,
+            46,
+            686,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Partners",
+          "automation_id": "MainWindow_TextBlockToolbarPartners",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            630,
+            85,
+            699,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Separator9",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            701,
+            46,
+            703,
+            101
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemSupport",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            705,
+            45,
+            774,
+            103
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            718,
+            46,
+            761,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Support",
+          "automation_id": "MainWindow_TextBlockToolbarSupport",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            705,
+            85,
+            774,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemZoomChat",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            774,
+            45,
+            843,
+            103
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            788,
+            46,
+            830,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Chat",
+          "automation_id": "MainWindow_TextBlockToolbarZoomChat",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            774,
+            85,
+            843,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemFeedback",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            843,
+            45,
+            912,
+            102
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "MainWindow_ButtonFeedback",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            846,
+            46,
+            909,
+            105
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            856,
+            46,
+            899,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Feedback",
+          "automation_id": "MainWindow_TextBlockToolbarFeedback",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            843,
+            85,
+            912,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Separator12",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            914,
+            46,
+            915,
+            101
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "MenuItem",
+          "name": "",
+          "automation_id": "MainWindow_MenuItemExit",
+          "class_name": "MenuItem",
+          "value": "",
+          "rect": [
+            917,
+            45,
+            986,
+            102
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "MainWindow_ButtonExit",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            920,
+            46,
+            983,
+            105
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            931,
+            46,
+            973,
+            89
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Exit",
+          "automation_id": "MainWindow_TextBlockToolbarExit",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            917,
+            85,
+            986,
+            99
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Group",
+          "name": "",
+          "automation_id": "MainWindow_ExpanderTop",
+          "class_name": "Expander",
+          "value": "",
+          "rect": [
+            0,
+            111,
+            314,
+            703
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "HeaderSite",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            2,
+            113,
+            22,
+            700
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": true
+        },
+        {
+          "control_type": "Text",
+          "name": "Recent Returns:",
+          "automation_id": "MainWindow_TextBlockRecentReturns",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            29,
+            120,
+            209,
+            137
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Key",
+          "automation_id": "MainWindow_TextBlockKey",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            217,
+            122,
+            234,
+            135
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "View/Print",
+          "automation_id": "MainWindow_TextBlockViewPrint",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            252,
+            122,
+            300,
+            135
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "DataGrid",
+          "name": "",
+          "automation_id": "MainWindow_DataGridRecentReturns",
+          "class_name": "DataGrid",
+          "value": "",
+          "rect": [
+            29,
+            139,
+            310,
+            159
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "DataItem",
+          "name": "Drake.DrakeTax.Entities.TaxPreparer.RecentReturn",
+          "automation_id": "",
+          "class_name": "DataGridRow",
+          "value": "",
+          "rect": [
+            29,
+            139,
+            310,
+            159
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Custom",
+          "name": "Item: Drake.DrakeTax.Entities.TaxPreparer.RecentReturn, Column Display Index: 0",
+          "automation_id": "",
+          "class_name": "DataGridCell",
+          "value": "",
+          "rect": [
+            29,
+            139,
+            215,
+            159
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "fynn, Test",
+          "automation_id": "MainWindow_ButtonRRTaxPayerWindow",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            29,
+            139,
+            215,
+            159
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": null
+        },
+        {
+          "control_type": "Text",
+          "name": "fynn, Test",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            29,
+            142,
+            73,
+            156
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": null
+        },
+        {
+          "control_type": "Custom",
+          "name": "Item: Drake.DrakeTax.Entities.TaxPreparer.RecentReturn, Column Display Index: 1",
+          "automation_id": "",
+          "class_name": "DataGridCell",
+          "value": "",
+          "rect": [
+            215,
+            139,
+            241,
+            159
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "1",
+          "automation_id": "MainWindow_LabelKey",
+          "class_name": "Text",
+          "value": "",
+          "rect": [
+            215,
+            142,
+            241,
+            156
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": null
+        },
+        {
+          "control_type": "Text",
+          "name": "1",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            225,
+            142,
+            231,
+            156
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": null
+        },
+        {
+          "control_type": "Custom",
+          "name": "Item: Drake.DrakeTax.Entities.TaxPreparer.RecentReturn, Column Display Index: 2",
+          "automation_id": "",
+          "class_name": "DataGridCell",
+          "value": "",
+          "rect": [
+            241,
+            139,
+            310,
+            159
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "MainWindow_ButtonTaxPayerFileView",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            239,
+            143,
+            313,
+            155
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": null
+        },
+        {
+          "control_type": "Image",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Image",
+          "value": "",
+          "rect": [
+            271,
+            143,
+            281,
+            155
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": null
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Seperator12",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            29,
+            332,
+            332,
+            333
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Appointments:",
+          "automation_id": "MainWindow_TextBlockAppointments",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            29,
+            338,
+            332,
+            354
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "No upcoming appointments today.",
+          "automation_id": "MainWindow_ButtonNoAppointmentsMessage",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            39,
+            367,
+            220,
+            383
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "No upcoming appointments today.",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            39,
+            367,
+            220,
+            383
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Seperator13",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            29,
+            508,
+            332,
+            509
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Alerts & Notifications:",
+          "automation_id": "MainWindow_TextBlockAlersAndNotifications",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            29,
+            514,
+            332,
+            529
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Pane",
+          "name": "",
+          "automation_id": "webAlerts",
+          "class_name": "HwndHost",
+          "value": "",
+          "rect": [
+            37,
+            532,
+            302,
+            632
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Pane",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Shell Embedding",
+          "value": "",
+          "rect": [
+            37,
+            532,
+            302,
+            632
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Pane",
+          "name": "",
+          "automation_id": "",
+          "class_name": "Shell DocObject View",
+          "value": "",
+          "rect": [
+            37,
+            532,
+            302,
+            632
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Pane",
+          "name": "http://www.drakealerts.com/alerts-2025/?utm_source=Drake2025&utm_medium=&utm_campaign=alerts&utm_content=desktop-ng",
+          "automation_id": "",
+          "class_name": "Internet Explorer_Server",
+          "value": "",
+          "rect": [
+            37,
+            532,
+            302,
+            632
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Pane",
+          "name": "Drake Software Alerts",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            37,
+            532,
+            285,
+            659
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Federal Reject \"R0000-148\"\r\nHelp Assistant & Live Chat Enhancements\r\n2026 Drake Update Schools\r\nTraining Resources\r\n\r\n2025 Filing Season",
+          "automation_id": "main-content",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            37,
+            532,
+            285,
+            659
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Hyperlink",
+          "name": "Federal Reject \"R0000-148\"",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            37,
+            534,
+            193,
+            551
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Federal Reject \"R0000-148\"",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            37,
+            532,
+            193,
+            553
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Hyperlink",
+          "name": "Help Assistant & Live Chat Enhancements",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            37,
+            555,
+            275,
+            572
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Help Assistant & Live Chat Enhancements",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            37,
+            553,
+            275,
+            574
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Hyperlink",
+          "name": "2026 Drake Update Schools",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            37,
+            576,
+            195,
+            593
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "2026 Drake Update Schools",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            37,
+            574,
+            195,
+            595
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Hyperlink",
+          "name": "Training Resources",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            37,
+            597,
+            145,
+            615
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Training Resources",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            37,
+            595,
+            145,
+            617
+          ],
+          "enabled": true,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "2025 Filing Season",
+          "automation_id": "",
+          "class_name": "",
+          "value": "",
+          "rect": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "enabled": true,
+          "visible": false,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Separator14",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            29,
+            635,
+            332,
+            636
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Scheduled Updates: Disabled",
+          "automation_id": "MainWindow_TextBlockScheduledUpdateNotice",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            29,
+            641,
+            332,
+            656
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Software up to date",
+          "automation_id": "MainWindow_TextBlockSoftwareUpdateStatusMessage",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            29,
+            659,
+            138,
+            675
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Thumb",
+          "name": "",
+          "automation_id": "",
+          "class_name": "GridSplitter",
+          "value": "",
+          "rect": [
+            332,
+            118,
+            337,
+            696
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "Enable Privacy",
+          "automation_id": "MainWindow_ButtonEnablePrivacy",
+          "class_name": "Button",
+          "value": "",
+          "rect": [
+            316,
+            113,
+            433,
+            143
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Enable Privacy",
+          "automation_id": "",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            334,
+            120,
+            414,
+            137
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Edit",
+          "name": "Preparer Notes",
+          "automation_id": "MainWindow_TextBoxPreparerNotes",
+          "class_name": "TextBox",
+          "value": "Preparer Notes",
+          "rect": [
+            316,
+            562,
+            1364,
+            700
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "ScrollBar",
+          "name": "",
+          "automation_id": "VerticalScrollBar",
+          "class_name": "ScrollBar",
+          "value": "",
+          "rect": [
+            1345,
+            563,
+            1363,
+            699
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "PART_LineUpButton",
+          "class_name": "RepeatButton",
+          "value": "",
+          "rect": [
+            1345,
+            563,
+            1363,
+            581
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Button",
+          "name": "",
+          "automation_id": "PART_LineDownButton",
+          "class_name": "RepeatButton",
+          "value": "",
+          "rect": [
+            1345,
+            681,
+            1363,
+            699
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "StatusBar",
+          "name": "",
+          "automation_id": "statusbar",
+          "class_name": "StatusBar",
+          "value": "",
+          "rect": [
+            0,
+            703,
+            1366,
+            728
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "User: ADMIN",
+          "automation_id": "MainWindow_TextBlockCurrentPreparerUserName",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            4,
+            707,
+            136,
+            724
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Separator24",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            139,
+            704,
+            147,
+            727
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "TRIAL",
+          "automation_id": "MainWindow_TextBlockApplicationMode",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            150,
+            707,
+            197,
+            724
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Separator25",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            200,
+            704,
+            207,
+            727
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Full Version: P1.01.02.2026.80",
+          "automation_id": "MainWindow_TextBlockStatusVersion",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            210,
+            707,
+            375,
+            724
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Separator26",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            378,
+            704,
+            386,
+            727
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Path: C:\\DRAKE25",
+          "automation_id": "MainWindow_TextBlockStatusDrive",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            389,
+            707,
+            489,
+            724
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Separator27",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            492,
+            704,
+            499,
+            727
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Text",
+          "name": "Friday, August 7, 2026",
+          "automation_id": "MainWindow_TextBlockStatusDate",
+          "class_name": "TextBlock",
+          "value": "",
+          "rect": [
+            503,
+            707,
+            656,
+            724
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        },
+        {
+          "control_type": "Separator",
+          "name": "",
+          "automation_id": "MainWindow_Separator28",
+          "class_name": "Separator",
+          "value": "",
+          "rect": [
+            659,
+            704,
+            666,
+            727
+          ],
+          "enabled": false,
+          "visible": true,
+          "focused": false,
+          "toggle": false
+        }
+      ],
+      "truncated": false
+    },
+    {
+      "hwnd": 2163608,
+      "title": "",
+      "class_name": "Internet Explorer_Hidden",
+      "rect": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "enabled": false,
+      "is_main": false,
+      "elements": [],
+      "truncated": false,
+      "note": "too small to be a screen \u2014 not walked"
+    }
+  ]
+}

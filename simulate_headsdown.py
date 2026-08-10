@@ -2549,6 +2549,70 @@ def case_nav_screen_link():
     return _table("navigation: choosing the screen link", checks)
 
 
+def case_nav_screen_signature():
+    """Nothing structural says which Drake screen is on display, so the proof has to come
+    off the screen's own heading — BEFORE anything is typed.
+
+    Measured 2026-08-07: Drake keeps several windows all titled 'Data Entry (...)', UIA's
+    descendants() crosses window boundaries, and all four structural markers plus all 37
+    screen links report present-and-visible in EVERY window in EVERY state. Heads-down
+    field numbers are screen-specific, so opening the wrong screen and typing anyway would
+    put 78 values into the wrong form with every read-back passing."""
+    from drake_nav import screen_is_showing
+    W2 = ["Form W-2 - Wage and Tax Statement", "Employer information", "Employee Name"]
+    SCREEN1 = ["Return Options", "Firm #", "Preparer #", "ERO #", "Invoice number"]
+    checks = [
+        ("the W-2 screen is recognised by its heading", screen_is_showing(W2, "W2") is True),
+        ("screen 1 is NOT mistaken for the W-2 screen",
+         screen_is_showing(SCREEN1, "W2") is False),
+        ("an empty label set is not a W-2 screen", screen_is_showing([], "W2") is False),
+        ("lower case still matches", screen_is_showing(["form w-2 wage"], "W2") is True),
+        ("'w2' as a code matches the same signature",
+         screen_is_showing(W2, "w2") is True),
+        # 'Import W2' is a BUTTON on the W-2 screen and also appears elsewhere; the
+        # signature is the form's printed heading, not any mention of the code.
+        ("a stray 'W2' mention is not the heading",
+         screen_is_showing(["Import W2", "Return Options"], "W2") is False),
+        # An unmeasured screen must report "cannot prove it", never "yes".
+        ("a screen with no measured signature returns None, not True",
+         screen_is_showing(["anything at all"], "1099") is None),
+        ("...and None is not True", screen_is_showing(["x"], "INT") is not True),
+    ]
+    return _table("navigation: the right SCREEN is open, proved by its heading", checks)
+
+
+def case_nav_create_name_collision():
+    """Auto-create's one failure mode that looks like success: a misread SSN digit makes a
+    brand-new empty return, the W-2 goes in it, the real client's return sits untouched,
+    and every check downstream passes."""
+    from drake_nav import name_collision, RESULT_ROW_ID_PREFIX as P
+    rows = [
+        {"automation_id": P + "123456789-0", "name": "fynn, Test"},
+        {"automation_id": P + "500001007-1", "name": "BLOGGER, MEDIA & NICHE"},
+    ]
+    checks = [
+        ("an existing client with the same name is found",
+         [r["name"] for r in name_collision(rows, "Test", "fynn")] == ["fynn, Test"]),
+        ("...so the run can refuse instead of creating a duplicate person",
+         len(name_collision(rows, "Test", "fynn")) > 0),
+        ("a genuinely new person collides with nobody",
+         name_collision(rows, "Jane", "Newperson") == []),
+        ("a joint-return spouse counts as a collision",
+         len(name_collision(rows, "Niche", "Blogger")) == 1),
+        ("a different surname is not a collision",
+         name_collision(rows, "Test", "Fynnegan") == []),
+        ("an empty client list collides with nobody",
+         name_collision([], "Test", "fynn") == []),
+        # No name to compare means no evidence — and no evidence must not read as "clear
+        # to create", so names_match refuses and nothing collides. The caller still has
+        # its own no-name refusal in create_client.
+        ("a payload with no name yields no false collision",
+         name_collision(rows, "", "") == []),
+    ]
+    return _table("navigation: auto-create refuses when the name is already on the books",
+                  checks)
+
+
 def case_nav_menu_is_not_the_form():
     """Both windows are titled 'Data Entry (...)'. Telling them apart by structure is what
     stops a run from arming its caret in the menu's screen-search box and typing field
@@ -2599,6 +2663,8 @@ def main() -> int:
         ('nav_row_name_pairing', lambda: case_nav_row_name_pairing()),
         ('nav_record_safety', lambda: case_nav_record_safety()),
         ('nav_screen_link', lambda: case_nav_screen_link()),
+        ('nav_screen_signature', lambda: case_nav_screen_signature()),
+        ('nav_create_name_collision', lambda: case_nav_create_name_collision()),
         ('nav_menu_is_not_the_form', lambda: case_nav_menu_is_not_the_form()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),

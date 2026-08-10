@@ -70,7 +70,7 @@ import json
 import os
 import sys
 
-from drake_driver import DrakeDriver
+from drake_driver import DrakeDriver, DrakeNotRunning
 from protocol import dispatch
 
 
@@ -694,19 +694,35 @@ def _navigate_for_payload(driver, payload: dict, args) -> dict:
         return out
 
     r = nav.open_client(driver, t["ssn"], first_name=t["first"], last_name=t["last"],
-                        timeout=args.nav_timeout)
+                        create=bool(getattr(args, 'create', False)), timeout=args.nav_timeout)
     steps.append({"step": "client", **{k: r.get(k) for k in ("ok", "reason", "step")}})
     if not r["ok"]:
         out["reason"] = r["reason"]
         out["not_found"] = bool(r.get("not_found"))
         return out
     out["return_title"] = r.get("title")
+    if r.get("created"):
+        out["created_client"] = True
+        out["incomplete"] = r.get("incomplete")
+        print(f"  NEW CLIENT CREATED — {r['reason']}")
+        print(f"    still needs a human on screen 1: {', '.join(r.get('incomplete') or [])}")
 
     s = nav.open_screen(driver, t["screen"], timeout=args.nav_timeout)
     steps.append({"step": "screen", **{k: s.get(k) for k in ("ok", "reason", "step")}})
     if not s["ok"]:
         out["reason"] = s["reason"]
         return out
+
+    # RE-BASELINE HERE, not after the record work. Opening a return and a screen creates
+    # new top-level windows and disables the frames behind them — structurally identical to
+    # a modal arriving. Everything below this line consults the dialog gate, and on
+    # 2026-08-09 `form_new_record` read the return's own newly-created window as a blocker
+    # and reported "Drake is asking a question" when Drake had asked nothing.
+    #
+    # It is safe exactly here and nowhere earlier: the return has been verified against
+    # Drake's own title, and the screen against its heading. Anything appearing after this
+    # still halts.
+    driver.rebaseline(why="opening the return and its screen")
 
     state = driver.form_record_state()
     plan = nav.plan_record_use(state, t["ein"], allow_new=not args.no_new_record)
@@ -728,14 +744,6 @@ def _navigate_for_payload(driver, payload: dict, args) -> dict:
         out["record"] = {"index": n["index"], "count": n["count"]}
     else:
         out["record"] = {"index": state.get("index"), "count": state.get("count")}
-
-    # Everything the agent just did to Drake's windows is now the expected resting state:
-    # a return is open, so a data-entry window exists and the frames behind it are
-    # disabled. Taken at attach — on the home screen — that state reads as a modal
-    # arriving, and the dialog gate halts on field 1 having typed nothing. Re-baselining
-    # HERE and nowhere else is what keeps the gate honest: it happens only once the return
-    # has been verified against Drake's own title.
-    driver.rebaseline(why="opening the return")
 
     out["ok"] = True
     out["reason"] = f"{r['reason']} / {s['reason']}"
@@ -1383,7 +1391,7 @@ def main() -> int:
     spp = sub.add_parser("probe-popup", parents=[common]); spp.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the probe runs"); spp.add_argument("--probe-field", dest="probe_field", default="6", help="which field number the probe jumps to. Default 6 (employer 'Name cont.' — normally empty and inert). NEVER use 4: it is the EIN, it auto-fills, and it is the do-not-touch box"); spp.set_defaults(func=cmd_probe_popup)
     spc = sub.add_parser("probe-checkbox", parents=[common]); spc.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the probe runs"); spc.add_argument("--field", dest="field_no", default="47", help="which CHECKBOX field to probe. Default 47 (Box 13 retirement plan); 46 statutory employee, 48 sick pay"); spc.add_argument("--no-flip", dest="no_flip", action="store_true", help="observe only — read the arrival state and leave without sending any token"); spc.set_defaults(func=cmd_probe_checkbox)
     sw2 = sub.add_parser("write-w2", parents=[common]); sw2.add_argument("--json", required=True, help="extracted W-2 JSON (the LLM's structured output — see w2_map.W2_SCHEMA_KEYS)"); sw2.add_argument("--dry-run", action="store_true", help="resolve and PRINT the plan without touching Drake — run this first, works anywhere"); sw2.add_argument("--skip-field", dest="skip_field", type=int, action="append", metavar="N", help="do NOT enter this field number, even if the extraction has a value for it; repeatable. Use --skip-field 4 to leave the employer EIN alone (it also avoids Drake's auto-fill + auto-advance)"); sw2.add_argument("--ts", choices=["T", "S"], help="whose W-2 this is (field 1). Drake defaults to T; on a JOINT return an unset TS files the spouse's W-2 under the taxpayer"); sw2.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="proceed even if some extracted values could not be resolved (they stay blank in Drake for you to key by hand)"); sw2.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero (default: skip — a blank box is zero on a tax form)"); sw2.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); sw2.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field (auto-fill/validation)"); sw2.add_argument("--delay", type=int, default=10, help="seconds to click into the W-2 screen before entry fires"); sw2.add_argument("--shot", default="w2-after.png", help="screenshot saved after the run — the verification artifact"); sw2.set_defaults(func=cmd_write_w2)
-    swt = sub.add_parser("watch", parents=[common]); swt.add_argument("--dir", required=True, help="folder the backend drops W-2 payloads into (its DRAKE_HANDOFF_DIR). Entered oldest-first, one at a time, then moved to done/ or failed/ with a .report.json"); swt.add_argument("--interval", type=float, default=2.0, help="seconds between folder checks"); swt.add_argument("--once", action="store_true", help="enter whatever is queued right now, then exit (what to use for a test)"); swt.add_argument("--keep-going", dest="keep_going", action="store_true", help="carry on to the next payload after one fails. OFF by default: a halt leaves Drake's screen in a state nobody has reviewed, and entering the next W-2 on top of it turns one bad return into several"); swt.add_argument("--ts", choices=["T", "S"], help="whose W-2 these are (field 1), when the payload does not say"); swt.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="enter the rest even when some extracted values could not be resolved (they stay blank for you to key by hand)"); swt.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero"); swt.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); swt.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field"); swt.add_argument("--no-navigate", dest="no_navigate", action="store_true", help="do NOT open the client and screen — go back to typing into whatever a human already opened. The identity check goes away with it"); swt.add_argument("--nav-timeout", dest="nav_timeout", type=float, default=12.0, help="seconds to wait for each Drake window while navigating"); swt.add_argument("--no-new-record", dest="no_new_record", action="store_true", help="refuse instead of pressing Page Down when the open W-2 record already has another employer on it"); swt.set_defaults(func=cmd_watch)
+    swt = sub.add_parser("watch", parents=[common]); swt.add_argument("--dir", required=True, help="folder the backend drops W-2 payloads into (its DRAKE_HANDOFF_DIR). Entered oldest-first, one at a time, then moved to done/ or failed/ with a .report.json"); swt.add_argument("--interval", type=float, default=2.0, help="seconds between folder checks"); swt.add_argument("--once", action="store_true", help="enter whatever is queued right now, then exit (what to use for a test)"); swt.add_argument("--keep-going", dest="keep_going", action="store_true", help="carry on to the next payload after one fails. OFF by default: a halt leaves Drake's screen in a state nobody has reviewed, and entering the next W-2 on top of it turns one bad return into several"); swt.add_argument("--ts", choices=["T", "S"], help="whose W-2 these are (field 1), when the payload does not say"); swt.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="enter the rest even when some extracted values could not be resolved (they stay blank for you to key by hand)"); swt.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero"); swt.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); swt.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field"); swt.add_argument("--no-navigate", dest="no_navigate", action="store_true", help="do NOT open the client and screen — go back to typing into whatever a human already opened. The identity check goes away with it"); swt.add_argument("--nav-timeout", dest="nav_timeout", type=float, default=12.0, help="seconds to wait for each Drake window while navigating"); swt.add_argument("--create", dest="create", action="store_true", help="create a client Drake has never seen instead of refusing. OFF by default: clients are created by a human, and a run that refuses tells the operator which SSN was missing rather than quietly opening a new empty return"); swt.add_argument("--no-new-record", dest="no_new_record", action="store_true", help="refuse instead of pressing Page Down when the open W-2 record already has another employer on it"); swt.set_defaults(func=cmd_watch)
     sev = sub.add_parser("envdump", parents=[common]); sev.add_argument("--out", default="env-dump.json", help="where to write the window-topology JSON"); sev.add_argument("--delay", type=int, default=0, help="seconds before capture — time to click a field / open heads-down first"); sev.set_defaults(func=cmd_envdump)
     sx = sub.add_parser("explore", parents=[common], help="read-only: show every window and control Drake is displaying right now")
     sx.add_argument("--out", default="explore.json", help="where to write the full JSON dump")
@@ -1405,7 +1413,16 @@ def main() -> int:
     scn = sub.add_parser("connect", parents=[common]); scn.add_argument("--url"); scn.add_argument("--token"); scn.set_defaults(func=cmd_connect)
 
     args = p.parse_args()
-    return args.func(args)
+    # Drake not being open is the most ordinary thing that can go wrong, and it used to
+    # surface as a twenty-second wait followed by thirty lines of pywinauto internals —
+    # which reads like a broken agent rather than a closed program. One sentence, and an
+    # exit code the caller can act on.
+    try:
+        return args.func(args)
+    except DrakeNotRunning as e:
+        print(f"\nDrake is not open. Start Drake Tax 2025, leave it on its home screen, "
+              f"then run this again.\n  ({e})", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

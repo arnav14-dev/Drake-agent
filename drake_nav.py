@@ -50,6 +50,29 @@ ROW_CELL_NAME_ID = "ClientName"
 ROW_CELL_TYPE_ID = "ClientType"
 ROW_CELL_MASKED_ID = "MaskedId"
 
+# 'Drake 2025 - Open Return' — "<id> does not exist. Would you like to create a new return?"
+CONFIRM_CREATE_TITLE_RE = r"Drake .*- Open Return\b"
+CONFIRM_MSG_ID = "CustomMessageBoxWindow_TextBlockMessage"
+CONFIRM_YES_ID = "CustomMessageBoxWindow_ButtonYes"
+CONFIRM_NO_ID = "CustomMessageBoxWindow_ButtonNo"
+
+# 'Drake 2025 - New Return' — return type + the name to file them under.
+NEW_RETURN_TITLE_RE = r"Drake .*- New Return\b"
+RETURN_TYPE_IDS = {
+    "individual": "CreateReturnWindow_RadioButtonIndividual",   # 1040 — what a W-2 is
+    "ccorp": "CreateReturnWindow_RadioButtonCcorp",
+    "scorp": "CreateReturnWindow_RadioButtonScorp",
+    "partnership": "CreateReturnWindow_RadioButtonPartnership",
+    "fiduciary": "CreateReturnWindow_RadioButtonFiduciary",
+    "taxexempt": "CreateReturnWindow_RadioButtonTaxExcempt",    # Drake's spelling
+    "estate": "CreateReturnWindow_RadioButtonEstate",
+}
+NEW_FIRST_NAME_ID = "CreateReturnWindow_TextBoxFirstName"
+NEW_MIDDLE_INITIAL_ID = "CreateReturnWindow_TextBoxMiddleInitial"
+NEW_LAST_NAME_ID = "CreateReturnWindow_TextBoxLastName"
+NEW_OK_ID = "UCButtonsControl_ButtonOk"
+NEW_CANCEL_ID = "UCButtonsControl_ButtonCancel"
+
 # Data Entry, both flavours (window: 'Drake 2025 - Data Entry (<id> - <name>) - ...')
 # The separator between id and name is ' - ' (spaces on BOTH sides). The id itself may
 # contain hyphens — '12-3456789' for an EIN, '123-45-6789' if Drake ever formats an SSN —
@@ -62,6 +85,28 @@ FORM_CANVAS_ID = "ucTaxForm"            # present ONLY on a tax form screen
 
 # Screen links on the menu are Buttons labelled 'CODE|Description' — 'W2|Wages'.
 SCREEN_LINK_ID_RE = r"^LINK_\d+_Col\d+_Sel\d+$"
+
+# A label that appears on the screen ITSELF once it is open. This is the only trustworthy
+# proof that clicking a screen link worked.
+#
+# Measured 2026-08-07: Drake keeps SEVERAL windows all titled 'Data Entry (...)' — an outer
+# shell and an inner one — and UIA's descendants() crosses window boundaries, so every one
+# of them reports the whole merged tree. All four structural markers (menuTabControl,
+# MenuScreenWindow_TextBoxSearch, taxTabControl, ucTaxForm) are present AND visible in
+# every window in every state, and so are all 37 screen-link buttons. Nothing about the
+# window tells you which screen a human is actually looking at.
+#
+# That matters because heads-down field numbers are SCREEN-SPECIFIC: field 4 is the
+# employer EIN on the W-2 screen and something else entirely on screen 1. Typing 78 values
+# into the wrong screen is the failure this check exists to prevent, and it has to happen
+# BEFORE the first keystroke — the read-backs afterwards would each pass, because Drake
+# really did accept what it was given.
+#
+# A screen with no signature here is opened and reported as UNVERIFIED rather than
+# claimed. Only W2 has been measured.
+SCREEN_SIGNATURES = {
+    "W2": r"Form\s+W-2\b",
+}
 
 
 # -- identity --------------------------------------------------------------------------
@@ -409,11 +454,33 @@ def plan_record_use(state: dict, employer_ein=None, *, allow_new: bool = True) -
                       f"employer — opening a new W-2 record"}
 
 
+def name_collision(rows: list, first_name, last_name) -> list:
+    """Clients already in Drake who carry THIS NAME. The guard on auto-create.
+
+    Auto-creating is safe exactly as long as "no client has this SSN" means "this person is
+    new". It stops being safe when the SSN is wrong: one misread digit and the agent files
+    a W-2 under a brand-new empty return while the real client's return sits untouched —
+    and every check downstream passes, because the values really did land where the agent
+    put them. It is the one failure mode of this feature that looks like success.
+
+    A name already on the books is the cheap tell. Nobody has to be asked anything: if
+    Drake already has a 'fynn' and the SSN we were given belongs to nobody, the far more
+    likely story is a bad digit than a second unrelated fynn arriving the same day. So the
+    run refuses and names the client it found, which is the loud failure the wrong-SSN
+    case deserves.
+    """
+    hits = []
+    for r in rows or ():
+        if names_match(r.get("name"), first_name, last_name)["ok"]:
+            hits.append(r)
+    return hits
+
+
 def _fail(step, reason, **extra) -> dict:
     return {"ok": False, "step": step, "reason": reason, **extra}
 
 
-def open_client(driver, client_id, *, first_name=None, last_name=None,
+def open_client(driver, client_id, *, first_name=None, last_name=None, create: bool = False,
                 timeout: float = 10.0, log=print) -> dict:
     """Get Drake to this taxpayer's return. {'ok', 'step', 'reason', 'title', 'reused'}.
 
@@ -472,16 +539,64 @@ def open_client(driver, client_id, *, first_name=None, last_name=None,
     # Drake filters the grid as the characters arrive; re-read AFTER typing or the rows
     # are the previous search's.
     import time
+    want_name = bool(str(first_name or "").strip() or str(last_name or "").strip())
     chosen, rows = None, []
     deadline = time.time() + float(timeout)
     while time.time() < deadline:
         rows = collect_client_rows(driver.nav_elements(dlg))
         chosen = choose_client_row(rows, want)
-        if chosen["ok"] or chosen.get("not_found"):
+        if chosen["ok"]:
+            # The row and its NAME are separate elements, and Drake fills the grid in two
+            # passes: the row (carrying the id) exists before the name cell has painted.
+            # Reading in that gap gives a matching id with an empty name, which the
+            # identity check then — correctly — refuses as unreadable. Waiting for the
+            # name is the fix; loosening the check would not be.
+            if not want_name or (chosen["row"].get("name") or "").strip():
+                break
+        elif chosen.get("not_found"):
             break
         time.sleep(0.15)
     if chosen is None:
         return _fail("search", "the client list never became readable")
+
+    if not chosen["ok"] and chosen.get("not_found") and create:
+        # Before creating: is somebody with this NAME already on the books? If so the SSN
+        # is far more likely to be misread than the person to be new, and creating would
+        # bury a real client's W-2 in a brand-new empty return while reporting success.
+        surname = str(last_name or first_name or "").strip()
+        if surname:
+            typed = driver.nav_type_into(box, surname)
+            if typed["ok"]:
+                deadline = time.time() + min(4.0, float(timeout))
+                by_name: list = []
+                while time.time() < deadline:
+                    by_name = collect_client_rows(driver.nav_elements(dlg))
+                    if by_name:
+                        break
+                    time.sleep(0.15)
+                clash = name_collision(by_name, first_name, last_name)
+                if clash:
+                    who = ", ".join(f"{c['name']} ({row_client_id(c['automation_id'])})"
+                                    for c in clash[:4])
+                    return _fail("identity",
+                                 f"no client has id {want}, but Drake already has "
+                                 f"{len(clash)} client(s) with this name — {who}. That is "
+                                 f"more likely a misread SSN than a new person, so nothing "
+                                 f"was created. Check the SSN on the document.",
+                                 candidates=chosen.get("candidates"), dialog_hwnd=dlg)
+            # Put the id back so Drake's create prompt is about the right taxpayer.
+            driver.nav_type_into(box, want)
+            time.sleep(0.4)
+
+        ok_btn = next((e for e in dels if e.get("automation_id") == DIALOG_OK_ID), None)
+        if ok_btn is None:
+            return _fail("search", f"the dialog has no {DIALOG_OK_ID} button")
+        act = driver.nav_act(ok_btn)
+        if not act["ok"]:
+            return _fail("search", f"could not press OK to reach the create prompt: "
+                                   f"{act['error']}")
+        return create_client(driver, want, first_name, last_name, timeout=timeout, log=log)
+
     if not chosen["ok"]:
         return _fail("search", chosen["reason"], candidates=chosen.get("candidates"),
                      not_found=bool(chosen.get("not_found")), dialog_hwnd=dlg)
@@ -525,54 +640,219 @@ def open_client(driver, client_id, *, first_name=None, last_name=None,
             "kind": cur["kind"], "reused": False}
 
 
+def screen_is_showing(labels, code) -> Optional[bool]:
+    """Is screen `code` the one on display? True / False / None when unmeasurable.
+
+    Answered from the screen's own printed heading, because nothing structural can answer
+    it — see SCREEN_SIGNATURES. None means this screen has no measured signature and the
+    caller must say so rather than claim success.
+    """
+    pat = SCREEN_SIGNATURES.get(str(code or "").strip().upper())
+    if not pat:
+        return None
+    blob = " ".join(str(l or "") for l in (labels or ()))
+    return bool(re.search(pat, blob, re.I))
+
+
 def open_screen(driver, code, *, timeout: float = 10.0, log=print) -> dict:
     """Open a data-entry screen by its Drake code. {'ok', 'step', 'reason', 'title'}.
 
     Assumes a return is already open and verified — this does not re-check identity,
-    because `open_client` is what proves it and doing it twice in two places is how the
-    two copies drift apart.
+    because `open_client` proves it and two copies of that check would drift apart.
+
+    The screen link is clicked wherever it is found. It does NOT first return to the Data
+    Entry Menu: measurement showed all 37 links are present and enabled from every state,
+    so 'get back to the menu first' was a step that could fail without buying anything.
+    What replaces it is a check that the screen actually opened — read off the screen's own
+    heading, before any value is typed.
     """
+    import time
     want = str(code or "").strip().upper()
     cur = driver.nav_data_entry_window()
     if cur["kind"] == "none":
-        return _fail("screen", "no return is open, so there is no menu to open a screen from")
-    if cur["kind"] == "form":
-        log(f"  a form screen is already open; returning to the menu")
-        driver.press(["Esc"])
-        import time
-        deadline = time.time() + float(timeout)
-        while time.time() < deadline:
-            cur = driver.nav_data_entry_window()
-            if cur["kind"] == "menu":
-                break
-            time.sleep(0.15)
-    if cur["kind"] != "menu":
-        return _fail("screen", f"Drake is not showing the Data Entry Menu "
-                               f"(it is showing a {cur['kind']!r} window), so the screen "
-                               f"list cannot be read")
+        return _fail("screen", "no return is open, so there is no screen to open")
 
-    els = driver.nav_elements(cur["hwnd"])
-    links = [e for e in els if re.match(SCREEN_LINK_ID_RE, e_id(e)) and (e.get("name") or "")]
+    def _links():
+        return [e for e in driver.nav_all_elements()
+                if re.match(SCREEN_LINK_ID_RE, e_id(e)) and (e.get("name") or "")]
+
+    def _labels():
+        return [e.get("name") for e in driver.nav_all_elements()
+                if e.get("control_type") == "Text"]
+
+    # A return opened straight from a CREATE has no Data Entry Menu window yet, so there
+    # are no screen links anywhere to click — they do not exist rather than being hidden.
+    # Escape backs out of the open screen and makes Drake build the menu. Only done when
+    # the links are genuinely absent, because on every other path they are already
+    # reachable and pressing Escape would be a step that can fail for nothing.
+    links = _links()
+    if not links:
+        for _ in range(2):
+            log("  no screen menu yet (new return) — backing out to build it")
+            driver.press(["Esc"])
+            deadline = time.time() + min(5.0, float(timeout))
+            while time.time() < deadline:
+                links = _links()
+                if links:
+                    break
+                time.sleep(0.2)
+            if links:
+                break
+            blocker = driver._detect_unexpected_dialog()
+            if blocker:
+                said = " ".join(str(blocker.get("text") or "").split())[:240]
+                return _fail("screen",
+                             f"Drake is asking a question instead of showing the screen "
+                             f"menu — {blocker.get('title')!r}: {said!r}. Answer it in "
+                             f"Drake, then re-send. Nothing was typed.")
+    if not links:
+        return _fail("screen", "Drake never showed a screen menu, so there is no "
+                               "screen list to choose from. Nothing was typed.")
+
     chosen = choose_screen_link(links, want)
     if not chosen["ok"]:
         return _fail("screen", chosen["reason"], candidates=chosen.get("candidates"))
     link = chosen["link"]
     parsed = parse_screen_link(link.get("name")) or {}
-    log(f"  opening screen {parsed.get('code')} — {parsed.get('title')}")
 
+    log(f"  opening screen {parsed.get('code')} — {parsed.get('title')}")
     act = driver.nav_act(link)
+    if not act["ok"]:
+        # A UIA element handle goes STALE whenever Drake redraws between the moment we
+        # enumerated it and the moment we use it — deleting a record does it, so does any
+        # screen change. The button is still there; our reference to it is not, and it
+        # surfaces as NoPatternInterfaceError / COMError on every method at once.
+        #
+        # Re-read the tree and try the freshly-found button once. Bounded to one retry on
+        # purpose: a second identical failure is a real problem, not a redraw, and looping
+        # on it would just take longer to tell the truth.
+        time.sleep(0.5)
+        again = choose_screen_link(_links(), want)
+        if again["ok"]:
+            link = again["link"]
+            log("  (the screen list had been redrawn — re-read it and retried)")
+            act = driver.nav_act(link)
     if not act["ok"]:
         return _fail("screen", f"could not open screen {want}: {act['error']}")
 
-    import time
     deadline = time.time() + float(timeout)
+    showing = None
     while time.time() < deadline:
-        now = driver.nav_data_entry_window()
-        if now["kind"] == "form":
-            return {"ok": True, "step": "screen", "reason": f"{parsed.get('code')} — "
-                    f"{parsed.get('title')}", "title": now["title"], "hwnd": now["hwnd"]}
-        time.sleep(0.15)
-    return _fail("screen", f"screen {want} was clicked but no data-entry form appeared")
+        showing = screen_is_showing(_labels(), want)
+        if showing is not False:
+            break
+        time.sleep(0.2)
+
+    now = driver.nav_data_entry_window()
+    if showing is False:
+        return _fail("screen",
+                     f"screen {want} was clicked but Drake is not showing it — its heading "
+                     f"never appeared. Nothing was typed. Entering here would put "
+                     f"{want} field numbers into whatever screen IS open.",
+                     title=now["title"])
+    verified = "verified by its heading" if showing else (
+        f"NOT VERIFIED — no measured heading for screen {want}, so this run cannot prove "
+        f"the right screen is open")
+    if showing is None:
+        log(f"  ! screen {want} opened but {verified}")
+    return {"ok": True, "step": "screen", "verified": bool(showing),
+            "reason": f"{parsed.get('code')} — {parsed.get('title')} ({verified})",
+            "title": now["title"], "hwnd": now["hwnd"]}
+
+
+def create_client(driver, client_id, first_name, last_name, *, middle_initial="",
+                  return_type="individual", timeout: float = 15.0, log=print) -> dict:
+    """Create a return for a taxpayer Drake has never seen. {'ok', 'step', 'reason'}.
+
+    Reached only when a lookup found NOBODY with this id. Drake's own flow, measured
+    2026-08-07: OK on a missing id raises 'Drake 2025 - Open Return' asking
+    "<id> does not exist. Would you like to create a new return?"; Yes raises
+    'Drake 2025 - New Return' wanting a return type and a first/last name; OK there creates
+    the client and drops straight onto a data-entry form with the return open.
+
+    Everything that dialog asks for, a W-2 supplies — return type is Individual/1040 for a
+    W-2 by definition, and the name is on the form. Nothing is invented here. In
+    particular NO FILING STATUS is set: it is not on this dialog, it is not on a W-2, and
+    guessing it would change the client's refund while looking entirely normal on screen.
+    The return is created incomplete, on purpose, and the caller says so.
+    """
+    import time
+    if not (str(first_name or "").strip() or str(last_name or "").strip()):
+        return _fail("create", "refusing to create a client with no name — the W-2 gave "
+                               "neither a first nor a last name to file them under")
+
+    dlg = driver.nav_find_window(CONFIRM_CREATE_TITLE_RE, timeout=timeout)
+    if not dlg:
+        return _fail("create", "Drake did not offer to create a new return")
+    els = driver.nav_elements(dlg)
+    msg = next((e.get("name") for e in els
+                if e_id(e) == CONFIRM_MSG_ID), "") or ""
+    # The dialog names the id it is talking about. If that is not the id we asked for,
+    # something else is on screen and pressing Yes would create the wrong client.
+    if normalize_id(client_id) not in normalize_id(msg):
+        return _fail("create", f"Drake's create prompt is about a different id than "
+                               f"{normalize_id(client_id)} — it says {msg!r}. Nothing "
+                               f"was created.")
+    yes = next((e for e in els if e_id(e) == CONFIRM_YES_ID), None)
+    if yes is None:
+        return _fail("create", "Drake's create prompt has no Yes button")
+    log(f"  no client with id {normalize_id(client_id)} — creating one")
+    act = driver.nav_act(yes)
+    if not act["ok"]:
+        return _fail("create", f"could not answer Drake's create prompt: {act['error']}")
+
+    win = driver.nav_find_window(NEW_RETURN_TITLE_RE, timeout=timeout)
+    if not win:
+        return _fail("create", "Drake's New Return window never appeared")
+    nels = driver.nav_elements(win)
+
+    def _by(aid):
+        return next((e for e in nels if e_id(e) == aid), None)
+
+    rb = _by(RETURN_TYPE_IDS.get(return_type, RETURN_TYPE_IDS["individual"]))
+    if rb is None:
+        return _fail("create", f"the New Return window has no {return_type!r} return type")
+    sel = driver.nav_act(rb, want="select")
+    if not sel["ok"]:
+        return _fail("create", f"could not choose the return type: {sel['error']}")
+
+    for aid, val, what in ((NEW_FIRST_NAME_ID, first_name, "first name"),
+                           (NEW_MIDDLE_INITIAL_ID, middle_initial, "middle initial"),
+                           (NEW_LAST_NAME_ID, last_name, "last name")):
+        if not str(val or "").strip():
+            continue
+        box = _by(aid)
+        if box is None:
+            return _fail("create", f"the New Return window has no {what} box")
+        r = driver.nav_type_into(box, str(val).strip())
+        if not r["ok"]:
+            return _fail("create", f"could not type the {what}: {r['error']}")
+
+    ok_btn = _by(NEW_OK_ID)
+    if ok_btn is None:
+        return _fail("create", "the New Return window has no OK button")
+    act = driver.nav_act(ok_btn)
+    if not act["ok"]:
+        return _fail("create", f"could not press OK on the New Return window: {act['error']}")
+    if not driver.nav_wait_gone(win, timeout=timeout):
+        return _fail("create", "OK was pressed but Drake's New Return window is still up; "
+                               "no client was created")
+
+    deadline = time.time() + float(timeout)
+    cur = {"kind": "none", "title": ""}
+    while time.time() < deadline:
+        cur = driver.nav_data_entry_window()
+        if cur["kind"] != "none":
+            break
+        time.sleep(0.2)
+    v = verify_open_return(cur["title"], client_id, first_name, last_name)
+    if not v["ok"]:
+        return _fail("create", f"a return was created but it is not the one expected — "
+                               f"{v['reason']}", title=cur["title"])
+    log(f"  created and opened: {v['reason']}")
+    return {"ok": True, "step": "created", "reason": v["reason"], "title": cur["title"],
+            "kind": cur["kind"], "created": True,
+            "incomplete": ["filing status", "date of birth", "address on screen 1"]}
 
 
 def verify_open_return(title, wanted_id, first_name=None, last_name=None) -> dict:

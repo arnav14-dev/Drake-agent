@@ -266,6 +266,15 @@ MUTANTS = {
     "nav: a real W-2 is mistaken for stray text (types over an existing W-2)": (
         '    return "w2" if any(_looks_numeric(v) for v in vals) else "fragment"',
         '    return "fragment"'),
+    "nav: the screen heading is never checked (78 values into whatever screen is open)": (
+        "    return bool(re.search(pat, blob, re.I))",
+        "    return True"),
+    "nav: an unmeasured screen is claimed as verified instead of reported unproved": (
+        "    if not pat:\n        return None",
+        "    if not pat:\n        return True"),
+    "nav: auto-create ignores a client already on the books (misread SSN buries a return)": (
+        '        if names_match(r.get("name"), first_name, last_name)["ok"]:\n            hits.append(r)',
+        '        if False:\n            hits.append(r)'),
 }
 
 # Which source file each mutant edits. drake_driver.py unless named here — the guards that

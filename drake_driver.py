@@ -93,6 +93,15 @@ def _say(msg: str) -> None:
         print(msg.encode("ascii", "replace").decode("ascii"))
 
 
+class DrakeNotRunning(RuntimeError):
+    """Drake is not open.
+
+    Its own class purely so the CLI can tell the single most ordinary failure apart from a
+    real fault and print one sentence instead of a stack trace. Nothing recovers from it —
+    a human opens Drake.
+    """
+
+
 class DrakeDriver:
     """Drives one running Drake instance. Attach to Drake AFTER a return is open."""
 
@@ -242,28 +251,34 @@ class DrakeDriver:
         titled 'Drake 2025 - Data Entry (…)', which the default pattern 'Drake \\d{4} Tax
         Software' cannot match — the same trap that made the heads-down popup unfindable.
 
-        So: try pywinauto's way first (it works when some window does start with the
-        pattern), and on failure find the process ourselves with `re.search` over every
-        top-level window title and connect by PID."""
-        try:
+        So the window search is ours, with `re.search`, and it runs FIRST. Drake simply not
+        being open is the most ordinary thing that can go wrong here, and pywinauto's way of
+        reporting it was a twenty-second wait followed by thirty lines of its own internals.
+        Looking ourselves answers instantly and lets that case raise DrakeNotRunning, which
+        agent.py prints as one sentence.
+        """
+        if not _WINFN:
             return Application(backend="uia").connect(title_re=self.title_re, timeout=20)
-        except Exception as first:
-            if not _WINFN:
-                raise
-            import re as _re
-            pat = _re.compile(self.title_re, _re.I)
-            best = None
-            for w in _enum_toplevel_windows(None):
-                if not w.get("visible") or not pat.search(w.get("title") or ""):
-                    continue
-                area = (w["rect"][2] or 0) * (w["rect"][3] or 0)
-                if best is None or area > best[1]:
-                    best = (int(w["pid"]), area)
-            if best is None:
-                raise RuntimeError(
-                    f"no visible window matches app_title_re {self.title_re!r} "
-                    f"(searched every process; pywinauto's own anchored match also failed: "
-                    f"{first})")
+
+        import re as _re
+        pat = _re.compile(self.title_re, _re.I)
+        best = None
+        for w in _enum_toplevel_windows(None):
+            if not w.get("visible") or not pat.search(w.get("title") or ""):
+                continue
+            area = (w["rect"][2] or 0) * (w["rect"][3] or 0)
+            if best is None or area > best[1]:
+                best = (int(w["pid"]), area)
+        if best is None:
+            raise DrakeNotRunning(
+                f"no visible window matches {self.title_re!r}")
+
+        # A window exists, so connecting is immediate. Try pywinauto's anchored match first
+        # (it gives a slightly better-behaved Application when the title does start with the
+        # pattern), then fall back to the process id we already found.
+        try:
+            return Application(backend="uia").connect(title_re=self.title_re, timeout=3)
+        except Exception:
             _say(f"  · app_title_re only matched mid-title — connected by process id "
                   f"{best[0]} instead (pywinauto's title_re is anchored at the start).")
             return Application(backend="uia").connect(process=best[0], timeout=20)
@@ -3134,6 +3149,38 @@ class DrakeDriver:
         except Exception as e:
             return {"ok": False, "error": f"could not type: {type(e).__name__}: {e}"}
 
+    def nav_data_entry_windows(self) -> list:
+        """EVERY visible window of the open return, not just the topmost.
+
+        Drake keeps several, all titled 'Data Entry (...)' — an outer shell, the Data Entry
+        Menu, the form — and which ones exist depends on where you have been. A return
+        opened straight from a fresh CREATE has no menu window at all yet, which is what
+        made the first auto-create run report 'no screen with code W2 on this menu': the
+        links were not hidden, they did not exist.
+        """
+        from drake_nav import DATA_ENTRY_TITLE_RE
+        out = []
+        try:
+            pid = int(self.pid or self.win.element_info.process_id)
+            for w in _enum_toplevel_windows(pid):
+                if w.get("visible") and _re.search(DATA_ENTRY_TITLE_RE, w.get("title") or ""):
+                    out.append(int(w["hwnd"]))
+        except Exception:
+            pass
+        return out
+
+    def nav_all_elements(self) -> list:
+        """The merged control tree of every window belonging to the open return."""
+        seen, out = set(), []
+        for h in self.nav_data_entry_windows():
+            for e in self.nav_elements(h):
+                key = (e.get("automation_id"), e.get("name"), tuple(e.get("rect") or ()))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(e)
+        return out
+
     def form_record_state(self) -> dict:
         """What is already on the CURRENT data-entry record.
 
@@ -3229,13 +3276,24 @@ class DrakeDriver:
         after = self.form_record_state()
         dlg = self._detect_unexpected_dialog()
         if dlg:
+            title = str(dlg.get("title") or "")
             said = " ".join(str(dlg.get("text") or dlg.get("summary") or "").split())[:300]
+            # Only call it a QUESTION when Drake actually asked one. A blocker whose only
+            # "text" is its own title is a window, not a prompt — reporting it as
+            # "Drake is asking: <the window title>" sends the operator hunting for a dialog
+            # that is not on screen, which is exactly what happened on 2026-08-09.
+            asked = bool(said) and _norm_prompt(said) != _norm_prompt(title)
+            reason = (
+                f"Drake is asking a question instead of opening a new record — {title!r}: "
+                f"{said!r}. This normally means the W-2 record already on screen is "
+                f"incomplete. Answer it in Drake (or clear that record), then re-send."
+                if asked else
+                f"a window this run did not expect appeared while opening a new record — "
+                f"{title!r}. Nothing on screen was answered, so the record was left alone."
+            )
             return {"ok": False, "index": after.get("index"), "count": after.get("count"),
-                    "dialog": {"title": dlg.get("title"), "text": said},
-                    "reason": f"Drake is asking a question instead of opening a new record — "
-                              f"{dlg.get('title')!r}: {said!r}. This normally means the W-2 "
-                              f"record already on screen is incomplete. Answer it in Drake "
-                              f"(or clear that record), then re-send. Nothing was typed."}
+                    "dialog": {"title": title, "text": said, "asked": asked},
+                    "reason": reason + " Nothing was typed."}
         return {"ok": False, "index": after.get("index"), "count": after.get("count"),
                 "reason": f"Page Down did not produce a blank record (still "
                           f"{after.get('populated')} value(s) on record "
