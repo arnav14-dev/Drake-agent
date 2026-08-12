@@ -108,6 +108,11 @@ class DrakeDriver:
     def __init__(self, binding: dict, *, key_pause: float = 0.03, dry_run: bool = False,
                  vk_packet: Optional[bool] = None):
         self.binding = binding
+        # The window we attached to, found by our own EnumWindows walk. Set by
+        # `_connect_uia` and used to keep every later lookup off the desktop-wide UIA walk
+        # that a suspended background app can block indefinitely.
+        self._attach_hwnd = None
+        self._attach_pid = None
         self.nav = binding.get("navigation", {})
         self.caps_cfg = binding.get("capabilities", {})
         # How we read a box back. On Drake Tax 2025 ALL programmatic reads are dead:
@@ -256,6 +261,18 @@ class DrakeDriver:
         reporting it was a twenty-second wait followed by thirty lines of its own internals.
         Looking ourselves answers instantly and lets that case raise DrakeNotRunning, which
         agent.py prints as one sentence.
+
+        AND THE ATTACH IS BY WINDOW HANDLE, never by title or process id.
+        `connect(title_re=…)` and `connect(process=…)` both make UIA walk the DESKTOP and
+        look at EVERY top-level window on the machine before filtering. Windows suspends
+        background UWP apps, and a suspended window does not answer — so that walk blocks,
+        with no timeout, for as long as the other app stays suspended.
+
+        Measured 2026-08-12: a backgrounded 'Media Player' (Microsoft.Media.Player.exe) that
+        did not answer a WM_NULL froze EVERY agent command at attach, for minutes, in a
+        process burning no CPU and printing nothing. `connect(handle=…)` builds the element
+        straight off the HWND, touches no other window, and returned in 0.0s with the same
+        app still suspended. We already know the handle — we just found it ourselves.
         """
         if not _WINFN:
             return Application(backend="uia").connect(title_re=self.title_re, timeout=20)
@@ -267,21 +284,14 @@ class DrakeDriver:
             if not w.get("visible") or not pat.search(w.get("title") or ""):
                 continue
             area = (w["rect"][2] or 0) * (w["rect"][3] or 0)
-            if best is None or area > best[1]:
-                best = (int(w["pid"]), area)
+            if best is None or area > best[2]:
+                best = (int(w["hwnd"]), int(w["pid"]), area)
         if best is None:
             raise DrakeNotRunning(
                 f"no visible window matches {self.title_re!r}")
 
-        # A window exists, so connecting is immediate. Try pywinauto's anchored match first
-        # (it gives a slightly better-behaved Application when the title does start with the
-        # pattern), then fall back to the process id we already found.
-        try:
-            return Application(backend="uia").connect(title_re=self.title_re, timeout=3)
-        except Exception:
-            _say(f"  · app_title_re only matched mid-title — connected by process id "
-                  f"{best[0]} instead (pywinauto's title_re is anchored at the start).")
-            return Application(backend="uia").connect(process=best[0], timeout=20)
+        self._attach_hwnd, self._attach_pid = best[0], best[1]
+        return Application(backend="uia").connect(handle=best[0], timeout=20)
 
     def _warn_if_elevation_mismatch(self) -> None:
         """If Drake runs elevated (as Admin) and this agent does not, Windows UIPI
@@ -331,6 +341,28 @@ class DrakeDriver:
         that meets a real frame size (min_main_w × min_main_h), preferring ones whose
         title matches app_title_re. Filters out the chat bubble and other tool overlays.
         Falls back to top_window() only if nothing qualifies."""
+        # OUR OWN win32 enumeration first, for the same reason the attach uses a handle:
+        # `app.windows()` filters a walk of the WHOLE DESKTOP, so one suspended app anywhere
+        # on the machine blocks it forever (measured 2026-08-12 — see _connect_uia). Listing
+        # the process's own windows with EnumWindows touches nothing else, and every element
+        # below is then built straight from its HWND.
+        if _WINFN and getattr(self, "_attach_pid", None):
+            import re as _re
+            pat = _re.compile(self.title_re, _re.I)
+            mine = [w for w in _enum_toplevel_windows(None)
+                    if w.get("visible") and int(w.get("pid") or 0) == self._attach_pid]
+            titled = [w for w in mine if pat.search(w.get("title") or "")]
+            for pool in (titled, mine):
+                sized = [w for w in pool
+                         if (w["rect"][2] or 0) >= self.min_main_w
+                         and (w["rect"][3] or 0) >= self.min_main_h]
+                sized.sort(key=lambda w: (w["rect"][2] or 0) * (w["rect"][3] or 0), reverse=True)
+                for w in sized:
+                    try:
+                        return self.app.window(handle=int(w["hwnd"]))
+                    except Exception:
+                        continue
+
         candidates = []
         pools = []
         try:
@@ -1564,6 +1596,47 @@ class DrakeDriver:
             time.sleep(0.12)
         return False
 
+    # Drake's validation help window: 'Drake 2025 - Data Entry - Help' carrying a message
+    # that starts 'Your entry is not VALID for field type: …'. It is Drake telling us, in
+    # its own words, that it would not take what we just typed.
+    VALIDATION_HELP_TITLE_RE = r"Data\s*Entry\s*-\s*Help\b"
+    # Drake has at least two wordings — "not VALID for field type: Federal Code" (field 2)
+    # and "Your entry is not VALID for the current Field!" (field 58). Matching only the
+    # first is why the second still surfaced as a bare focus message. Anchor on the part
+    # that is common to both and let Drake's own text carry the detail.
+    VALIDATION_HELP_TEXT_RE = r"not\s+VALID\s+for\s"
+
+    def _drake_validation_help(self):
+        """Drake's own objection to a value, if it is on screen. {hwnd,title,text} or None.
+
+        Read from the WINDOW HANDLE, never from a desktop walk — the same rule the attach
+        follows, so a suspended app elsewhere on the machine cannot make this hang.
+        """
+        if not _WINFN or self.app is None or not self.pid:
+            return None
+        import re as _re
+        try:
+            for w in _enum_toplevel_windows(None):
+                if not w.get("visible") or int(w.get("pid") or 0) != int(self.pid):
+                    continue
+                title = w.get("title") or ""
+                if not _re.search(self.VALIDATION_HELP_TITLE_RE, title, _re.I):
+                    continue
+                names = []
+                for e in self.app.window(handle=int(w["hwnd"])).descendants():
+                    try:
+                        n = e.window_text()
+                    except Exception:
+                        continue
+                    if n and n.strip():
+                        names.append(" ".join(n.split()))
+                text = " ".join(names)
+                if _re.search(self.VALIDATION_HELP_TEXT_RE, text, _re.I):
+                    return {"hwnd": int(w["hwnd"]), "title": title, "text": text[:400]}
+        except Exception:
+            return None
+        return None
+
     def _recycle_popup(self, *, method: str = "scancode") -> dict:
         """Close a popup that is on screen but not holding the keyboard, then open a fresh
         one — Ctrl+N twice, VERIFIED at each step rather than fired blind.
@@ -1578,6 +1651,22 @@ class DrakeDriver:
         import time
         ok_scope, where = self._input_scope(allow_popup=True)
         if not ok_scope:
+            # WHY the keyboard moved matters more than the fact that it did. The commonest
+            # cause is Drake itself: a value it will not accept raises its own help window,
+            # which takes focus and keeps it until a human clicks OK. Reporting only "the
+            # keyboard is somewhere else" sends the operator looking at focus when Drake has
+            # already written the answer on the screen — measured 2026-08-12, when field 2
+            # of the INT screen got a multi-form code and Drake said it wanted a Federal
+            # code. So if Drake is objecting, its words go first.
+            said = self._drake_validation_help()
+            if said:
+                return {"ok": False,
+                        "reason": f"Drake REFUSED the value in the field before this one and "
+                                  f"is showing its own message: {said['text']!r}. Its window "
+                                  f"({said['title']!r}) now holds the keyboard, so nothing "
+                                  f"further was typed. Click OK in Drake, fix that value, "
+                                  f"then re-send.",
+                        "drake_said": said}
             return {"ok": False,
                     "reason": f"the heads-down popup is up but does not hold the keyboard, "
                               f"and the keyboard is in {where} — outside Drake entirely. "
@@ -3236,12 +3325,22 @@ class DrakeDriver:
         return {"ok": True, "reason": "", "index": index, "count": count,
                 "values": values, "populated": len(values)}
 
-    def form_new_record(self, *, timeout: float = 6.0) -> dict:
+    def form_new_record(self, *, timeout: float = 6.0, max_pages: int = 12) -> dict:
         """Page Down to a fresh blank record on the open screen. {ok, index, count, reason}.
 
         Verifies afterwards that the record really is blank. Drake's own status bar says
         'Press Page Down for New Screen', but a keystroke that silently did nothing would
         otherwise leave the run typing a second W-2 on top of the first.
+
+        PAGES REPEATEDLY, because Page Down means "next record", not "new record". A client
+        with two bank accounts already has two 1099-INT records: one Page Down from record 1
+        lands on record 2, which is populated, and a single-press version reported that as a
+        failure — so the third account could never be entered at all. Measured 2026-08-12 on
+        the INT screen, but it was always true of a second W-2 as well.
+
+        Bounded, and it stops the moment the position stops moving: a screen that will not
+        page is a refusal, never a loop. Paging changes no value, so walking past populated
+        records on the way to a blank one costs nothing.
         """
         import time
         before = self.form_record_state()
@@ -3249,19 +3348,41 @@ class DrakeDriver:
             return {"ok": False, "reason": before["reason"]}
         if not self._focus_canvas_field():
             return {"ok": False, "reason": "could not put the caret on the form before Page Down"}
-        try:
-            self._keys("{PGDN}")
-        except Exception as e:
-            return {"ok": False, "reason": f"Page Down failed: {type(e).__name__}: {e}"}
 
-        deadline = time.time() + float(timeout)
-        while time.time() < deadline:
-            after = self.form_record_state()
-            if after["ok"] and after["populated"] == 0 and (
-                    after["index"] != before["index"] or after["count"] != before["count"]):
-                return {"ok": True, "index": after["index"], "count": after["count"],
-                        "reason": ""}
-            time.sleep(0.15)
+        seen_positions = {(before["index"], before["count"])}
+        prev, walked = before, 0
+        for _ in range(max(1, int(max_pages))):
+            try:
+                self._keys("{PGDN}")
+            except Exception as e:
+                return {"ok": False, "reason": f"Page Down failed: {type(e).__name__}: {e}"}
+
+            moved = None
+            deadline = time.time() + float(timeout)
+            while time.time() < deadline:
+                after = self.form_record_state()
+                if after["ok"] and (after["index"], after["count"]) != (prev["index"], prev["count"]):
+                    moved = after
+                    break
+                if after["ok"] and after["populated"] == 0 and after["index"] is None:
+                    # Some screens do not expose a position at all; a blank form is then the
+                    # only evidence there is, and it is enough — nothing can be overwritten.
+                    moved = after
+                    break
+                time.sleep(0.15)
+
+            if moved is None:
+                break                      # did not move: fall through to the diagnosis below
+            walked += 1
+            if moved["populated"] == 0:
+                return {"ok": True, "index": moved["index"], "count": moved["count"],
+                        "reason": (f"paged past {walked - 1} record(s) already on this screen"
+                                   if walked > 1 else "")}
+            pos = (moved["index"], moved["count"])
+            if pos in seen_positions:
+                break                      # wrapped around; there is no blank record ahead
+            seen_positions.add(pos)
+            prev = moved
         # WHY it did not work matters more than that it did not. Drake answers a Page Down
         # off an incomplete screen with a modal — "There are fields on this screen that must
         # contain data if you are planning to e-file this return" — and reporting that as
@@ -3285,7 +3406,7 @@ class DrakeDriver:
             asked = bool(said) and _norm_prompt(said) != _norm_prompt(title)
             reason = (
                 f"Drake is asking a question instead of opening a new record — {title!r}: "
-                f"{said!r}. This normally means the W-2 record already on screen is "
+                f"{said!r}. This normally means the record already on screen is "
                 f"incomplete. Answer it in Drake (or clear that record), then re-send."
                 if asked else
                 f"a window this run did not expect appeared while opening a new record — "
@@ -3294,10 +3415,12 @@ class DrakeDriver:
             return {"ok": False, "index": after.get("index"), "count": after.get("count"),
                     "dialog": {"title": title, "text": said, "asked": asked},
                     "reason": reason + " Nothing was typed."}
+        walked_note = (f" Paged through {walked} record(s) looking for a blank one."
+                       if walked else " Page Down did not move off the record it started on.")
         return {"ok": False, "index": after.get("index"), "count": after.get("count"),
-                "reason": f"Page Down did not produce a blank record (still "
+                "reason": f"could not reach a blank record on this screen (still "
                           f"{after.get('populated')} value(s) on record "
-                          f"{after.get('index')} of {after.get('count')})"}
+                          f"{after.get('index')} of {after.get('count')})." + walked_note}
 
     def nav_data_entry_window(self) -> dict:
         """The open return's window and WHICH KIND it is: {'hwnd', 'title', 'kind'}.
@@ -3520,10 +3643,35 @@ class DrakeDriver:
         for the wire; this writes a file for a person to open.) Brings Drake to the front
         first so the capture is Drake, never the editor/terminal that launched the run.
         grid=True overlays a labeled pixel grid so you can read coordinates by eye."""
+        if self.dry_run or self.win is None:
+            return {"ok": False, "path": None, "error": "no window"}
         try:
-            if self.dry_run or self.win is None:
-                return {"ok": False, "path": None, "error": "no window"}
             img = self._capture_window_image()
+        except Exception as e:
+            # FALL BACK TO THE WHOLE SCREEN rather than returning nothing. This picture is
+            # the only artefact that can show a value nobody asked for, and it is what a
+            # human approves against — a run that entered 59 boxes and saved no evidence is
+            # the one outcome worth going to some trouble to avoid.
+            #
+            # Seen 2026-08-12: the per-window capture raised a COM error
+            # ("An event was unable to invoke any of the subscribers") on a run that had
+            # otherwise completed. A full-screen grab needs no cooperation from the window.
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grab()
+            except Exception as e2:
+                return {"ok": False, "path": None,
+                        "error": f"{e}; full-screen fallback also failed: {e2}"}
+            try:
+                if grid:
+                    img = _overlay_grid(img)
+                img.save(path, format="PNG")
+            except Exception as e2:
+                return {"ok": False, "path": None, "error": f"{e}; could not save: {e2}"}
+            return {"ok": True, "path": path, "takenAt": _now(), "fallback": "full-screen",
+                    "note": f"the Drake window would not capture ({e}); this is the whole "
+                            f"screen instead, so it may include other windows"}
+        try:
             if grid:
                 img = _overlay_grid(img)
             img.save(path, format="PNG")

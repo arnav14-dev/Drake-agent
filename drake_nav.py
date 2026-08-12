@@ -103,10 +103,26 @@ SCREEN_LINK_ID_RE = r"^LINK_\d+_Col\d+_Sel\d+$"
 # really did accept what it was given.
 #
 # A screen with no signature here is opened and reported as UNVERIFIED rather than
-# claimed. Only W2 has been measured.
+# claimed. Each entry was read off that screen's own printed heading in a live explore dump.
 SCREEN_SIGNATURES = {
     "W2": r"Form\s+W-2\b",
+    # Measured 2026-08-11 in explore-int-form-headsdown.json (Label_6). Deliberately the
+    # WHOLE heading: 'Interest Income' on its own also appears in the Data Entry Menu's
+    # screen-link list ('INT|1099-INT, Interest Income'), which is present in every window
+    # in every state, so the short form would report the INT screen as open from the menu.
+    "INT": r"Schedule\s+B\s*-\s*Interest\s+Income\s*\(1099-INT\)",
 }
+
+# Drake can draw some screens as a SPREADSHEET instead of a form — the INT screen prints
+# "*Use <F3> to switch to grid mode*" on itself. The two modes share a heading and a window
+# title, so the screen signature above cannot tell them apart, and the heads-down field
+# numbers belong to the FORM: in grid mode they address nothing at all.
+#
+# Measured 2026-08-10/11 by dumping the same screen in both modes. The grid carries a
+# 'ucTaxGrid…' automation id and the form carries none — the only structural difference
+# between the two dumps that is not also present in both.
+GRID_MODE_ID_PREFIX = "ucTaxGrid"
+GRID_MODE_TOGGLE_KEY = "F3"
 
 
 # -- identity --------------------------------------------------------------------------
@@ -398,10 +414,18 @@ def record_kind(values: list) -> str:
     return "w2" if any(_looks_numeric(v) for v in vals) else "fragment"
 
 
-def plan_record_use(state: dict, employer_ein=None, *, allow_new: bool = True) -> dict:
+def plan_record_use(state: dict, employer_ein=None, *, allow_new: bool = True,
+                    noun: str = "W-2", id_noun: str = "employer EIN",
+                    amount_noun: str = "wages") -> dict:
     """Use this record, open a fresh one, or refuse? {'action', 'reason'}.
 
     action is 'use' | 'new' | 'refuse'.
+
+    The three nouns are what makes this reusable across forms without a second copy of the
+    logic. A W-2 record is one EMPLOYER identified by an EIN; a 1099-INT record is one
+    PAYER identified by a TIN. The decision is identical; only the words a preparer reads
+    change, and a message that says "W-2" on the 1099 screen is a message they will not
+    trust.
 
     A W-2 screen is one employer. Three situations, three answers:
 
@@ -432,9 +456,10 @@ def plan_record_use(state: dict, employer_ein=None, *, allow_new: bool = True) -
         # Stray text with no employer and no money. Filling it in is both safer and
         # tidier than paging past it: the incoming W-2 writes these same boxes anyway,
         # and leaving an incomplete W-2 record behind is a filing problem of its own.
+        who = id_noun.rsplit(" ", 1)[0] if " " in id_noun else id_noun
         return {"action": "use",
                 "reason": f"{where} holds {state['populated']} stray value(s) but no "
-                          f"employer and no amounts — not a W-2, so it is being filled in "
+                          f"{who} and no amounts — not a {noun}, so it is being filled in "
                           f"rather than left behind"}
 
     want = normalize_id(employer_ein)
@@ -442,16 +467,18 @@ def plan_record_use(state: dict, employer_ein=None, *, allow_new: bool = True) -
         for v in state.get("values") or ():
             if normalize_id(v.get("value")) == want:
                 return {"action": "refuse",
-                        "reason": f"{where} already holds employer EIN {want} — this W-2 "
+                        "reason": f"{where} already holds {id_noun} {want} — this {noun} "
                                   f"looks like it has already been entered, and entering it "
-                                  f"again would double the client's wages. Nothing was typed."}
+                                  f"again would double the client's {amount_noun}. Nothing "
+                                  f"was typed."}
     if not allow_new:
         return {"action": "refuse",
                 "reason": f"{where} already has {state['populated']} value(s) on it and "
                           f"opening a new record is disabled"}
     return {"action": "new",
             "reason": f"{where} already has {state['populated']} value(s) for a different "
-                      f"employer — opening a new W-2 record"}
+                      f"{id_noun.rsplit(' ', 1)[0] if ' ' in id_noun else id_noun} — "
+                      f"opening a new {noun} record"}
 
 
 def name_collision(rows: list, first_name, last_name) -> list:
@@ -640,6 +667,22 @@ def open_client(driver, client_id, *, first_name=None, last_name=None, create: b
             "kind": cur["kind"], "reused": False}
 
 
+def screen_is_grid(element_ids) -> bool:
+    """Is this screen being drawn as Drake's SPREADSHEET grid rather than as the form?
+
+    Structural, not textual: the grid builds controls under a 'ucTaxGrid…' automation id
+    and the form builds none. The printed heading is identical in both modes, so the screen
+    signature cannot answer this and something has to.
+
+    It matters because every field number in a form map belongs to the FORM. Starting a
+    heads-down run against the grid would send 61 field numbers into a screen where those
+    numbers mean nothing — and the popup would echo each value back, so the per-field gate
+    would pass all the way down.
+    """
+    pre = GRID_MODE_ID_PREFIX.lower()
+    return any(str(i or "").lower().startswith(pre) for i in (element_ids or ()))
+
+
 def screen_is_showing(labels, code) -> Optional[bool]:
     """Is screen `code` the one on display? True / False / None when unmeasurable.
 
@@ -750,6 +793,34 @@ def open_screen(driver, code, *, timeout: float = 10.0, log=print) -> dict:
                      f"never appeared. Nothing was typed. Entering here would put "
                      f"{want} field numbers into whatever screen IS open.",
                      title=now["title"])
+
+    # FORM OR GRID. The right screen can still be the wrong MODE, and the heading is the
+    # same either way. F3 is Drake's own toggle — printed on the screen — and pressing it
+    # proves nothing, so what counts is the re-read afterwards. If it is still a grid the
+    # run refuses with nothing typed, which is also what happens if this misread a form and
+    # toggled it INTO a grid: one wasted keystroke, no values, and a message that says so.
+    def _ids():
+        return [e_id(e) for e in driver.nav_all_elements()]
+
+    if screen_is_grid(_ids()):
+        log(f"  screen {want} is in GRID mode — pressing {GRID_MODE_TOGGLE_KEY} to switch "
+            f"to the form, then checking")
+        driver.press([GRID_MODE_TOGGLE_KEY])
+        deadline = time.time() + min(5.0, float(timeout))
+        while time.time() < deadline:
+            if not screen_is_grid(_ids()):
+                break
+            time.sleep(0.2)
+        if screen_is_grid(_ids()):
+            return _fail("screen",
+                         f"screen {want} is showing Drake's GRID (spreadsheet) view and "
+                         f"{GRID_MODE_TOGGLE_KEY} did not switch it to the form. Heads-down "
+                         f"field numbers belong to the FORM — in the grid they address "
+                         f"nothing. Press {GRID_MODE_TOGGLE_KEY} in Drake to get the form "
+                         f"view, then re-send. Nothing was typed.",
+                         title=now["title"])
+        log("  now showing the form view")
+
     verified = "verified by its heading" if showing else (
         f"NOT VERIFIED — no measured heading for screen {want}, so this run cannot prove "
         f"the right screen is open")

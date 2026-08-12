@@ -2456,7 +2456,7 @@ def case_nav_record_safety():
     from drake_nav import parse_record_position, plan_record_use
     blank = {"ok": True, "index": 1, "count": 1, "populated": 0, "values": []}
     occupied = {"ok": True, "index": 1, "count": 1, "populated": 3, "values": [
-        {"value": "93-4517345"}, {"value": "your tax team ca"}, {"value": "29477"}]}
+        {"value": "00-1112222"}, {"value": "test employer llc"}, {"value": "29477"}]}
     unreadable = {"ok": False, "reason": "the form's control tree could not be read",
                   "index": None, "count": None, "populated": 0, "values": []}
     # What the first live navigate-and-fill run actually met: leftover City/State, no
@@ -2474,12 +2474,12 @@ def case_nav_record_safety():
 
         ("a blank record is used", act(blank) == "use"),
         ("a blank record is used even when an EIN is supplied",
-         act(blank, "934517345") == "use"),
+         act(blank, "001112222") == "use"),
         # The dangerous one.
         ("re-sending the SAME employer REFUSES rather than duplicating wages",
-         act(occupied, "93-4517345") == "refuse"),
+         act(occupied, "00-1112222") == "refuse"),
         ("...and the refusal explains the consequence, not just the fact",
-         "double" in plan_record_use(occupied, "934517345")["reason"]),
+         "double" in plan_record_use(occupied, "001112222")["reason"]),
         ("a DIFFERENT employer opens a new record (a second job is normal)",
          act(occupied, "99-1112222") == "new"),
         ("an occupied record with no EIN to compare still opens a new record",
@@ -2508,7 +2508,7 @@ def case_nav_record_safety():
         ("a missing state refuses", act(None) == "refuse"),
         ("the EIN comparison ignores dash formatting",
          act({"ok": True, "index": 1, "count": 1, "populated": 1,
-              "values": [{"value": "934517345"}]}, "93-4517345") == "refuse"),
+              "values": [{"value": "001112222"}]}, "00-1112222") == "refuse"),
     ]
     return _table("navigation: one W-2 record per employer", checks)
 
@@ -2632,6 +2632,241 @@ def case_nav_menu_is_not_the_form():
     return _table("navigation: the menu screen is not the form screen", checks)
 
 
+def plan_has_confirm(spec, field_no) -> bool:
+    """Would a plan mark this field 'verify by eye'? Asked of the PLAN, not the table —
+    that flag is what a preparer actually sees, and it is set by build_plan, not declared."""
+    import form_plan
+    key = next(k for k, f in spec.fields.items() if f["field_no"] == field_no)
+    field = spec.fields[key]
+    kind = field["kind"]
+    probe = {"checkbox": True, "pct": "10", "date": "12/31/2025", "money": "100",
+             "state": "PA", "code": "CA", "tsj": "T"}.get(kind, "0" if kind == "digits" else "X")
+    # A box with a fixed list has to be probed with something ON the list, or the plan
+    # rightly refuses it and there is no entry left to inspect for the flag.
+    if field.get("values"):
+        probe = sorted(field["values"])[0]
+    plan = form_plan.build_plan({key: probe}, spec)
+    return any(e["field_no"] == field_no and e["confirm"] for e in plan["entries"])
+
+
+def case_int_field_map():
+    """The 1099-INT map is the safety mechanism for that screen, exactly as w2_map is for
+    the W-2, so the same class of mistake has to be un-importable.
+
+    A wrong field number has no downstream defense: Drake accepts a number on any screen,
+    the popup echoes the value back, the read-back gate passes, and a plausible amount sits
+    in the wrong box of a real return. The checks below are what `FormSpec.validate()`
+    enforces at import time — this proves the enforcement, not just the current table."""
+    import int_map
+    from form_plan import FormSpec
+    spec = int_map.INT_SPEC
+    nums = sorted(f["field_no"] for f in int_map.INT_FIELD_MAP.values())
+
+    def refuses(**over):
+        """Does a spec built with this defect refuse to import?"""
+        kw = dict(screen="TST", label="t", fields=dict(int_map.INT_FIELD_MAP),
+                  max_field=int_map.MAX_FIELD, forbidden=dict(int_map.FORBIDDEN_FIELDS))
+        kw.update(over)
+        try:
+            FormSpec(**kw)
+            return False
+        except RuntimeError:
+            return True
+
+    dup = dict(int_map.INT_FIELD_MAP)
+    dup["a_second_key_for_box_1"] = {"field_no": 20, "kind": "money", "label": "clash"}
+    forbidden_bind = dict(int_map.INT_FIELD_MAP)
+    forbidden_bind["foreign_province"] = {"field_no": 14, "kind": "text", "label": "sub-screen"}
+    over_range = dict(int_map.INT_FIELD_MAP)
+    over_range["invented"] = {"field_no": 63, "kind": "money", "label": "not on the screen"}
+    bad_kind = dict(int_map.INT_FIELD_MAP)
+    bad_kind["odd"] = {"field_no": 63, "kind": "currency", "label": "not a real kind"}
+
+    checks = [
+        ("every field number 1-62 is mapped except 14",
+         nums == [n for n in range(1, 63) if n != 14]),
+        ("61 boxes are writable", len(nums) == 61),
+        ("field 14 is FORBIDDEN — it is a '<Click to Access>' sub-screen, not a box",
+         14 in int_map.FORBIDDEN_FIELDS and 14 not in nums),
+        ("two keys claiming the same box refuses to import", refuses(fields=dup)),
+        ("a key bound to the forbidden sub-screen refuses to import",
+         refuses(fields=forbidden_bind)),
+        ("a field number above the highest legible one refuses to import",
+         refuses(fields=over_range, max_field=62)),
+        ("an unknown value kind refuses to import — it would fall through to plain text",
+         refuses(fields=bad_kind, max_field=63)),
+        ("a locality field naming no mapped box refuses to import",
+         refuses(locality_fields={99: "resident_state"})),
+        # The dedupe id is what stops the same payer going in twice, so it has to BE a key.
+        ("the dedupe key is a real key on this screen",
+         spec.dedupe_key in int_map.INT_FIELD_MAP),
+        ("field 4 resolves through Drake's locality table, not as free text",
+         4 in spec.locality_fields),
+        # A dropdown moves into the confirmed set only by being READ BACK on a live run, so
+        # the contents of that set change over time and asserting a snapshot of it just goes
+        # stale. What must hold forever is that it cannot claim a box that is not a dropdown
+        # at all — that would silently drop the "check this by eye" flag from a real one.
+        ("nothing is confirmed as a dropdown that is not a dropdown",
+         spec.dropdowns_confirmed <= spec.dropdowns),
+        ("a dropdown that is NOT confirmed still gets flagged for a human",
+         all(f["field_no"] in spec.dropdowns_confirmed
+             or plan_has_confirm(spec, f["field_no"])
+             for f in int_map.INT_FIELD_MAP.values()
+             if f["field_no"] in spec.dropdowns)),
+    ]
+    return _table("1099-INT: the field map cannot bind a box it must not touch", checks)
+
+
+def case_int_value_kinds():
+    """The three value kinds the 1099-INT screen needs that a W-2 never did.
+
+    Each one rejects rather than guesses. A percentage box holding 150, a date Drake will
+    parse differently from what was meant, or a 'J' silently downgraded to 'T' are all
+    wrong values that LOOK right on a screenshot — the read-back cannot catch any of them,
+    because Drake really did accept what it was given."""
+    from form_plan import sanitize
+    checks = [
+        # pct — a real range, not a clamp.
+        ("'100%' -> '100'", sanitize("pct", "100%") == "100"),
+        ("'12.50' keeps its half a percent", sanitize("pct", "12.50") == "12.5"),
+        ("0 percent is a value, not a blank", sanitize("pct", "0") == "0"),
+        ("150% is REJECTED, not clamped to 100", sanitize("pct", "150") is None),
+        ("a negative percentage is REJECTED", sanitize("pct", "-5") is None),
+        ("'abc' is not a percentage", sanitize("pct", "abc") is None),
+        # date — one unambiguous output, and a refusal when the input is not a date.
+        ("'12/31/2025' -> MMDDYYYY", sanitize("date", "12/31/2025") == "12312025"),
+        ("ISO '2025-12-31' lands on the same value", sanitize("date", "2025-12-31") == "12312025"),
+        ("a 2-digit year is expanded", sanitize("date", "123125") == "12312025"),
+        ("month 13 is REJECTED", sanitize("date", "13/01/2025") is None),
+        ("day 32 is REJECTED", sanitize("date", "01/32/2025") is None),
+        ("a 7-digit smear is REJECTED rather than sliced", sanitize("date", "1231202") is None),
+        # tsj — the whole reason 'ts' could not be reused here.
+        ("'J' survives on a 1099 screen — an account really can be joint",
+         sanitize("tsj", "J") == "J"),
+        ("'joint' spelled out is J", sanitize("tsj", "joint") == "J"),
+        ("T and S still work", (sanitize("tsj", "T"), sanitize("tsj", "spouse")) == ("T", "S")),
+        ("a 'J' on the W-2's TS selector is REJECTED, not turned into T",
+         sanitize("ts", "J") is None),
+        ("'X' is not a taxpayer designation", sanitize("tsj", "X") is None),
+        # A TIN is digits; Drake formats it itself.
+        ("a formatted payer TIN keeps only its digits",
+         sanitize("tin", "93-1234567") == "931234567"),
+        ("a routing number keeps only its digits", sanitize("digits", "031 000 053") == "031000053"),
+    ]
+    return _table("1099-INT: percentages, dates and TSJ reject rather than guess", checks)
+
+
+def case_int_screen_and_grid():
+    """Two ways to be on the wrong screen with the right heading.
+
+    The INT screen can be drawn as a FORM or as a spreadsheet GRID, and Drake prints the
+    same heading over both. Heads-down field numbers belong to the form; in the grid they
+    address nothing. And 'Interest Income' on its own appears in the Data Entry Menu's own
+    screen-link list — which is present in every window in every state — so a short
+    signature would report the INT screen as open while a preparer is looking at the menu."""
+    from drake_nav import screen_is_showing, screen_is_grid
+    INT_FORM = ["Schedule B - Interest Income (1099-INT)", "Payer information",
+                "*Use <F3> to switch to grid mode*"]
+    MENU = ["INT|1099-INT, Interest Income", "W2|Wages, Salaries, Tips",
+            "DIV|1099-DIV, Dividend Income"]
+    # Automation ids, measured: the grid builds controls under 'ucTaxGrid…', the form
+    # builds none.
+    GRID_IDS = ["ucTaxGrid1", "ucTaxGrid1_DataGrid", "PART_ScrollBar", "txtInstance"]
+    FORM_IDS = ["ucTaxForm", "taxTabControl", "Textbox_12", "Dropdown_3", "Label_6"]
+    checks = [
+        ("the INT screen is recognised by its full printed heading",
+         screen_is_showing(INT_FORM, "INT") is True),
+        ("the Data Entry MENU is not mistaken for the INT screen",
+         screen_is_showing(MENU, "INT") is False),
+        ("...even though the menu does contain the words 'Interest Income'",
+         any("Interest Income" in l for l in MENU)),
+        ("the W-2 screen is not mistaken for the INT screen",
+         screen_is_showing(["Form W-2 - Wage and Tax Statement"], "INT") is False),
+        ("the INT screen is not mistaken for the W-2 screen",
+         screen_is_showing(INT_FORM, "W2") is False),
+        ("lower case still matches", screen_is_showing(["schedule b - interest income (1099-int)"], "INT") is True),
+        ("grid mode is detected from the tree", screen_is_grid(GRID_IDS) is True),
+        ("the form view is NOT reported as a grid", screen_is_grid(FORM_IDS) is False),
+        ("an unreadable tree is not reported as a grid", screen_is_grid([]) is False),
+        ("a None in the id list does not crash the check", screen_is_grid([None, "ucTaxForm"]) is False),
+        # The heading and the mode are independent questions; passing one is not passing both.
+        ("the heading says nothing about which MODE is showing",
+         screen_is_showing(INT_FORM, "INT") is True and screen_is_grid(GRID_IDS) is True),
+    ]
+    return _table("1099-INT: right screen, and the right MODE of it", checks)
+
+
+def case_form_dispatch():
+    """A payload picks its own Drake screen, so the agent has to refuse the ones it cannot
+    drive — and it has to refuse them BEFORE anything is typed.
+
+    Nothing downstream can catch this. The read-back gate proves Drake accepted a value and
+    the form check proves the value is on the canvas; both pass happily when 61 INT field
+    numbers are typed into a 1099-R. Only the map knows what a number means on a screen."""
+    import agent as ag
+    unknown = None
+    try:
+        ag._load_form_map("99N")
+    except ValueError as e:
+        unknown = str(e)
+    w2_target = ag._payload_target({"employee_ssn": "000112222", "employer_ein": "001112222",
+                                    "employee_first_name": "Test", "employee_last_name": "Taxpayer"})
+    int_target = ag._payload_target({"drake_screen": "INT", "recipient_tin": "123456789",
+                                     "payer_tin": "931234567", "employer_ein": "999999999",
+                                     "recipient_first_name": "Test", "recipient_last_name": "fynn"})
+    bogus = ag._payload_target({"drake_screen": "SCHC", "recipient_tin": "1"})
+    checks = [
+        ("a payload with no screen is still a W-2 — the default cannot change under us",
+         w2_target["screen"] == "W2"),
+        ("the W-2's dedupe id is the employer EIN", w2_target["ein"] == "001112222"),
+        ("an INT payload targets the INT screen", int_target["screen"] == "INT"),
+        ("the INT dedupe id is the PAYER TIN, not an employer EIN",
+         int_target["ein"] == "931234567"),
+        ("the client is found from the recipient TIN on a 1099",
+         int_target["ssn"] == "123456789" and int_target["last"] == "fynn"),
+        ("a screen with no field map resolves to no form", bogus["form"] is None),
+        ("...and asking for its map raises rather than falling back to the W-2",
+         unknown is not None),
+        ("the refusal names the screens the agent CAN drive",
+         unknown is not None and "W2" in unknown and "INT" in unknown),
+        ("both mapped screens expose the same planning entry points",
+         all(callable(getattr(ag._load_form_map(s)[0], fn))
+             for s in ("W2", "INT") for fn in ("build_plan", "format_plan"))),
+    ]
+    return _table("forms: a screen with no verified map is refused, not guessed", checks)
+
+
+def case_int_full_coverage_plan():
+    """The full-coverage dummy payload really does reach every writable box.
+
+    This is the payload the first live INT run uses, and its whole value is that one run
+    proves the entire map. A quietly dropped key would leave a box unproven while the run
+    still reported success — so the count is asserted, not eyeballed."""
+    import json as _json
+    import int_map
+    with open("sample_1099int_full.json", encoding="utf-8-sig") as f:
+        payload = _json.load(f)
+    plan = int_map.build_plan(payload, ts="T")
+    got = sorted(e["field_no"] for e in plan["entries"])
+    locality = [e for e in plan["entries"] if e["field_no"] == 4]
+    checks = [
+        ("all 61 writable boxes are planned", len(plan["entries"]) == 61),
+        ("...and they are exactly 1-62 without the sub-screen",
+         got == [n for n in range(1, 63) if n != 14]),
+        ("nothing was rejected", [s for s in plan["skipped"] if s.get("rejected")] == []),
+        ("no key in the payload was unrecognised", plan["unknown_keys"] == []),
+        ("the client identity keys are acknowledged, not called unknown",
+         "recipient_tin" in plan["identity_keys"]),
+        ("the resident city is typed as Drake's CODE, not the printed name",
+         bool(locality) and locality[0]["value"] == "PL"
+         and locality[0]["resolved_from"] == "PHILADELPHIA"),
+        ("every dropdown is flagged for a human's eye",
+         all(e["confirm"] for e in plan["entries"] if e["field_no"] in int_map.DROPDOWN_FIELDS)),
+        ("the plan says which screen it is for", plan["screen"] == "INT"),
+    ]
+    return _table("1099-INT: the dummy payload covers every box on the screen", checks)
+
+
 def main() -> int:
     # The suite prints '⚠' and '·', and a REDIRECTED stdout on Windows is cp1252 — which
     # raised UnicodeEncodeError inside the driver, was caught by headsdown_type's outer
@@ -2666,6 +2901,11 @@ def main() -> int:
         ('nav_screen_signature', lambda: case_nav_screen_signature()),
         ('nav_create_name_collision', lambda: case_nav_create_name_collision()),
         ('nav_menu_is_not_the_form', lambda: case_nav_menu_is_not_the_form()),
+        ('int_field_map', lambda: case_int_field_map()),
+        ('int_value_kinds', lambda: case_int_value_kinds()),
+        ('int_screen_and_grid', lambda: case_int_screen_and_grid()),
+        ('int_full_coverage_plan', lambda: case_int_full_coverage_plan()),
+        ('form_dispatch', lambda: case_form_dispatch()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),
         ('caret_rearm_impossible_halts', lambda: case_rearm_that_cannot_work_halts_clean()),

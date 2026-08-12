@@ -613,7 +613,10 @@ def build_plan(payload: dict, *, checkbox_token: str = "X", include_zeros: bool 
         payload["ts"] = ts
 
     for key, raw in payload.items():
-        if key.startswith("_"):
+        # Transport, not a value: `drake_screen` is how a payload names the form it is for,
+        # and it is what chose this map in the first place. Reporting it as an unrecognised
+        # key would put a permanent, meaningless warning on every W-2 the backend sends.
+        if key.startswith("_") or key in ("drake_screen", "doc_type"):
             continue
         if key in NOT_ON_THIS_SCREEN:
             not_on_screen.append({"key": key, "raw": raw, "why": NOT_ON_THIS_SCREEN[key]})

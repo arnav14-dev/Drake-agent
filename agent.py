@@ -659,19 +659,182 @@ def cmd_write_w2(args) -> int:
     return code
 
 
-def _payload_target(payload: dict) -> dict:
-    """Who and what this payload is for: {ssn, first, last, ein, screen}.
+# --- which form is this? -----------------------------------------------------------------
+# A payload names its Drake screen and this decides which field map plans it. Adding a form
+# is one row here plus its map module — nothing else in the entry path knows how many forms
+# exist, which is the only way the W-2's gates keep protecting the ones added after it.
+#
+# The nouns are for the operator, not the code: a message that says "W-2" while the 1099
+# screen is on the monitor is a message nobody trusts.
+_FORMS = {
+    "W2": {"module": "w2_map", "label": "W-2",
+           "id_key": "employer_ein", "id_noun": "employer EIN", "amount_noun": "wages"},
+    "INT": {"module": "int_map", "label": "1099-INT",
+            "id_key": "payer_tin", "id_noun": "payer TIN", "amount_noun": "interest income"},
+}
 
-    The backend already sends all of it — employee_ssn, employee_first_name,
-    employee_last_name and employer_ein have been in the handoff since the field map was
-    widened to 78. `screen` lets a future 1099/INT payload pick its own Drake screen
-    without another change here; W2 stays the default because it is the only screen with a
-    verified field map.
+
+def _form_for(screen: str) -> dict:
+    """The form definition for a Drake screen code, or None if this agent cannot drive it.
+
+    Refusing an unknown screen is the whole point. Every other layer downstream — the
+    read-back gate, the form check — verifies that Drake ACCEPTED what it was given, and
+    Drake accepts a field number on any screen. Only the map knows whether field 20 is Box
+    1 interest or something else entirely, so a screen with no map must never reach it.
+    """
+    return _FORMS.get(str(screen or "").strip().upper())
+
+
+def _load_form_map(screen: str):
+    """Import the map module for a screen. Raises ValueError with a usable message."""
+    form = _form_for(screen)
+    if not form:
+        raise ValueError(
+            f"this agent has no verified field map for Drake screen "
+            f"{str(screen).strip().upper()!r}. Screens it can drive: "
+            f"{', '.join(sorted(_FORMS))}. Entering without a map would put field numbers "
+            f"into boxes nobody has checked.")
+    import importlib
+    return importlib.import_module(form["module"]), form
+
+
+def cmd_write_form(args) -> int:
+    """Extracted JSON -> Drake, end to end, for ANY screen this agent has a map for.
+
+    The same command as `write-w2` with the form chosen by the payload's `drake_screen`
+    instead of assumed. It is the path a new form is brought up on: --dry-run resolves the
+    whole plan and touches nothing (works on a machine with no Drake at all), then the live
+    run navigates to the client and the screen itself, types every field by number, reads
+    each one back, and finishes with the form check and a screenshot.
+
+    Never files. There is no file/e-file command in this agent by design.
+    """
+    import time
+
+    with open(args.json, "r", encoding="utf-8-sig") as f:
+        payload = json.load(f)
+
+    screen = str(args.screen or payload.get("drake_screen") or "W2").upper()
+    payload["drake_screen"] = screen
+    try:
+        form_map, form = _load_form_map(screen)
+    except ValueError as e:
+        print(f"\n{e}\n", file=sys.stderr)
+        return 1
+
+    binding = load_binding(args.binding) if not args.dry_run else _try_load_binding(args.binding)
+    token = (binding.get("navigation", {}) or {}).get("headsdown_checkbox_true", "X")
+    plan = form_map.build_plan(payload, checkbox_token=token, include_zeros=args.include_zeros,
+                              skip_fields=args.skip_field, ts=args.ts)
+    print(f"\nForm: {form['label']}  (Drake screen {screen})")
+    print(form_map.format_plan(plan))
+
+    if not plan["entries"]:
+        print("Nothing to enter — the payload resolved to zero fields.\n", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print("DRY RUN — nothing was sent to Drake. Re-run without --dry-run to enter these.\n")
+        return 0
+
+    # Abort BEFORE connecting if the extraction produced a value we could not resolve. The
+    # run would otherwise enter everything else and report unqualified success with the bad
+    # field silently blank. Nothing has been typed yet, so stopping here is free.
+    rejected = [s for s in plan["skipped"] if s.get("rejected")]
+    if rejected and not args.allow_rejected:
+        print(f"REFUSING TO START: {len(rejected)} value(s) could not be resolved to a valid "
+              f"entry:", file=sys.stderr)
+        for s in rejected:
+            print(f"    field {s['field_no']:<4} {s['label']:<38} raw={s['raw']!r}", file=sys.stderr)
+        print("Fix the payload, or pass --allow-rejected to enter the rest and key these by "
+              "hand.\n", file=sys.stderr)
+        return 1
+
+    driver = DrakeDriver(binding)
+    driver.connect()
+    wi = driver.window_info()
+    print(f"Bound window: {wi.get('title')!r}  {wi.get('width')}x{wi.get('height')}")
+    if driver.w32 is None:
+        print("  could not open the win32 popup connection — heads-down entry needs it.",
+              file=sys.stderr)
+        return 1
+
+    if args.manual:
+        print(f"\nOpen the {form['label']} screen ({screen}) for this client, then CLICK into "
+              f"any field on it so\nits cursor is blinking (that active caret is what lets "
+              f"Ctrl+N arm heads-down).")
+        print("Then take your hands off the keyboard. Entry starts in ", end="", flush=True)
+        for n in range(max(1, args.delay), 0, -1):
+            print(f"{n}… ", end="", flush=True)
+            time.sleep(1)
+        print()
+    else:
+        # The real path: the operator leaves Drake on its home screen and the agent opens
+        # the client, the screen and the record itself — with the identity check, the screen
+        # signature and the grid-mode check all in front of the first keystroke.
+        navr = _navigate_for_payload(driver, payload, args)
+        if not navr["ok"]:
+            print(f"\nNAVIGATION STOPPED: {navr['reason']}\nNothing was typed.\n", file=sys.stderr)
+            return 1
+        if not driver._focus_canvas_field():
+            print("\nCould not put the caret on a Drake data-entry box after navigating. "
+                  "Nothing was typed.\n", file=sys.stderr)
+            return 1
+
+    rows, halted, reason = _headsdown_run(driver, plan["entries"],
+                                          method=args.toggle_method,
+                                          settle_after=args.settle_after)
+    code = _print_seq_outcome(rows, halted, reason, plan=plan)
+
+    # THE FORM-LEVEL CHECK. Everything above verifies what the POPUP showed, which is what
+    # we typed — not what Drake KEPT. A dropdown with no matching entry accepts the typing,
+    # echoes it back, and stores nothing; this screen has ten of them, none confirmed.
+    entered = [r for r in rows if r["ok"]]
+    audit = driver.audit_canvas([e for e in plan["entries"]
+                                 if str(e["field_no"]) in {r["num"] for r in entered}])
+    print()
+    if audit.get("canvas_elements"):
+        if audit["ok"]:
+            print(f"FORM CHECK: all {audit['checked']} entered value(s) are readable on the "
+                  f"data-entry form ({audit['canvas_elements']} controls read).")
+        else:
+            print(f"FORM CHECK — {len(audit['missing'])} value(s) reported entered are NOT on "
+                  f"the form. Drake took the keystrokes and kept nothing:")
+            for e in audit["missing"]:
+                print(f"    field {e['field_no']:<4} {e['label']:<38} = {e['value']!r}")
+            print("    A dropdown with no matching entry does this: it accepts the typing,")
+            print("    echoes it in the popup, and stores nothing. Enter these by hand.")
+            code = max(code, 3)
+    else:
+        print(f"FORM CHECK: unavailable — {audit.get('reason')}")
+    s = driver.save_screenshot(args.shot)
+    print(f"screenshot -> {s['path']}" if s.get("ok") else f"(screenshot failed: {s.get('error')})")
+    print("\nVERIFY THE SCREENSHOT before doing anything else in Drake. This agent has no")
+    print("file/e-file command by design — a human reviews and executes, always.")
+    return code
+
+
+def _payload_target(payload: dict) -> dict:
+    """Who and what this payload is for: {ssn, first, last, ein, screen, form}.
+
+    `ssn` is the CLIENT — whose return this document belongs to. It is never a box on the
+    document's own screen (a W-2 screen has no SSN box, an INT screen has no recipient
+    block); it is what the agent matches the client on, and it arrives under whichever name
+    that form's extractor uses.
+
+    `ein` is the DEDUPE id — the employer on a W-2, the payer on a 1099. Entering the same
+    one twice doubles a client's income and every read-back would still verify perfectly,
+    so which key holds it comes from the form definition rather than being hard-coded.
     """
     g = lambda k: str(payload.get(k) or "").strip()
-    return {"ssn": g("employee_ssn"), "first": g("employee_first_name"),
-            "last": g("employee_last_name"), "ein": g("employer_ein"),
-            "screen": (g("drake_screen") or "W2").upper()}
+    first = lambda *keys: next((g(k) for k in keys if g(k)), "")
+    screen = (g("drake_screen") or "W2").upper()
+    form = _form_for(screen) or {}
+    return {"ssn": first("client_ssn", "employee_ssn", "recipient_tin", "recipient_ssn"),
+            "first": first("client_first_name", "employee_first_name", "recipient_first_name"),
+            "last": first("client_last_name", "employee_last_name", "recipient_last_name"),
+            "ein": g(form.get("id_key") or "employer_ein"),
+            "screen": screen,
+            "form": form or None}
 
 
 def _navigate_for_payload(driver, payload: dict, args) -> dict:
@@ -688,9 +851,14 @@ def _navigate_for_payload(driver, payload: dict, args) -> dict:
     steps: list = []
     out = {"ok": False, "reason": None, "steps": steps, "target": t}
 
+    if not t["form"]:
+        out["reason"] = (f"the payload asks for Drake screen {t['screen']!r}, which this "
+                         f"agent has no verified field map for. Screens it can drive: "
+                         f"{', '.join(sorted(_FORMS))}. Nothing was opened.")
+        return out
     if not t["ssn"]:
-        out["reason"] = ("the payload has no employee SSN, so the agent cannot tell which "
-                         "return this W-2 belongs to")
+        out["reason"] = (f"the payload has no client SSN, so the agent cannot tell which "
+                         f"return this {t['form']['label']} belongs to")
         return out
 
     r = nav.open_client(driver, t["ssn"], first_name=t["first"], last_name=t["last"],
@@ -725,7 +893,9 @@ def _navigate_for_payload(driver, payload: dict, args) -> dict:
     driver.rebaseline(why="opening the return and its screen")
 
     state = driver.form_record_state()
-    plan = nav.plan_record_use(state, t["ein"], allow_new=not args.no_new_record)
+    plan = nav.plan_record_use(state, t["ein"], allow_new=not args.no_new_record,
+                               noun=t["form"]["label"], id_noun=t["form"]["id_noun"],
+                               amount_noun=t["form"]["amount_noun"])
     steps.append({"step": "record", "action": plan["action"], "reason": plan["reason"],
                   "index": state.get("index"), "count": state.get("count"),
                   "populated": state.get("populated")})
@@ -740,7 +910,7 @@ def _navigate_for_payload(driver, payload: dict, args) -> dict:
         if not n["ok"]:
             out["reason"] = n["reason"]
             return out
-        print(f"  opened a new W-2 record ({n['index']} of {n['count']})")
+        print(f"  opened a new {t['form']['label']} record ({n['index']} of {n['count']})")
         out["record"] = {"index": n["index"], "count": n["count"]}
     else:
         out["record"] = {"index": state.get("index"), "count": state.get("count")}
@@ -751,15 +921,27 @@ def _navigate_for_payload(driver, payload: dict, args) -> dict:
 
 
 def _enter_one_payload(driver, payload: dict, args, *, token: str) -> dict:
-    """Plan one extracted W-2 and enter it. Returns a report; never files, never raises.
+    """Plan one extracted document and enter it. Returns a report; never files, never raises.
 
     Composes the SAME helpers `write-w2` uses — build_plan, _headsdown_run, audit_canvas —
     rather than reimplementing them, so the watcher cannot drift into a second, less-tested
     entry path. Every gate that protects a hand-run protects this one.
-    """
-    from w2_map import build_plan, format_plan
 
-    report: dict = {"ok": False, "halted": False, "entered": 0, "planned": 0, "reason": None}
+    WHICH map plans it comes from the payload's own `drake_screen`. A payload for a screen
+    this agent has no map for is refused here having typed nothing — the read-back gates
+    downstream cannot save it, because Drake will happily accept a field number on any
+    screen and only the map knows what that number means.
+    """
+    screen = str((payload or {}).get("drake_screen") or "W2").upper()
+    report: dict = {"ok": False, "halted": False, "entered": 0, "planned": 0, "reason": None,
+                    "screen": screen}
+    try:
+        form_map, form = _load_form_map(screen)
+    except ValueError as e:
+        report["reason"] = str(e)
+        return report
+    build_plan, format_plan = form_map.build_plan, form_map.format_plan
+
     try:
         plan = build_plan(payload, checkbox_token=token, include_zeros=args.include_zeros,
                           skip_fields=None, ts=args.ts)
@@ -818,7 +1000,12 @@ def _enter_one_payload(driver, payload: dict, args, *, token: str) -> dict:
 
 
 def cmd_watch(args) -> int:
-    """Watch a folder for W-2 payloads and enter each one into Drake.
+    """Watch a folder for payloads and enter each one into Drake.
+
+    Each payload names its own Drake screen and is planned with THAT screen's verified field
+    map (see `_FORMS`). A payload naming a screen with no map is refused having typed
+    nothing — the read-back gates below cannot catch a wrong SCREEN, because Drake accepts a
+    field number on whatever form is in front of it.
 
     This is the transport between Fynn's backend and Drake. The backend writes
     `w2-<docId>.json` into the folder (atomically — it renames a `.part` file into place, so
@@ -856,8 +1043,9 @@ def cmd_watch(args) -> int:
               file=sys.stderr)
         return 1
 
-    print(f"\nWatching {root} for W-2 payloads. Open Drake on the W-2 screen of the return "
-          f"you want filled.\nCtrl+C to stop.\n")
+    print(f"\nWatching {root} for payloads ({', '.join(sorted(_FORMS))}). Leave Drake on its "
+          f"home screen — the agent opens the client, the screen and the record itself."
+          f"\nCtrl+C to stop.\n")
     processed = 0
     try:
         while True:
@@ -1391,7 +1579,24 @@ def main() -> int:
     spp = sub.add_parser("probe-popup", parents=[common]); spp.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the probe runs"); spp.add_argument("--probe-field", dest="probe_field", default="6", help="which field number the probe jumps to. Default 6 (employer 'Name cont.' — normally empty and inert). NEVER use 4: it is the EIN, it auto-fills, and it is the do-not-touch box"); spp.set_defaults(func=cmd_probe_popup)
     spc = sub.add_parser("probe-checkbox", parents=[common]); spc.add_argument("--delay", type=int, default=8, help="seconds to click into a Drake field before the probe runs"); spc.add_argument("--field", dest="field_no", default="47", help="which CHECKBOX field to probe. Default 47 (Box 13 retirement plan); 46 statutory employee, 48 sick pay"); spc.add_argument("--no-flip", dest="no_flip", action="store_true", help="observe only — read the arrival state and leave without sending any token"); spc.set_defaults(func=cmd_probe_checkbox)
     sw2 = sub.add_parser("write-w2", parents=[common]); sw2.add_argument("--json", required=True, help="extracted W-2 JSON (the LLM's structured output — see w2_map.W2_SCHEMA_KEYS)"); sw2.add_argument("--dry-run", action="store_true", help="resolve and PRINT the plan without touching Drake — run this first, works anywhere"); sw2.add_argument("--skip-field", dest="skip_field", type=int, action="append", metavar="N", help="do NOT enter this field number, even if the extraction has a value for it; repeatable. Use --skip-field 4 to leave the employer EIN alone (it also avoids Drake's auto-fill + auto-advance)"); sw2.add_argument("--ts", choices=["T", "S"], help="whose W-2 this is (field 1). Drake defaults to T; on a JOINT return an unset TS files the spouse's W-2 under the taxpayer"); sw2.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="proceed even if some extracted values could not be resolved (they stay blank in Drake for you to key by hand)"); sw2.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero (default: skip — a blank box is zero on a tax form)"); sw2.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); sw2.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field (auto-fill/validation)"); sw2.add_argument("--delay", type=int, default=10, help="seconds to click into the W-2 screen before entry fires"); sw2.add_argument("--shot", default="w2-after.png", help="screenshot saved after the run — the verification artifact"); sw2.set_defaults(func=cmd_write_w2)
-    swt = sub.add_parser("watch", parents=[common]); swt.add_argument("--dir", required=True, help="folder the backend drops W-2 payloads into (its DRAKE_HANDOFF_DIR). Entered oldest-first, one at a time, then moved to done/ or failed/ with a .report.json"); swt.add_argument("--interval", type=float, default=2.0, help="seconds between folder checks"); swt.add_argument("--once", action="store_true", help="enter whatever is queued right now, then exit (what to use for a test)"); swt.add_argument("--keep-going", dest="keep_going", action="store_true", help="carry on to the next payload after one fails. OFF by default: a halt leaves Drake's screen in a state nobody has reviewed, and entering the next W-2 on top of it turns one bad return into several"); swt.add_argument("--ts", choices=["T", "S"], help="whose W-2 these are (field 1), when the payload does not say"); swt.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="enter the rest even when some extracted values could not be resolved (they stay blank for you to key by hand)"); swt.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero"); swt.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); swt.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field"); swt.add_argument("--no-navigate", dest="no_navigate", action="store_true", help="do NOT open the client and screen — go back to typing into whatever a human already opened. The identity check goes away with it"); swt.add_argument("--nav-timeout", dest="nav_timeout", type=float, default=12.0, help="seconds to wait for each Drake window while navigating"); swt.add_argument("--create", dest="create", action="store_true", help="create a client Drake has never seen instead of refusing. OFF by default: clients are created by a human, and a run that refuses tells the operator which SSN was missing rather than quietly opening a new empty return"); swt.add_argument("--no-new-record", dest="no_new_record", action="store_true", help="refuse instead of pressing Page Down when the open W-2 record already has another employer on it"); swt.set_defaults(func=cmd_watch)
+    swt = sub.add_parser("watch", parents=[common]); swt.add_argument("--dir", required=True, help="folder the backend drops payloads into (its DRAKE_HANDOFF_DIR). Entered oldest-first, one at a time, then moved to done/ or failed/ with a .report.json"); swt.add_argument("--interval", type=float, default=2.0, help="seconds between folder checks"); swt.add_argument("--once", action="store_true", help="enter whatever is queued right now, then exit (what to use for a test)"); swt.add_argument("--keep-going", dest="keep_going", action="store_true", help="carry on to the next payload after one fails. OFF by default: a halt leaves Drake's screen in a state nobody has reviewed, and entering the next W-2 on top of it turns one bad return into several"); swt.add_argument("--ts", choices=["T", "S", "J"], help="whose documents these are (field 1), when the payload does not say. J (joint) is valid on the 1099 screens only — the W-2 screen's selector is TS and refuses it"); swt.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="enter the rest even when some extracted values could not be resolved (they stay blank for you to key by hand)"); swt.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero"); swt.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)"); swt.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field"); swt.add_argument("--no-navigate", dest="no_navigate", action="store_true", help="do NOT open the client and screen — go back to typing into whatever a human already opened. The identity check goes away with it"); swt.add_argument("--nav-timeout", dest="nav_timeout", type=float, default=12.0, help="seconds to wait for each Drake window while navigating"); swt.add_argument("--create", dest="create", action="store_true", help="create a client Drake has never seen instead of refusing. OFF by default: clients are created by a human, and a run that refuses tells the operator which SSN was missing rather than quietly opening a new empty return"); swt.add_argument("--no-new-record", dest="no_new_record", action="store_true", help="refuse instead of pressing Page Down when the open W-2 record already has another employer on it"); swt.set_defaults(func=cmd_watch)
+    swf = sub.add_parser("write-form", parents=[common], help="enter an extracted document into Drake on ANY screen this agent has a verified field map for (W2, INT)")
+    swf.add_argument("--json", required=True, help="extracted JSON. The form is chosen by its 'drake_screen' key (or --screen)")
+    swf.add_argument("--screen", help="override the payload's drake_screen (W2, INT)")
+    swf.add_argument("--dry-run", action="store_true", help="resolve and PRINT the plan without touching Drake — run this first, works anywhere")
+    swf.add_argument("--manual", action="store_true", help="do NOT navigate: YOU open the client and the screen and click a field, then the agent types. Skips the identity, screen and grid-mode checks with it")
+    swf.add_argument("--skip-field", dest="skip_field", type=int, action="append", metavar="N", help="do NOT enter this field number even if the payload has a value for it; repeatable")
+    swf.add_argument("--ts", choices=["T", "S", "J"], help="whose document this is (field 1). 1099 screens are TSJ and accept J (a joint account); the W-2 screen is TS only")
+    swf.add_argument("--allow-rejected", dest="allow_rejected", action="store_true", help="proceed even if some values could not be resolved (they stay blank in Drake for you to key by hand)")
+    swf.add_argument("--include-zeros", action="store_true", help="also enter money fields that are zero (default: skip — a blank box is zero on a tax form)")
+    swf.add_argument("--toggle-method", dest="toggle_method", choices=["scancode", "vkhold", "pywinauto"], default="scancode", help="how Ctrl+N is injected (default scancode — what Drake accepts)")
+    swf.add_argument("--settle-after", dest="settle_after", type=float, default=0.15, help="seconds to let Drake settle after each field")
+    swf.add_argument("--nav-timeout", dest="nav_timeout", type=float, default=12.0, help="seconds to wait for each Drake window while navigating")
+    swf.add_argument("--create", dest="create", action="store_true", help="create a client Drake has never seen instead of refusing. OFF by default: clients are created by a human")
+    swf.add_argument("--no-new-record", dest="no_new_record", action="store_true", help="refuse instead of pressing Page Down when the open record already holds another payer/employer")
+    swf.add_argument("--delay", type=int, default=10, help="seconds to click into the screen before entry fires, in --manual mode")
+    swf.add_argument("--shot", default="form-after.png", help="screenshot saved after the run — the verification artifact")
+    swf.set_defaults(func=cmd_write_form)
     sev = sub.add_parser("envdump", parents=[common]); sev.add_argument("--out", default="env-dump.json", help="where to write the window-topology JSON"); sev.add_argument("--delay", type=int, default=0, help="seconds before capture — time to click a field / open heads-down first"); sev.set_defaults(func=cmd_envdump)
     sx = sub.add_parser("explore", parents=[common], help="read-only: show every window and control Drake is displaying right now")
     sx.add_argument("--out", default="explore.json", help="where to write the full JSON dump")

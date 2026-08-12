@@ -275,6 +275,50 @@ MUTANTS = {
     "nav: auto-create ignores a client already on the books (misread SSN buries a return)": (
         '        if names_match(r.get("name"), first_name, last_name)["ok"]:\n            hits.append(r)',
         '        if False:\n            hits.append(r)'),
+    "nav: grid mode is never detected (61 field numbers into a spreadsheet)": (
+        '    return any(str(i or "").lower().startswith(pre) for i in (element_ids or ()))',
+        "    return False"),
+    "nav: everything is called a grid (the form view can never be entered)": (
+        '    return any(str(i or "").lower().startswith(pre) for i in (element_ids or ()))',
+        "    return True"),
+    # -- the 1099-INT map and the generic planner (int_map.py / form_plan.py) -----------
+    # The W-2 taught this the expensive way: the map IS the safety mechanism, because a
+    # wrong field number has no downstream defense. Drake accepts a number on any screen,
+    # the popup echoes the value back, the read-back gate passes, and a plausible amount
+    # ends up in the wrong box of a real return with a green run on the operator's screen.
+    "int: two keys may claim the same box (one value silently overwrites another)": (
+        "            if n in seen:\n"
+        "                raise RuntimeError(f\"{where}: field {n} is claimed by both {seen[n]!r} and {k!r}\")",
+        "            if False:\n"
+        "                raise RuntimeError(f\"{where}: field {n} is claimed by both {seen[n]!r} and {k!r}\")"),
+    "int: a key may be bound to the forbidden '<Click to Access>' sub-screen": (
+        "        bad = sorted((k, n) for k, n in nums if n in self.forbidden)",
+        "        bad = []"),
+    "int: field numbers above the highest legible one are allowed": (
+        "        out_of_range = sorted((k, n) for k, n in nums if not 1 <= n <= self.max_field)",
+        "        out_of_range = []"),
+    "int: an unknown value kind falls through to plain text instead of refusing": (
+        '        unknown_kinds = sorted({s["kind"] for s in self.fields.values()} - {',
+        '        unknown_kinds = [] or sorted(set() - {'),
+    "int: a percentage over 100 is entered instead of refused": (
+        "    if pct < 0 or pct > 100:\n        return None",
+        "    if False:\n        return None"),
+    "int: an unparseable date is typed anyway instead of refused": (
+        "    if not (1 <= int(m) <= 12 and 1 <= int(d) <= 31 and 1900 <= int(y) <= 2100):\n"
+        "        return None",
+        "    if False:\n        return None"),
+    "int: a joint 'J' is quietly downgraded to taxpayer": (
+        '    if s in ("T", "S", "J"):\n        return s',
+        '    if s in ("T", "S", "J"):\n        return "T"'),
+    "int: a locality is typed as its printed name instead of Drake's code": (
+        '            if res["code"] is None:\n                row["value"] = _clean_text(raw)',
+        '            if True:\n                row["value"] = _clean_text(raw)'),
+    "forms: an unmapped screen falls back to the W-2 map": (
+        '    return _FORMS.get(str(screen or "").strip().upper())',
+        '    return _FORMS.get(str(screen or "").strip().upper()) or _FORMS["W2"]'),
+    "forms: the dedupe id always comes from the W-2's employer EIN key": (
+        '            "ein": g(form.get("id_key") or "employer_ein"),',
+        '            "ein": g("employer_ein"),'),
 }
 
 # Which source file each mutant edits. drake_driver.py unless named here — the guards that
@@ -282,7 +326,13 @@ MUTANTS = {
 # reach one file quietly reports "all covered" about the other.
 TARGET = {n: "w2_map.py" for n in MUTANTS if n.startswith("locality:")}
 TARGET.update({n: "drake_nav.py" for n in MUTANTS if n.startswith("nav:")})
-MUTABLE_FILES = ("drake_driver.py", "w2_map.py", "drake_nav.py")
+# The 1099-INT guards live in the generic planner, not in the INT map — that is the point
+# of the planner. `forms:` mutants edit the dispatcher in agent.py, which is what decides
+# which map plans a payload at all.
+TARGET.update({n: "form_plan.py" for n in MUTANTS if n.startswith("int:")})
+TARGET.update({n: "agent.py" for n in MUTANTS if n.startswith("forms:")})
+MUTABLE_FILES = ("drake_driver.py", "w2_map.py", "drake_nav.py", "form_plan.py",
+                 "int_map.py", "agent.py")
 
 
 # Mutants whose guard belongs to one family of cases may name that family, so the harness
@@ -296,6 +346,14 @@ FAMILY.update({n: "ctrln" for n in MUTANTS if "inert popup" in n or "double-togg
 FAMILY.update({n: "locality" for n in MUTANTS if n.startswith("locality:")})
 FAMILY.update({n: "caret" for n in MUTANTS if n.startswith("caret:")})
 FAMILY.update({n: "nav" for n in MUTANTS if n.startswith("nav:")})
+FAMILY.update({n: "int" for n in MUTANTS if n.startswith("int:")})
+FAMILY.update({n: "form_dispatch" for n in MUTANTS if n.startswith("forms:")})
+# The grid-mode guard lives in drake_nav (so it is a `nav:` mutant) but the cases that
+# prove it are the INT ones — the grid only exists on screens like INT. Filtering to the
+# 'nav' family would run a set of cases that never touches it, and a mutant that survives
+# because its test was never RUN reads exactly like a mutant that survived because the
+# guard is untested.
+FAMILY.update({n: "grid" for n in MUTANTS if "grid" in n})
 
 
 # Per-mutant wall clock. A BROKEN guard does not only fail cases — it stops the driver
@@ -325,9 +383,20 @@ pick = args[0] if args else None      # substring: run only these mutants
 if pick:
     print(f"(only mutants matching {pick!r})\n")
 
+# Everything the suite needs to run standing on its own in a temp directory. It must be a
+# SUPERSET of MUTABLE_FILES: a mutant written into a file the suite never loaded would run
+# against the pristine original and be reported as a survivor — the harness accusing the
+# tests of a gap that is really its own.
+COPY_FILES = ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py",
+              "drake_nav.py", "form_plan.py", "int_map.py", "agent.py",
+              "sample_1099int_full.json")
+missing = sorted(set(MUTABLE_FILES) - set(COPY_FILES))
+if missing:
+    raise SystemExit(f"mutants.py: {missing} can be mutated but is never copied into the "
+                     f"sandbox — every mutant against it would falsely SURVIVE")
+
 base_dir = tempfile.mkdtemp()
-for f in ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py",
-          "drake_nav.py"):
+for f in COPY_FILES:
     shutil.copy(SRC / f, base_dir)
 todo = {k: v for k, v in MUTANTS.items() if not pick or pick.lower() in k.lower()}
 if not todo:
@@ -357,8 +426,7 @@ for name, (anchor, repl) in todo.items():
         survived.append(name)
         continue
     d = tempfile.mkdtemp()
-    for f in ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py",
-          "drake_nav.py"):
+    for f in COPY_FILES:
         shutil.copy(SRC / f, d)
     (pathlib.Path(d) / target).write_text(original.replace(anchor, repl), encoding="utf-8")
     fam = FAMILY.get(name)
