@@ -30,7 +30,10 @@ halt that taught the map something:
   field 26  the same, and it echoed 'CA  Canada' — which is how we know CA is Canada here
             and not California.
   field 58  bank interest state is FOUR states, MA/ME/OK/TN.
-  field 61  a single letter, A-N, of Illinois bond categories.
+  field 61  a code from Drake's Illinois bond list. Recorded as "a single letter, A-N"
+            from the list Drake printed when it rejected a value — and that window
+            scrolled. Reading the list out of the DIV screen's copy of the same control on
+            2026-08-12 showed 32 codes, A-Z plus AA-FF. Corrected below.
 
 TEN OF THESE BOXES ARE DROPDOWNS and all ten are now confirmed to take a typed code on this
 build. That was worth measuring rather than assuming, because a Drake dropdown with no
@@ -161,7 +164,19 @@ INT_FIELD_MAP = {
     "ftc_date_paid_or_accrued":     {"field_no": 55, "kind": "date",     "label": "FTC date paid or accrued",
                                      "confirm": True},
     "ftc_foreign_investment_expense": {"field_no": 56, "kind": "money",  "label": "FTC foreign investment expense"},
-    "ftc_amount":                   {"field_no": 57, "kind": "money",    "label": "FTC amount", "confirm": True},
+    # CORRECTED 2026-08-12, from measuring the SAME box on the DIV screen. This is 41 pixels
+    # wide where every amount box here is 136 — the same width as the LLC # box at field 62.
+    # Its twin on the DIV screen (field 68) took '601' from '6010' on a live run: it stops
+    # accepting characters at three.
+    #
+    # So it is not an amount, and calling it one was wrong. The INT coverage run sent '570'
+    # and it fit, which is exactly why the mistake survived — three digits of a wrong-kinded
+    # value look identical to a right one. Drake prints only "FTC" beside it, in the
+    # "Form 1116 / FTC information" group; a 3-character box there is a form NUMBER. That
+    # last part is inferred; the three characters are measured.
+    "ftc_form_1116_code":           {"field_no": 57, "kind": "digits",
+                                     "label": "FTC — Form 1116 number (3-char box, NOT an amount)",
+                                     "max_len": 3, "confirm": True},
     # --- state-specific ----------------------------------------------------------------
     # NOT a general state dropdown — Drake lists exactly four. Its own words, measured
     # 2026-08-12: "State bank interest (direct entry) — Choose the state for which the bank
@@ -185,11 +200,25 @@ INT_FIELD_MAP = {
     # echo what was sent and the run refused to commit. Sending 'US' got through the popup
     # — and Drake rejected it afterwards with its own window.
     #
-    # `values` is every single letter, not the exact list: the list is Illinois-specific
-    # and the window scrolled past N, so a shorter set risks refusing a code Drake would
-    # have taken. One letter is what was actually measured; that is what is enforced.
-    "il_schedule_m_source":         {"field_no": 61, "kind": "code",     "label": "IL Schedule M interest source (A-N)",
-                                     "values": {chr(c) for c in range(ord("A"), ord("Z") + 1)},
+    # CORRECTED 2026-08-12. This was every SINGLE letter, written from the list Drake
+    # printed in its REJECTION window — and that window scrolled. Reading the same Illinois
+    # list straight out of the DIV screen's control (its field 71) showed it runs to
+    # THIRTY-TWO codes: A-Z plus AA, BB, CC, DD, EE, FF, the two-letter ones being bonds
+    # issued by Guam, Puerto Rico, the Virgin Islands, American Samoa and the Northern
+    # Marianas.
+    #
+    # So the old set would have refused a client's valid Puerto Rico bond code — our own
+    # planner rejecting a value Drake would have accepted. That is exactly the failure a
+    # `values` list exists to prevent, pointed the wrong way, and it is why a list read off
+    # a help window is not a measurement of the list.
+    #
+    # NOT re-read on the INT screen itself: this is the DIV screen's copy of the same
+    # Illinois Schedule M list. Widening is the safe direction — for a code Drake really
+    # does not have, the outcome is the refusal that already happens today.
+    "il_schedule_m_source":         {"field_no": 61, "kind": "code",
+                                     "label": "IL Schedule M interest source (A-Z, AA-FF)",
+                                     "values": ({chr(c) for c in range(ord("A"), ord("Z") + 1)}
+                                                | {"AA", "BB", "CC", "DD", "EE", "FF"}),
                                      "confirm": True},
     "llc_number":                   {"field_no": 62, "kind": "digits",   "label": "LLC #"},
 }
@@ -216,8 +245,9 @@ NOTES = [
     "the three amount/percent pairs (48/49, 50/51, 52/53) are alternatives — Drake expects "
     "one or the other on each row. Nothing here can tell which one a document meant, so if "
     "both arrive both are typed; check those rows on the screenshot.",
-    "field 57 (FTC) is a narrow box whose contents have not been read back on this build. "
-    "It is entered as an amount and flagged — confirm it on the screenshot.",
+    "field 57 (FTC) holds THREE characters and is NOT an amount box — measured on the DIV "
+    "screen's twin of it, where Drake took '601' from '6010'. The coverage run's old value "
+    "of '570' fit, which is why it looked right for so long.",
 ]
 
 INT_SPEC = FormSpec(

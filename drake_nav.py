@@ -111,6 +111,13 @@ SCREEN_SIGNATURES = {
     # screen-link list ('INT|1099-INT, Interest Income'), which is present in every window
     # in every state, so the short form would report the INT screen as open from the menu.
     "INT": r"Schedule\s+B\s*-\s*Interest\s+Income\s*\(1099-INT\)",
+    # Measured 2026-08-12 in explore-div-form.json. Whole heading for the same reason as the
+    # INT one: the Data Entry Menu's screen-link list carries 'DIV|1099-DIV, Dividend Income'
+    # in every window in every state, so a short pattern would report this screen as open
+    # from the menu. The two Schedule B screens also cross-link to each other ('Screen INT
+    # for Interest' is printed on the DIV screen), which is a second way a loose pattern
+    # would match the wrong one.
+    "DIV": r"Schedule\s+B\s*-\s*Dividend\s+Income\s*\(1099-DIV\)",
 }
 
 # Drake can draw some screens as a SPREADSHEET instead of a form — the INT screen prints

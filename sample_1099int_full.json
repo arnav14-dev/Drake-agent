@@ -97,7 +97,7 @@
   "ftc_accrued": true,
   "ftc_date_paid_or_accrued": "12/31/2025",
   "ftc_foreign_investment_expense": "560",
-  "ftc_amount": "570",
+  "ftc_form_1116_code": "1",
 
   "bank_interest_state": "MA",
   "bank_interest_amount": "590",

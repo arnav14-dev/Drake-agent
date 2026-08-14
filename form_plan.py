@@ -109,6 +109,30 @@ def _clean_date(v) -> Optional[str]:
     return f"{m}{d}{y}"
 
 
+# Kinds whose value is a QUANTITY, where cutting characters off the end changes the number
+# rather than shortening a description. A `text` box may be trimmed to fit and reported; one
+# of these may not.
+NUMERIC_KINDS = frozenset({"money", "digits", "pct", "tin", "ein", "ssn", "zip", "year"})
+
+
+def _clean_code_alnum(v) -> Optional[str]:
+    """A dropdown selection code that may contain DIGITS — Drake's Section 1202 list on the
+    DIV screen is Q1 / Q3 / Q4.
+
+    Deliberately NOT a loosening of the `code` kind. That one is the W-2's Box 12 code and
+    it REJECTS anything carrying a digit on purpose: 'D 23' has a prior-year designation
+    that belongs in its own box, and stripping it to 'D' measures the whole amount against
+    the current year's deferral limit. The rule is right there and wrong here, so these are
+    two kinds rather than one kind with an exception.
+
+    Anything that is not purely alphanumeric — 'Q1 - QSB stock 50%...', a code with a dash —
+    returns None and becomes a loud skip. Silently compressing a descriptive string into
+    something code-shaped is how a value nobody chose ends up in a box.
+    """
+    s = str(v).strip().upper()
+    return s if s.isalnum() else None
+
+
 def sanitize(kind: str, value, *, checkbox_token: str = "X") -> Optional[str]:
     """Value as Drake should receive it, or None meaning SKIP this field entirely."""
     if value is None:
@@ -123,6 +147,8 @@ def sanitize(kind: str, value, *, checkbox_token: str = "X") -> Optional[str]:
         return _clean_pct(value)
     if kind == "date":
         return _clean_date(value)
+    if kind == "code_an":
+        return _clean_code_alnum(value)
     return _w2_sanitize(kind, value, checkbox_token=checkbox_token)
 
 
@@ -210,8 +236,8 @@ class FormSpec:
             raise RuntimeError(f"{where}: key(s) both mapped and marked not-on-screen: "
                                f"{sorted(overlap)}")
         unknown_kinds = sorted({s["kind"] for s in self.fields.values()} - {
-            "money", "ein", "ssn", "tin", "digits", "zip", "state", "code", "year", "ts",
-            "tsj", "checkbox", "text", "pct", "date"})
+            "money", "ein", "ssn", "tin", "digits", "zip", "state", "code", "code_an",
+            "year", "ts", "tsj", "checkbox", "text", "pct", "date"})
         if unknown_kinds:
             raise RuntimeError(f"{where}: unknown value kind(s) {unknown_kinds} — sanitize() "
                                f"would silently fall through to plain text")
@@ -312,6 +338,23 @@ def build_plan(payload: dict, spec: FormSpec, *, checkbox_token: str = "X",
         trimmed_from = None
         maxlen = field.get("max_len")
         if val is not None and maxlen and len(val) > int(maxlen):
+            if field["kind"] in NUMERIC_KINDS:
+                # Cutting a NUMBER to fit does not shorten it, it changes it: 6010 becomes
+                # 601. Measured live on the DIV screen 2026-08-12, where field 68 is a
+                # 3-character box — Drake took '601' from '6010' and the run halted on the
+                # read-back because the echo did not match what was sent.
+                #
+                # That halt is what a wrong value looks like when it is caught. A trim would
+                # have made it look like a success with a warning attached, and the warning
+                # would sit under a value that is off by a factor of ten.
+                skipped.append({"key": key, "field_no": no, "label": field["label"],
+                                "raw": raw, "rejected": True})
+                warnings.append(
+                    f"REJECTED {key} = {raw!r} — field {no} ({field['label']}) holds only "
+                    f"{maxlen} character(s) and this is a {field['kind']}. Cutting it to fit "
+                    f"would enter {val[:int(maxlen)]!r}, a different number. It was NOT "
+                    f"entered; check the box and key it by hand.")
+                continue
             trimmed_from, val = val, val[:int(maxlen)]
         if val is None and include_zeros and field["kind"] == "money":
             val = "0" if str(raw).strip() not in ("", "None") else None

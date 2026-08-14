@@ -313,6 +313,32 @@ MUTANTS = {
     "int: a locality is typed as its printed name instead of Drake's code": (
         '            if res["code"] is None:\n                row["value"] = _clean_text(raw)',
         '            if True:\n                row["value"] = _clean_text(raw)'),
+    # --- 1099-DIV ---------------------------------------------------------------------
+    # This screen brought two things the INT screen did not: codes carrying a DIGIT, and a
+    # sibling screen with an almost identical heading that it links to by name.
+    "div: a dropdown's description is compressed into a code instead of refused": (
+        "    s = str(v).strip().upper()\n    return s if s.isalnum() else None",
+        '    s = "".join(ch for ch in str(v) if ch.isalnum()).upper()\n    return s or None'),
+    # The reason code_an is a SEPARATE kind. If someone ever "simplifies" the two together,
+    # this is the W-2 behaviour that goes quiet: 'D 23' becomes 'D' and the whole deferral
+    # is measured against the current year's limit.
+    "div: the W-2's Box 12 digit rule is loosened, so 'D 23' becomes 'D'": (
+        "    if any(ch.isdigit() for ch in raw):\n        return None",
+        "    if False:\n        return None"),
+    # The guard that came out of the live INT halts: a value of exactly the right SHAPE that
+    # Drake's list does not contain. The popup echoes it perfectly and Drake rejects it
+    # afterwards, so nothing downstream can catch this one.
+    "div: a value outside a box's fixed list is entered instead of refused": (
+        '        allowed = field.get("values")',
+        "        allowed = None"),
+    # Field 68 holds three characters. Trimming a QUANTITY to fit turns 6010 into 601 and
+    # attaches a warning to a number that is ten times too small — which reads as a success.
+    "div: a number too long for its box is cut down to fit instead of refused": (
+        '            if field["kind"] in NUMERIC_KINDS:',
+        "            if False:"),
+    "div: the DIV screen signature is loose enough to match the INT screen": (
+        '    "DIV": r"Schedule\\s+B\\s*-\\s*Dividend\\s+Income\\s*\\(1099-DIV\\)",',
+        '    "DIV": r"Schedule\\s+B",'),
     "forms: an unmapped screen falls back to the W-2 map": (
         '    return _FORMS.get(str(screen or "").strip().upper())',
         '    return _FORMS.get(str(screen or "").strip().upper()) or _FORMS["W2"]'),
@@ -331,8 +357,14 @@ TARGET.update({n: "drake_nav.py" for n in MUTANTS if n.startswith("nav:")})
 # which map plans a payload at all.
 TARGET.update({n: "form_plan.py" for n in MUTANTS if n.startswith("int:")})
 TARGET.update({n: "agent.py" for n in MUTANTS if n.startswith("forms:")})
+# The `div:` mutants do NOT share one file: two are in the planner, one is the W-2's own
+# sanitizer (which is the point of that mutant — proving the DIV work did not loosen it),
+# and one is the screen signature in the navigator. Routed by name for that reason.
+TARGET.update({n: "form_plan.py" for n in MUTANTS if n.startswith("div:")})
+TARGET["div: the W-2's Box 12 digit rule is loosened, so 'D 23' becomes 'D'"] = "w2_map.py"
+TARGET["div: the DIV screen signature is loose enough to match the INT screen"] = "drake_nav.py"
 MUTABLE_FILES = ("drake_driver.py", "w2_map.py", "drake_nav.py", "form_plan.py",
-                 "int_map.py", "agent.py")
+                 "int_map.py", "div_map.py", "agent.py")
 
 
 # Mutants whose guard belongs to one family of cases may name that family, so the harness
@@ -347,6 +379,7 @@ FAMILY.update({n: "locality" for n in MUTANTS if n.startswith("locality:")})
 FAMILY.update({n: "caret" for n in MUTANTS if n.startswith("caret:")})
 FAMILY.update({n: "nav" for n in MUTANTS if n.startswith("nav:")})
 FAMILY.update({n: "int" for n in MUTANTS if n.startswith("int:")})
+FAMILY.update({n: "div" for n in MUTANTS if n.startswith("div:")})
 FAMILY.update({n: "form_dispatch" for n in MUTANTS if n.startswith("forms:")})
 # The grid-mode guard lives in drake_nav (so it is a `nav:` mutant) but the cases that
 # prove it are the INT ones — the grid only exists on screens like INT. Filtering to the
@@ -388,8 +421,8 @@ if pick:
 # against the pristine original and be reported as a survivor — the harness accusing the
 # tests of a gap that is really its own.
 COPY_FILES = ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py",
-              "drake_nav.py", "form_plan.py", "int_map.py", "agent.py",
-              "sample_1099int_full.json")
+              "drake_nav.py", "form_plan.py", "int_map.py", "div_map.py", "agent.py",
+              "sample_1099int_full.json", "sample_1099div_full.json")
 missing = sorted(set(MUTABLE_FILES) - set(COPY_FILES))
 if missing:
     raise SystemExit(f"mutants.py: {missing} can be mutated but is never copied into the "

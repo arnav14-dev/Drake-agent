@@ -671,6 +671,8 @@ _FORMS = {
            "id_key": "employer_ein", "id_noun": "employer EIN", "amount_noun": "wages"},
     "INT": {"module": "int_map", "label": "1099-INT",
             "id_key": "payer_tin", "id_noun": "payer TIN", "amount_noun": "interest income"},
+    "DIV": {"module": "div_map", "label": "1099-DIV",
+            "id_key": "payer_tin", "id_noun": "payer TIN", "amount_noun": "dividend income"},
 }
 
 

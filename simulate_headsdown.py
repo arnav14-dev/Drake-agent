@@ -2645,7 +2645,15 @@ def plan_has_confirm(spec, field_no) -> bool:
     # rightly refuses it and there is no entry left to inspect for the flag.
     if field.get("values"):
         probe = sorted(field["values"])[0]
-    plan = form_plan.build_plan({key: probe}, spec)
+    payload = {key: probe}
+    # A LOCALITY box resolves through Drake's city table, which is keyed on the state as
+    # well as the name. Probed without one it resolves to nothing, lands in hand_entry, and
+    # leaves no typed entry to inspect — the helper would then report "not flagged" for a
+    # box that is simply not typed. Give it the pair the coverage payloads use.
+    if field_no in (spec.locality_fields or {}):
+        payload[key] = "PHILADELPHIA"
+        payload[spec.locality_fields[field_no]] = "PA"
+    plan = form_plan.build_plan(payload, spec)
     return any(e["field_no"] == field_no and e["confirm"] for e in plan["entries"])
 
 
@@ -2828,10 +2836,17 @@ def case_form_dispatch():
         ("...and asking for its map raises rather than falling back to the W-2",
          unknown is not None),
         ("the refusal names the screens the agent CAN drive",
-         unknown is not None and "W2" in unknown and "INT" in unknown),
-        ("both mapped screens expose the same planning entry points",
+         unknown is not None and all(s in unknown for s in ("W2", "INT", "DIV"))),
+        ("every mapped screen exposes the same planning entry points",
          all(callable(getattr(ag._load_form_map(s)[0], fn))
-             for s in ("W2", "INT") for fn in ("build_plan", "format_plan"))),
+             for s in ("W2", "INT", "DIV") for fn in ("build_plan", "format_plan"))),
+        # The two Schedule B screens share a dedupe id NAME and must not share a map.
+        ("INT and DIV are different maps, not one map reached twice",
+         ag._load_form_map("INT")[0] is not ag._load_form_map("DIV")[0]),
+        ("a DIV payload targets the DIV screen and dedupes on the payer TIN",
+         (lambda t: t["screen"] == "DIV" and t["ein"] == "941234567")(
+             ag._payload_target({"drake_screen": "DIV", "recipient_tin": "123456789",
+                                 "payer_tin": "941234567"}))),
     ]
     return _table("forms: a screen with no verified map is refused, not guessed", checks)
 
@@ -2865,6 +2880,243 @@ def case_int_full_coverage_plan():
         ("the plan says which screen it is for", plan["screen"] == "INT"),
     ]
     return _table("1099-INT: the dummy payload covers every box on the screen", checks)
+
+
+def case_div_field_map():
+    """The 1099-DIV map, held to the same import-time rules as the INT one.
+
+    This screen adds a way to be wrong that the INT screen did not have: FOUR COLUMNS. Box
+    1a is fields 18 (Total), 43 (Foreign Amount), 47 (Foreign Percent) and 51 (Nominee), and
+    those are four different meanings of one printed box. Putting the nominee amount in the
+    Total is not a typo, it is a different return — and every downstream check passes,
+    because Drake really did accept the number."""
+    import div_map
+    from form_plan import FormSpec
+    spec = div_map.DIV_SPEC
+    nums = sorted(f["field_no"] for f in div_map.DIV_FIELD_MAP.values())
+
+    def refuses(**over):
+        kw = dict(screen="TST", label="t", fields=dict(div_map.DIV_FIELD_MAP),
+                  max_field=div_map.MAX_FIELD, forbidden=dict(div_map.FORBIDDEN_FIELDS))
+        kw.update(over)
+        try:
+            FormSpec(**kw)
+            return False
+        except RuntimeError:
+            return True
+
+    dup = dict(div_map.DIV_FIELD_MAP)
+    dup["a_second_key_for_box_1a"] = {"field_no": 18, "kind": "money", "label": "clash"}
+    forbidden_bind = dict(div_map.DIV_FIELD_MAP)
+    forbidden_bind["foreign_province"] = {"field_no": 13, "kind": "text", "label": "sub-screen"}
+    over_range = dict(div_map.DIV_FIELD_MAP)
+    over_range["invented"] = {"field_no": 74, "kind": "money", "label": "not on the screen"}
+
+    def field_of(key):
+        return div_map.DIV_FIELD_MAP[key]["field_no"]
+
+    checks = [
+        ("every field number 1-73 is mapped except 13",
+         nums == [n for n in range(1, 74) if n != 13]),
+        ("72 boxes are writable", len(nums) == 72),
+        ("field 13 is FORBIDDEN — it is a '<Click to Access>' sub-screen, not a box",
+         13 in div_map.FORBIDDEN_FIELDS and 13 not in nums),
+        ("two keys claiming the same box refuses to import", refuses(fields=dup)),
+        ("a key bound to the forbidden sub-screen refuses to import",
+         refuses(fields=forbidden_bind)),
+        ("a field number above the highest measured one refuses to import",
+         refuses(fields=over_range, max_field=73)),
+        ("the dedupe key is a real key on this screen",
+         spec.dedupe_key in div_map.DIV_FIELD_MAP),
+        ("field 4 resolves through Drake's locality table, not as free text",
+         4 in spec.locality_fields),
+        ("nothing is confirmed as a dropdown that is not a dropdown",
+         spec.dropdowns_confirmed <= spec.dropdowns),
+        ("a dropdown that is NOT confirmed still gets flagged for a human",
+         all(f["field_no"] in spec.dropdowns_confirmed
+             or plan_has_confirm(spec, f["field_no"])
+             for f in div_map.DIV_FIELD_MAP.values()
+             if f["field_no"] in spec.dropdowns)),
+        # The four columns. These are the numbers read off the live screen, and they are the
+        # one thing on this map that no downstream layer could ever question.
+        ("Box 1a is FOUR different boxes, one per column",
+         [field_of("box1a_ordinary_dividends"), field_of("box1a_foreign_amount"),
+          field_of("box1a_foreign_pct"), field_of("box1a_nominee")] == [18, 43, 47, 51]),
+        ("Box 2a likewise", [field_of("box2a_total_capital_gain"),
+                             field_of("box2a_foreign_amount"),
+                             field_of("box2a_foreign_pct"),
+                             field_of("box2a_nominee")] == [20, 45, 49, 53]),
+        ("the Total and the Nominee amount are never the same box",
+         all(field_of(f"box{b}_nominee") != field_of(t) for b, t in
+             (("1a", "box1a_ordinary_dividends"), ("1b", "box1b_qualified_dividends"),
+              ("2a", "box2a_total_capital_gain")))),
+        ("the foreign PERCENT column is a percentage kind, not an amount",
+         all(div_map.DIV_FIELD_MAP[k]["kind"] == "pct" for k in
+             ("box1a_foreign_pct", "box1b_foreign_pct", "box2a_foreign_pct",
+              "box6_foreign_pct"))),
+        # Numbering does NOT carry over from the sibling screen. Field 5 is the proof.
+        ("field 5 is 'Do not update' here, where the INT screen has a different box",
+         field_of("do_not_update") == 5),
+    ]
+    return _table("1099-DIV: four columns, and no number borrowed from the INT screen", checks)
+
+
+def case_div_code_kinds():
+    """Drake's Section 1202 codes carry a DIGIT, and the W-2's Box 12 rule forbids that.
+
+    `code` rejects anything with a digit on purpose: 'D 23' has a prior-year designation
+    that belongs in its own box, and stripping it to 'D' measures the whole amount against
+    the current year's deferral limit. That rule is right for Box 12 and wrong for Q1/Q3/Q4,
+    so `code_an` is a separate kind. This case exists to stop anyone 'simplifying' the two
+    back into one — the W-2 checks below are the ones that would break silently."""
+    from form_plan import sanitize
+    import div_map
+    checks = [
+        ("'Q1' survives as a Section 1202 code", sanitize("code_an", "Q1") == "Q1"),
+        ("lower case is upper-cased", sanitize("code_an", "q3") == "Q3"),
+        ("a plain letter code still works", sanitize("code_an", "a") == "A"),
+        # The descriptive text Drake shows beside the code must not be squeezed into one.
+        ("the dropdown's DESCRIPTION is refused, not compressed into a code",
+         sanitize("code_an", "Q1 - QSB stock 50% acquired after 08/10/1993") is None),
+        ("a code with a dash is refused rather than joined up",
+         sanitize("code_an", "Q-1") is None),
+        ("blank is a skip, not an empty code", sanitize("code_an", "   ") is None),
+        # ---- the W-2 rule this kind must NOT have loosened ----
+        ("the W-2's Box 12 code STILL rejects a digit — 'D 23' is not 'D'",
+         sanitize("code", "D 23") is None),
+        ("...and a bare letter code still passes there", sanitize("code", "D") == "D"),
+        ("the two kinds really are different functions",
+         sanitize("code", "Q1") is None and sanitize("code_an", "Q1") == "Q1"),
+        # The list is what makes a wrong-but-code-shaped value loud.
+        ("field 22 accepts exactly Q1, Q3, Q4 — Drake has no Q2",
+         div_map.DIV_FIELD_MAP["box2c_section_1202_type"]["values"] == {"Q1", "Q3", "Q4"}),
+        # ...and the list has to be ENFORCED, not merely declared. This is the guard that
+        # came out of the live INT run: 'Q2' is exactly the right shape, the heads-down popup
+        # would echo it back perfectly, and Drake would then reject it with a window that
+        # holds the keyboard. The refusal has to happen before Drake is open.
+        ("a plausible but non-existent code (Q2) is REFUSED, not typed",
+         (lambda p: not any(e["field_no"] == 22 for e in p["entries"])
+                    and any(s.get("rejected") and s["field_no"] == 22 for s in p["skipped"]))(
+             div_map.build_plan({"box2c_section_1202_type": "Q2"}))),
+        ("...and the refusal says so out loud rather than passing quietly",
+         any("REJECTED" in w for w in
+             div_map.build_plan({"box2c_section_1202_type": "Q2"})["warnings"])),
+        ("a real code on the list is still entered",
+         any(e["field_no"] == 22 and e["value"] == "Q3"
+             for e in div_map.build_plan({"box2c_section_1202_type": "Q3"})["entries"])),
+        # The correction that came out of reading the real list.
+        ("the IL Schedule M list includes the two-letter territory codes",
+         {"AA", "FF"} <= div_map.DIV_FIELD_MAP["il_schedule_m_source"]["values"]),
+        ("a Puerto Rico bond code is accepted, not refused by our own planner",
+         any(e["field_no"] == 71 and e["value"] == "BB"
+             for e in div_map.build_plan({"il_schedule_m_source": "BB"})["entries"])),
+        ("...and a code Drake does not have is still refused",
+         any(s.get("rejected") and s["field_no"] == 71 for s in
+             div_map.build_plan({"il_schedule_m_source": "ZZ"})["skipped"])),
+        # Field 68, measured live: a 3-character box. Cutting a NUMBER to fit does not
+        # shorten it, it changes it — Drake itself took '601' from '6010', which is where
+        # this came from. A text box may be trimmed and reported; a quantity may not.
+        ("a number too long for its box is REFUSED, not cut down to fit",
+         (lambda p: not any(e["field_no"] == 68 for e in p["entries"])
+                    and any(s.get("rejected") and s["field_no"] == 68 for s in p["skipped"]))(
+             div_map.build_plan({"ftc_form_1116_code": "6010"}))),
+        ("...and the refusal quotes what cutting it would have entered",
+         any("601" in w and "REJECTED" in w for w in
+             div_map.build_plan({"ftc_form_1116_code": "6010"})["warnings"])),
+        ("a value that FITS the box is still entered",
+         any(e["field_no"] == 68 and e["value"] == "1"
+             for e in div_map.build_plan({"ftc_form_1116_code": "1"})["entries"])),
+        # The W-2's Box 14 is a DESCRIPTION and trimming it to the box is what a preparer
+        # does by hand. That behaviour must survive — this is a rule about quantities.
+        ("a text field too long for its box is still trimmed and reported, not refused",
+         (lambda p: any(e["field_no"] == 49 and e.get("trimmed_from") == "UNION DUES AND MORE"
+                        and e["value"] == "UNION DU" for e in p["entries"]))(
+             __import__("w2_map").build_plan({"box14_1_desc": "UNION DUES AND MORE"}))),
+        # The rule only has to exist where a capped box holds a quantity. It does not on the
+        # W-2 — every max_len there is a Box 14 DESCRIPTION — which is why that path keeps
+        # its own trim and is left alone.
+        ("no capped box on the W-2 screen holds a number, so nothing there needs the rule",
+         all(__import__("w2_map").W2_FIELD_MAP[k]["kind"] == "text"
+             for k, f in __import__("w2_map").W2_FIELD_MAP.items() if f.get("max_len"))),
+    ]
+    return _table("1099-DIV: alphanumeric codes, without loosening the W-2's rule", checks)
+
+
+def case_div_screen_signature():
+    """Two Schedule B screens that print almost the same heading, and cross-link to each
+    other.
+
+    'Screen INT for Interest' is printed ON the DIV screen, and the Data Entry Menu lists
+    both ('DIV|1099-DIV, Dividend Income') in every window in every state. A signature loose
+    enough to match either would let a DIV payload be typed into the INT screen, where the
+    same field numbers mean entirely different boxes."""
+    from drake_nav import screen_is_showing, screen_is_grid
+    DIV_FORM = ["Schedule B - Dividend Income (1099-DIV)", "Payer Information",
+                "Screen INT for Interest", "*Use <F3> to switch to grid mode*"]
+    INT_FORM = ["Schedule B - Interest Income (1099-INT)", "Payer information"]
+    MENU = ["INT|1099-INT, Interest Income", "DIV|1099-DIV, Dividend Income",
+            "W2|Wages, Salaries, Tips"]
+    checks = [
+        ("the DIV screen is recognised by its full printed heading",
+         screen_is_showing(DIV_FORM, "DIV") is True),
+        ("the Data Entry MENU is not mistaken for the DIV screen",
+         screen_is_showing(MENU, "DIV") is False),
+        ("...even though the menu does contain the words 'Dividend Income'",
+         any("Dividend Income" in l for l in MENU)),
+        # The two Schedule B screens, each way round.
+        ("the INT screen is not mistaken for the DIV screen",
+         screen_is_showing(INT_FORM, "DIV") is False),
+        ("the DIV screen is not mistaken for the INT screen",
+         screen_is_showing(DIV_FORM, "INT") is False),
+        ("...even though the DIV screen prints a link to the INT one",
+         any("Screen INT" in l for l in DIV_FORM)),
+        ("the W-2 screen is not mistaken for the DIV screen",
+         screen_is_showing(["Form W-2 - Wage and Tax Statement"], "DIV") is False),
+        ("lower case still matches",
+         screen_is_showing(["schedule b - dividend income (1099-div)"], "DIV") is True),
+        # This screen opens in GRID mode on a fresh record — measured 2026-08-12.
+        ("grid mode is still detected on this screen",
+         screen_is_grid(["ucTaxGrid1", "ucTaxGrid1_DataGrid"]) is True),
+        ("the form view is NOT reported as a grid",
+         screen_is_grid(["Textbox_18", "Dropdown_22", "CheckboxTextRight_17"]) is False),
+    ]
+    return _table("1099-DIV: told apart from the INT screen it links to", checks)
+
+
+def case_div_full_coverage_plan():
+    """The full-coverage dummy payload really does reach every writable box on the DIV
+    screen — all 72 of them, so one live run proves the whole map."""
+    import json as _json
+    import div_map
+    with open("sample_1099div_full.json", encoding="utf-8-sig") as f:
+        payload = _json.load(f)
+    plan = div_map.build_plan(payload, ts="T")
+    got = sorted(e["field_no"] for e in plan["entries"])
+    locality = [e for e in plan["entries"] if e["field_no"] == 4]
+    by_no = {e["field_no"]: e for e in plan["entries"]}
+    checks = [
+        ("all 72 writable boxes are planned", len(plan["entries"]) == 72),
+        ("...and they are exactly 1-73 without the sub-screen",
+         got == [n for n in range(1, 74) if n != 13]),
+        ("nothing was rejected", [s for s in plan["skipped"] if s.get("rejected")] == []),
+        ("no key in the payload was unrecognised", plan["unknown_keys"] == []),
+        ("the client identity keys are acknowledged, not called unknown",
+         "recipient_tin" in plan["identity_keys"]),
+        ("the resident city is typed as Drake's CODE, not the printed name",
+         bool(locality) and locality[0]["value"] == "PL"
+         and locality[0]["resolved_from"] == "PHILADELPHIA"),
+        ("every dropdown is flagged for a human's eye",
+         all(e["confirm"] for e in plan["entries"] if e["field_no"] in div_map.DROPDOWN_FIELDS)),
+        ("the plan says which screen it is for", plan["screen"] == "DIV"),
+        ("the Section 1202 code is planned as Q1, not stripped to Q",
+         by_no[22]["value"] == "Q1"),
+        ("the FTC date is planned as MMDDYYYY", by_no[67]["value"] == "12312025"),
+        # Column staging: the dummy amounts are chosen so a value in the wrong column is
+        # visible by eye on the screenshot. Assert the staging held.
+        ("the four Box 1a columns carry four DIFFERENT values",
+         len({by_no[n]["value"] for n in (18, 43, 47, 51)}) == 4),
+    ]
+    return _table("1099-DIV: the dummy payload covers every box on the screen", checks)
 
 
 def main() -> int:
@@ -2905,6 +3157,10 @@ def main() -> int:
         ('int_value_kinds', lambda: case_int_value_kinds()),
         ('int_screen_and_grid', lambda: case_int_screen_and_grid()),
         ('int_full_coverage_plan', lambda: case_int_full_coverage_plan()),
+        ('div_field_map', lambda: case_div_field_map()),
+        ('div_code_kinds', lambda: case_div_code_kinds()),
+        ('div_screen_signature', lambda: case_div_screen_signature()),
+        ('div_full_coverage_plan', lambda: case_div_full_coverage_plan()),
         ('form_dispatch', lambda: case_form_dispatch()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),
