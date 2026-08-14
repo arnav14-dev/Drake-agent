@@ -2574,8 +2574,10 @@ def case_nav_screen_signature():
         ("a stray 'W2' mention is not the heading",
          screen_is_showing(["Import W2", "Return Options"], "W2") is False),
         # An unmeasured screen must report "cannot prove it", never "yes".
+        # Computed, not hard-coded: this used to name screen '1099' and quietly went stale
+        # the day that screen was measured, failing a case whose point had not changed.
         ("a screen with no measured signature returns None, not True",
-         screen_is_showing(["anything at all"], "1099") is None),
+         screen_is_showing(["anything at all"], _an_unmeasured_screen()) is None),
         ("...and None is not True", screen_is_showing(["x"], "INT") is not True),
     ]
     return _table("navigation: the right SCREEN is open, proved by its heading", checks)
@@ -2632,6 +2634,20 @@ def case_nav_menu_is_not_the_form():
     return _table("navigation: the menu screen is not the form screen", checks)
 
 
+def _an_unmeasured_screen() -> str:
+    """A Drake screen code that has NO measured heading signature.
+
+    Computed so the case using it cannot go stale: any code not in SCREEN_SIGNATURES will
+    do, and one is always available because the agent will never have measured every screen
+    Drake has. '99N' (1099-NEC) is the preferred answer while it is still unmeasured.
+    """
+    from drake_nav import SCREEN_SIGNATURES
+    for code in ("99N", "99M", "SCHC", "K1P", "ZZZ_NOT_A_SCREEN"):
+        if code not in SCREEN_SIGNATURES:
+            return code
+    raise AssertionError("every candidate screen code now has a signature — pick another")
+
+
 def plan_has_confirm(spec, field_no) -> bool:
     """Would a plan mark this field 'verify by eye'? Asked of the PLAN, not the table —
     that flag is what a preparer actually sees, and it is set by build_plan, not declared."""
@@ -2639,8 +2655,13 @@ def plan_has_confirm(spec, field_no) -> bool:
     key = next(k for k, f in spec.fields.items() if f["field_no"] == field_no)
     field = spec.fields[key]
     kind = field["kind"]
+    # 'ts' was missing here, so a TS dropdown was probed with 'X', sanitized to None, and
+    # produced no entry to inspect — the helper then reported "not flagged" about a box that
+    # is flagged. A missing kind must not look like a missing guard.
     probe = {"checkbox": True, "pct": "10", "date": "12/31/2025", "money": "100",
-             "state": "PA", "code": "CA", "tsj": "T"}.get(kind, "0" if kind == "digits" else "X")
+             "state": "PA", "code": "CA", "tsj": "T", "ts": "T", "code_an": "A",
+             "tin": "123456789", "zip": "19103", "year": "23"}.get(
+                 kind, "0" if kind == "digits" else "X")
     # A box with a fixed list has to be probed with something ON the list, or the plan
     # rightly refuses it and there is no entry left to inspect for the flag.
     if field.get("values"):
@@ -2836,10 +2857,10 @@ def case_form_dispatch():
         ("...and asking for its map raises rather than falling back to the W-2",
          unknown is not None),
         ("the refusal names the screens the agent CAN drive",
-         unknown is not None and all(s in unknown for s in ("W2", "INT", "DIV"))),
+         unknown is not None and all(s in unknown for s in ("W2", "INT", "DIV", "1099"))),
         ("every mapped screen exposes the same planning entry points",
          all(callable(getattr(ag._load_form_map(s)[0], fn))
-             for s in ("W2", "INT", "DIV") for fn in ("build_plan", "format_plan"))),
+             for s in ("W2", "INT", "DIV", "1099") for fn in ("build_plan", "format_plan"))),
         # The two Schedule B screens share a dedupe id NAME and must not share a map.
         ("INT and DIV are different maps, not one map reached twice",
          ag._load_form_map("INT")[0] is not ag._load_form_map("DIV")[0]),
@@ -3119,6 +3140,216 @@ def case_div_full_coverage_plan():
     return _table("1099-DIV: the dummy payload covers every box on the screen", checks)
 
 
+def case_r_field_map():
+    """The 1099-R map. Same import-time rules, plus two shapes no earlier screen had.
+
+    This screen is TS, not TSJ — Drake offers T and S only, because a pension belongs to one
+    person — and its Box 7 is TWO boxes rather than one. Both are the kind of thing that
+    looks fine right up until a return is wrong."""
+    import r_map
+    from form_plan import FormSpec
+    spec = r_map.R_SPEC
+    nums = sorted(f["field_no"] for f in r_map.R_FIELD_MAP.values())
+
+    def refuses(**over):
+        kw = dict(screen="TST", label="t", fields=dict(r_map.R_FIELD_MAP),
+                  max_field=r_map.MAX_FIELD, forbidden=dict(r_map.FORBIDDEN_FIELDS))
+        kw.update(over)
+        try:
+            FormSpec(**kw)
+            return False
+        except RuntimeError:
+            return True
+
+    dup = dict(r_map.R_FIELD_MAP)
+    dup["a_second_key_for_box_1"] = {"field_no": 25, "kind": "money", "label": "clash"}
+    over_range = dict(r_map.R_FIELD_MAP)
+    over_range["invented"] = {"field_no": 74, "kind": "money", "label": "not on the screen"}
+    kinds = {k: f["kind"] for k, f in r_map.R_FIELD_MAP.items()}
+
+    checks = [
+        ("every field number 1-73 is mapped, with no gaps and nothing forbidden",
+         nums == list(range(1, 74))),
+        ("73 boxes are writable", len(nums) == 73),
+        ("no box on this screen is a '<Click to Access>' sub-screen",
+         r_map.FORBIDDEN_FIELDS == {}),
+        ("two keys claiming the same box refuses to import", refuses(fields=dup)),
+        ("a field number above the highest measured one refuses to import",
+         refuses(fields=over_range, max_field=73)),
+        ("the dedupe key is a real key on this screen", spec.dedupe_key in r_map.R_FIELD_MAP),
+        ("nothing is confirmed as a dropdown that is not a dropdown",
+         spec.dropdowns_confirmed <= spec.dropdowns),
+        ("a dropdown that is NOT confirmed still gets flagged for a human",
+         all(f["field_no"] in spec.dropdowns_confirmed
+             or plan_has_confirm(spec, f["field_no"])
+             for f in r_map.R_FIELD_MAP.values() if f["field_no"] in spec.dropdowns)),
+        # TS, not TSJ. The kind is the enforcement — `ts` rejects 'J' outright rather than
+        # quietly downgrading it to 'T', which would file a spouse's pension under the
+        # taxpayer.
+        ("field 1 is the TS kind, so a joint 'J' is REFUSED, not downgraded",
+         kinds["ts"] == "ts" and __import__("form_plan").sanitize("ts", "J") is None),
+        ("...and T and S both still work",
+         (__import__("form_plan").sanitize("ts", "T"),
+          __import__("form_plan").sanitize("ts", "S")) == ("T", "S")),
+        # Box 7 is two boxes.
+        ("Box 7 is TWO separate boxes, 33 and 34",
+         (r_map.R_FIELD_MAP["box7_dist_code"]["field_no"],
+          r_map.R_FIELD_MAP["box7_dist_code_2"]["field_no"]) == (33, 34)),
+        ("both halves accept the same 29 codes Drake offers",
+         r_map.R_FIELD_MAP["box7_dist_code"]["values"]
+         == r_map.R_FIELD_MAP["box7_dist_code_2"]["values"] == r_map.DIST_CODES
+         and len(r_map.DIST_CODES) == 29),
+        # Both locality rows resolve through Drake's table, keyed on their OWN state.
+        ("each local row resolves its locality against its own state row",
+         spec.locality_fields == {48: "box15_state", 55: "box15_state_2"}),
+        # The override block is flagged, because writing one changes the return.
+        ("every recipient OVERRIDE box is flagged for a human's eye",
+         all(r_map.R_FIELD_MAP[k].get("confirm") for k in r_map.R_FIELD_MAP
+             if k.endswith("_override"))),
+        ("the override block is fields 16-24",
+         sorted(f["field_no"] for k, f in r_map.R_FIELD_MAP.items()
+                if k.endswith("_override")) == list(range(16, 25))),
+    ]
+    return _table("1099-R: TS not TSJ, and Box 7 is two boxes", checks)
+
+
+def case_r_dist_code_split():
+    """Box 7 printed as '1B' is TWO codes, and Drake has two boxes for them.
+
+    The distribution code decides whether the 10% early-withdrawal penalty applies, whether
+    the money is a non-taxable rollover, or whether it is a death benefit. Dropping the
+    second character does not lose detail — it changes the tax. And nothing downstream would
+    notice: '1' on its own is a perfectly valid code that Drake accepts without complaint."""
+    import r_map
+    split = r_map.split_distribution_code
+    plan_1b = r_map.build_plan({"box7_dist_code": "1B"})
+    plan_bad = r_map.build_plan({"box7_dist_code": "1BX"})
+    by_no = {e["field_no"]: e for e in plan_1b["entries"]}
+    checks = [
+        ("'1B' is two codes", split("1B") == ("1", "B")),
+        ("a single code leaves the second box alone", split("7") == ("7", None)),
+        ("lower case is accepted", split("1b") == ("1", "B")),
+        ("a space between them is not a third code", split("1 B") == ("1", "B")),
+        # Refusals. Each of these is a string that LOOKS code-shaped.
+        ("a three-character string is REFUSED, not truncated to the first two",
+         split("1BX") == (None, None)),
+        ("a code Drake does not offer is refused", split("Z") == (None, None)),
+        ("...even when only the second half is wrong", split("1Z") == (None, None)),
+        ("blank is not a code", split("") == (None, None)),
+        # And the planner wires it up.
+        ("build_plan splits '1B' across fields 33 and 34",
+         by_no.get(33, {}).get("value") == "1" and by_no.get(34, {}).get("value") == "B"),
+        ("...and says so, rather than doing it quietly",
+         any("split" in w.lower() for w in plan_1b["warnings"])),
+        ("an unusable code is entered NOWHERE",
+         not any(e["field_no"] in (33, 34) for e in plan_bad["entries"])),
+        ("...and the run is told to key it by hand",
+         any("by hand" in w for w in plan_bad["warnings"])),
+        # A caller that already knows the shape must not be second-guessed.
+        ("an explicit pair is left exactly as given",
+         (lambda p: {e["field_no"]: e["value"] for e in p["entries"] if e["field_no"] in (33, 34)}
+                    == {33: "4", 34: "D"})(
+             r_map.build_plan({"box7_dist_code": "4", "box7_dist_code_2": "D"}))),
+    ]
+    return _table("1099-R: Box 7 splits into the two boxes Drake has", checks)
+
+
+def case_drake_symbol_codes():
+    """Drake selection codes that are SYMBOLS, and the length bound that keeps them honest.
+
+    The 1099-R pension-type list has 44 codes and seven are symbols — @ for Arizona, # for
+    Connecticut, * for a Pennsylvania ESOP, % for New York, and &/$/= for Maryland. Refusing
+    them would be the same defect as the IL Schedule M list that only knew A-Z: our own
+    planner turning away a value Drake accepts."""
+    from form_plan import sanitize
+    import r_map
+    checks = [
+        ("'@' is a real Drake code, not junk", sanitize("code_an", "@") == "@"),
+        ("so are '#', '%' and '='",
+         (sanitize("code_an", "#"), sanitize("code_an", "%"), sanitize("code_an", "=")) == ("#", "%", "=")),
+        ("the alphanumeric codes still work",
+         (sanitize("code_an", "q1"), sanitize("code_an", "7"), sanitize("code_an", "aa"))
+         == ("Q1", "7", "AA")),
+        # The length bound is what stops descriptive text becoming a code.
+        ("a three-character string is not a selection code", sanitize("code_an", "ABC") is None),
+        ("the dropdown's DESCRIPTION is still refused",
+         sanitize("code_an", "Q1 - QSB stock 50% acquired after 08/10/1993") is None),
+        ("a dash is still not a code character", sanitize("code_an", "Q-") is None),
+        ("blank is a skip, not an empty code", sanitize("code_an", "  ") is None),
+        # The W-2 rule this must not have loosened.
+        ("the W-2's Box 12 code STILL rejects a digit — 'D 23' is not 'D'",
+         sanitize("code", "D 23") is None),
+        ("the pension-type list carries all seven symbols",
+         set("#$%&*=@") <= r_map.PENSION_TYPE_CODES),
+        ("...and a symbol Drake does NOT offer is refused by the list",
+         any(s.get("rejected") and s["field_no"] == 3
+             for s in r_map.build_plan({"pension_type": "!"})["skipped"])),
+    ]
+    return _table("Drake selection codes: symbols are real, descriptions are not", checks)
+
+
+def case_r_screen_signature():
+    """The 1099-R screen prints '1099-R' inside two of its own checkbox captions, so a
+    signature loose enough to match those would report the screen as open from anywhere."""
+    from drake_nav import screen_is_showing
+    R_FORM = ["Form 1099-R - Pensions, Annuities, Retirement, Profit-Sharing, IRAs, "
+              "Insurance Contracts, etc.", "Payer Information (required for e-file)",
+              "1099-R for disability", "1099-R altered or handwritten"]
+    MENU = ["1099|1099-R, Retirement", "INT|1099-INT, Interest Income",
+            "DIV|1099-DIV, Dividend Income"]
+    checks = [
+        ("the 1099-R screen is recognised by its full printed heading",
+         screen_is_showing(R_FORM, "1099") is True),
+        ("the Data Entry MENU is not mistaken for it",
+         screen_is_showing(MENU, "1099") is False),
+        ("...even though the menu does contain '1099-R'",
+         any("1099-R" in l for l in MENU)),
+        ("the screen's own checkbox captions do not match it on their own",
+         screen_is_showing(["1099-R for disability", "1099-R altered or handwritten"], "1099")
+         is False),
+        ("the DIV screen is not mistaken for the 1099-R screen",
+         screen_is_showing(["Schedule B - Dividend Income (1099-DIV)"], "1099") is False),
+        ("the 1099-R screen is not mistaken for the DIV screen",
+         screen_is_showing(R_FORM, "DIV") is False),
+        ("lower case still matches",
+         screen_is_showing(["form 1099-r - pensions, annuities, retirement, profit-sharing"],
+                           "1099") is True),
+    ]
+    return _table("1099-R: told apart from its own captions and the menu", checks)
+
+
+def case_r_full_coverage_plan():
+    """The full-coverage dummy payload reaches every one of the 73 boxes."""
+    import json as _json
+    import r_map
+    with open("sample_1099r_full.json", encoding="utf-8-sig") as f:
+        payload = _json.load(f)
+    plan = r_map.build_plan(payload, ts="T")
+    got = sorted(e["field_no"] for e in plan["entries"])
+    by_no = {e["field_no"]: e for e in plan["entries"]}
+    checks = [
+        ("all 73 boxes are planned", len(plan["entries"]) == 73),
+        ("...and they are exactly 1-73", got == list(range(1, 74))),
+        ("nothing was rejected", [s for s in plan["skipped"] if s.get("rejected")] == []),
+        ("no key in the payload was unrecognised", plan["unknown_keys"] == []),
+        ("the plan says which screen it is for", plan["screen"] == "1099"),
+        ("Box 7 is split across the two boxes",
+         by_no[33]["value"] == "1" and by_no[34]["value"] == "B"),
+        ("the first locality resolves to Drake's CODE, not the printed name",
+         by_no[48]["value"] == "PL" and by_no[48]["resolved_from"] == "PHILADELPHIA"),
+        # The second row is Ohio deliberately: New Jersey has no localities in Drake's table
+        # at all, so that row could never be proven.
+        ("the second locality row resolves too, against its own state",
+         by_no[55]["value"] and by_no[55]["resolved_from"] == "COLUMBUS"),
+        ("the four-digit Roth year fits its box", by_no[41]["value"] == "2019"),
+        ("both dates are planned as MMDDYYYY",
+         by_no[68]["value"] == "12312025" and by_no[69]["value"] == "06302025"),
+        ("every dropdown is flagged for a human's eye",
+         all(e["confirm"] for e in plan["entries"] if e["field_no"] in r_map.DROPDOWN_FIELDS)),
+    ]
+    return _table("1099-R: the dummy payload covers every box on the screen", checks)
+
+
 def main() -> int:
     # The suite prints '⚠' and '·', and a REDIRECTED stdout on Windows is cp1252 — which
     # raised UnicodeEncodeError inside the driver, was caught by headsdown_type's outer
@@ -3161,6 +3392,11 @@ def main() -> int:
         ('div_code_kinds', lambda: case_div_code_kinds()),
         ('div_screen_signature', lambda: case_div_screen_signature()),
         ('div_full_coverage_plan', lambda: case_div_full_coverage_plan()),
+        ('r_field_map', lambda: case_r_field_map()),
+        ('r_dist_code_split', lambda: case_r_dist_code_split()),
+        ('r_screen_signature', lambda: case_r_screen_signature()),
+        ('r_full_coverage_plan', lambda: case_r_full_coverage_plan()),
+        ('drake_symbol_codes', lambda: case_drake_symbol_codes()),
         ('form_dispatch', lambda: case_form_dispatch()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),

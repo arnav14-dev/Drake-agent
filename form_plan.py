@@ -115,22 +115,38 @@ def _clean_date(v) -> Optional[str]:
 NUMERIC_KINDS = frozenset({"money", "digits", "pct", "tin", "ein", "ssn", "zip", "year"})
 
 
+# Characters that are a Drake SELECTION CODE in their own right, beyond letters and digits.
+# Measured 2026-08-13 by reading the 1099-R screen's "Pension type" list out of the control:
+# it offers 44 codes and SEVEN of them are symbols — '@' Arizona, '#' Connecticut,
+# '*' Pennsylvania ESOP, '%' New York, '&' and '$' and '=' Maryland.
+#
+# Worth stating plainly, because refusing them would be the same defect as the IL Schedule M
+# list that only knew A-Z: our own planner turning away a value Drake accepts.
+DRAKE_CODE_SYMBOLS = frozenset("#$%&*=@")
+
+
 def _clean_code_alnum(v) -> Optional[str]:
-    """A dropdown selection code that may contain DIGITS — Drake's Section 1202 list on the
-    DIV screen is Q1 / Q3 / Q4.
+    """A Drake dropdown SELECTION CODE: one or two characters, letters, digits or symbols.
 
-    Deliberately NOT a loosening of the `code` kind. That one is the W-2's Box 12 code and
-    it REJECTS anything carrying a digit on purpose: 'D 23' has a prior-year designation
-    that belongs in its own box, and stripping it to 'D' measures the whole amount against
-    the current year's deferral limit. The rule is right there and wrong here, so these are
-    two kinds rather than one kind with an exception.
+    Covers Q1/Q3/Q4 on the DIV screen, the 1099-R distribution codes (which are single
+    characters mixing digits and letters — 1, 7, G), and the pension-type symbols above.
 
-    Anything that is not purely alphanumeric — 'Q1 - QSB stock 50%...', a code with a dash —
-    returns None and becomes a loud skip. Silently compressing a descriptive string into
-    something code-shaped is how a value nobody chose ends up in a box.
+    Deliberately NOT a loosening of the `code` kind. That one is the W-2's Box 12 code and it
+    REJECTS anything carrying a digit on purpose: 'D 23' has a prior-year designation that
+    belongs in its own box, and stripping it to 'D' measures the whole amount against the
+    current year's deferral limit. The rule is right there and wrong here, so these stay two
+    kinds rather than one kind with an exception.
+
+    The LENGTH BOUND is what keeps this honest. Every Drake selection code measured so far is
+    one or two characters, so a longer string is not a code — it is the descriptive text
+    printed beside it ('Q1 - QSB stock 50% acquired after 08/10/1993'), and compressing that
+    into something code-shaped is how a value nobody chose ends up in a box. Longer input
+    returns None and becomes a loud skip.
     """
     s = str(v).strip().upper()
-    return s if s.isalnum() else None
+    if not 1 <= len(s) <= 2:
+        return None
+    return s if all(ch.isalnum() or ch in DRAKE_CODE_SYMBOLS for ch in s) else None
 
 
 def sanitize(kind: str, value, *, checkbox_token: str = "X") -> Optional[str]:

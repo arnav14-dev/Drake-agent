@@ -118,6 +118,11 @@ SCREEN_SIGNATURES = {
     # for Interest' is printed on the DIV screen), which is a second way a loose pattern
     # would match the wrong one.
     "DIV": r"Schedule\s+B\s*-\s*Dividend\s+Income\s*\(1099-DIV\)",
+    # Measured 2026-08-13 in explore-1099r-form.json. Anchored on "Form 1099-R - Pensions"
+    # rather than on "1099-R" alone, which the screen also prints inside two of its own
+    # checkbox captions ("1099-R for disability", "1099-R altered or handwritten") and which
+    # the Data Entry Menu carries in its screen-link list in every window in every state.
+    "1099": r"Form\s+1099-R\s*-\s*Pensions,\s*Annuities,\s*Retirement",
 }
 
 # Drake can draw some screens as a SPREADSHEET instead of a form — the INT screen prints

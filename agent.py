@@ -673,6 +673,8 @@ _FORMS = {
             "id_key": "payer_tin", "id_noun": "payer TIN", "amount_noun": "interest income"},
     "DIV": {"module": "div_map", "label": "1099-DIV",
             "id_key": "payer_tin", "id_noun": "payer TIN", "amount_noun": "dividend income"},
+    "1099": {"module": "r_map", "label": "1099-R",
+             "id_key": "payer_tin", "id_noun": "payer TIN", "amount_noun": "pension income"},
 }
 
 

@@ -339,6 +339,30 @@ MUTANTS = {
     "div: the DIV screen signature is loose enough to match the INT screen": (
         '    "DIV": r"Schedule\\s+B\\s*-\\s*Dividend\\s+Income\\s*\\(1099-DIV\\)",',
         '    "DIV": r"Schedule\\s+B",'),
+    # --- 1099-R ---------------------------------------------------------------------
+    # Box 7 is TWO boxes on this screen. Dropping the second code is not a lost detail: '1'
+    # on its own is a valid code Drake accepts without complaint, and it means an early
+    # distribution with no known exception — so the 10% penalty rides on the character that
+    # went missing. Nothing downstream can see it.
+    "r_: Box 7's second distribution code is dropped instead of entered in its own box": (
+        "    if len(s) == 2 and s[0] in DIST_CODES and s[1] in DIST_CODES:\n"
+        "        return s[0], s[1]",
+        "    if len(s) == 2 and s[0] in DIST_CODES and s[1] in DIST_CODES:\n"
+        "        return s[0], None"),
+    # This screen offers T and S only. Accepting J would file a spouse's pension under
+    # whoever Drake defaults to.
+    "r_: a joint 'J' is accepted on a screen that only offers T and S": (
+        '    if s in ("T", "S"):\n        return s',
+        '    if s in ("T", "S", "J"):\n        return s'),
+    # Seven of the pension-type codes are symbols. Refusing them is our planner turning away
+    # a value Drake accepts — the same defect as the IL Schedule M list that only knew A-Z.
+    "codes: Drake's symbol selection codes are refused as if they were junk": (
+        'DRAKE_CODE_SYMBOLS = frozenset("#$%&*=@")',
+        "DRAKE_CODE_SYMBOLS = frozenset()"),
+    # Without the length bound, the descriptive text printed beside a code becomes a code.
+    "codes: a selection code of any length is accepted, so a description becomes a code": (
+        "    if not 1 <= len(s) <= 2:\n        return None",
+        "    if False:\n        return None"),
     "forms: an unmapped screen falls back to the W-2 map": (
         '    return _FORMS.get(str(screen or "").strip().upper())',
         '    return _FORMS.get(str(screen or "").strip().upper()) or _FORMS["W2"]'),
@@ -363,8 +387,13 @@ TARGET.update({n: "agent.py" for n in MUTANTS if n.startswith("forms:")})
 TARGET.update({n: "form_plan.py" for n in MUTANTS if n.startswith("div:")})
 TARGET["div: the W-2's Box 12 digit rule is loosened, so 'D 23' becomes 'D'"] = "w2_map.py"
 TARGET["div: the DIV screen signature is loose enough to match the INT screen"] = "drake_nav.py"
+# The `r_:` mutants split the same way: the Box 7 guard lives in the 1099-R map itself,
+# the TS guard is the W-2's own sanitizer, and the code-shape guards are in the planner.
+TARGET.update({n: "form_plan.py" for n in MUTANTS if n.startswith("codes:")})
+TARGET["r_: Box 7's second distribution code is dropped instead of entered in its own box"] = "r_map.py"
+TARGET["r_: a joint 'J' is accepted on a screen that only offers T and S"] = "w2_map.py"
 MUTABLE_FILES = ("drake_driver.py", "w2_map.py", "drake_nav.py", "form_plan.py",
-                 "int_map.py", "div_map.py", "agent.py")
+                 "int_map.py", "div_map.py", "r_map.py", "agent.py")
 
 
 # Mutants whose guard belongs to one family of cases may name that family, so the harness
@@ -380,6 +409,7 @@ FAMILY.update({n: "caret" for n in MUTANTS if n.startswith("caret:")})
 FAMILY.update({n: "nav" for n in MUTANTS if n.startswith("nav:")})
 FAMILY.update({n: "int" for n in MUTANTS if n.startswith("int:")})
 FAMILY.update({n: "div" for n in MUTANTS if n.startswith("div:")})
+FAMILY.update({n: "r_" for n in MUTANTS if n.startswith("r_:")})
 FAMILY.update({n: "form_dispatch" for n in MUTANTS if n.startswith("forms:")})
 # The grid-mode guard lives in drake_nav (so it is a `nav:` mutant) but the cases that
 # prove it are the INT ones — the grid only exists on screens like INT. Filtering to the
@@ -421,8 +451,9 @@ if pick:
 # against the pristine original and be reported as a survivor — the harness accusing the
 # tests of a gap that is really its own.
 COPY_FILES = ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py",
-              "drake_nav.py", "form_plan.py", "int_map.py", "div_map.py", "agent.py",
-              "sample_1099int_full.json", "sample_1099div_full.json")
+              "drake_nav.py", "form_plan.py", "int_map.py", "div_map.py", "r_map.py",
+              "agent.py", "sample_1099int_full.json", "sample_1099div_full.json",
+              "sample_1099r_full.json")
 missing = sorted(set(MUTABLE_FILES) - set(COPY_FILES))
 if missing:
     raise SystemExit(f"mutants.py: {missing} can be mutated but is never copied into the "
