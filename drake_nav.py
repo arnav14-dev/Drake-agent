@@ -128,6 +128,13 @@ SCREEN_SIGNATURES = {
     # is a PREFIX of the heading. A pattern stopping at "Social Security" would match the
     # menu — present in every window in every state — and report the screen as open from it.
     "SSA": r"SSA-1099,\s*Social\s+Security\s+Benefits\s+Statement",
+    # Measured 2026-08-15 in explore-1098-form.json (the screen's heading at y=113).
+    # Anchored on "Form 1098 -" rather than on "1098" or "Mortgage Interest" alone, both of
+    # which appear in menu link lists that are present in every window in every state:
+    # 'DOCS|1098/1099 Source Document Guide' on the Miscellaneous tab carries the number,
+    # and this screen's own menu link — '1098|Mortgage Interest Statement' — carries the
+    # words. Neither carries the printed heading.
+    "1098": r"Form\s+1098\s*-\s*Mortgage\s+Interest",
 }
 
 # Drake can draw some screens as a SPREADSHEET instead of a form — the INT screen prints
@@ -725,6 +732,14 @@ def open_screen(driver, code, *, timeout: float = 10.0, log=print) -> dict:
     so 'get back to the menu first' was a step that could fail without buying anything.
     What replaces it is a check that the screen actually opened — read off the screen's own
     heading, before any value is typed.
+
+    THE 37 IS ONE TAB, NOT THE MENU. The sentence above was measured on the tab Drake opens
+    on — General — and it is true there. The menu has TEN tabs and draws one at a time, so
+    those 37 links are 37 of 312, and the other 275 are not hidden, they are absent from the
+    tree entirely. Screen 1098 lives on 'Other Forms' and was unreachable: this function
+    reported "no screen with code 1098 on this menu" and listed whatever tab happened to be
+    up. Correct refusal, wrong conclusion available to the reader — the screen exists.
+    So when the code is not on the current tab, the tabs are selected in turn until it is.
     """
     import time
     want = str(code or "").strip().upper()
@@ -739,6 +754,10 @@ def open_screen(driver, code, *, timeout: float = 10.0, log=print) -> dict:
     def _labels():
         return [e.get("name") for e in driver.nav_all_elements()
                 if e.get("control_type") == "Text"]
+
+    def _tabs():
+        return [e for e in driver.nav_all_elements()
+                if e.get("control_type") == "TabItem" and (e.get("name") or "").strip()]
 
     # A return opened straight from a CREATE has no Data Entry Menu window yet, so there
     # are no screen links anywhere to click — they do not exist rather than being hidden.
@@ -771,7 +790,33 @@ def open_screen(driver, code, *, timeout: float = 10.0, log=print) -> dict:
 
     chosen = choose_screen_link(links, want)
     if not chosen["ok"]:
-        return _fail("screen", chosen["reason"], candidates=chosen.get("candidates"))
+        # Not on the tab Drake is showing. Select each of the others and look again.
+        #
+        # Selecting a tab changes what the menu DRAWS and nothing in the return, so this is
+        # cheap to be wrong about — unlike the alternative of typing the code into the menu's
+        # search box, which is an Edit control that also accepts anything else and would put
+        # a screen code somewhere unknown if the box were not the one we thought.
+        tried = []
+        for tab in _tabs():
+            name = (tab.get("name") or "").strip()
+            if not name or name in tried:
+                continue
+            tried.append(name)
+            if not driver.nav_act(tab, want="select")["ok"]:
+                continue
+            time.sleep(0.45)
+            retry = choose_screen_link(_links(), want)
+            if retry["ok"]:
+                log(f"  screen {want} is on the {name!r} tab")
+                chosen = retry
+                break
+        if not chosen["ok"]:
+            return _fail("screen",
+                         f"{chosen['reason']} Every tab was searched "
+                         f"({', '.join(tried) if tried else 'none found'}), so this is not "
+                         f"a tab that was merely not selected — Drake is not offering this "
+                         f"screen for this return.",
+                         candidates=chosen.get("candidates"))
     link = chosen["link"]
     parsed = parse_screen_link(link.get("name")) or {}
 

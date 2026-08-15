@@ -2660,6 +2660,11 @@ def plan_has_confirm(spec, field_no) -> bool:
     # is flagged. A missing kind must not look like a missing guard.
     probe = {"checkbox": True, "pct": "10", "date": "12/31/2025", "money": "100",
              "state": "PA", "code": "CA", "tsj": "T", "ts": "T", "code_an": "A",
+             # 1098 adds these two. Both fields that use them carry a `values` set, so the
+             # branch below overrides these anyway — they are here so that a future field
+             # WITHOUT a list does not silently fall through to "X" and sanitize to None,
+             # which is the failure that made this helper lie about 'ts'.
+             "code_form": "A", "country": "CA",
              "tin": "123456789", "zip": "19103", "year": "23"}.get(
                  kind, "0" if kind == "digits" else "X")
     # A box with a fixed list has to be probed with something ON the list, or the plan
@@ -3475,6 +3480,297 @@ def case_ssa_screen_signature():
     return _table("SSA-1099: told apart from the menu link that prefixes it", checks)
 
 
+
+def case_m1098_field_map():
+    """The Form 1098 map. Forty-five boxes, and two new value kinds behind it."""
+    import m1098_map
+    from form_plan import FormSpec, sanitize
+    spec = m1098_map.M1098_SPEC
+    nums = sorted(f["field_no"] for f in m1098_map.M1098_FIELD_MAP.values())
+
+    def refuses(**over):
+        kw = dict(screen="TST", label="t", fields=dict(m1098_map.M1098_FIELD_MAP),
+                  max_field=m1098_map.MAX_FIELD)
+        kw.update(over)
+        try:
+            FormSpec(**kw)
+            return False
+        except RuntimeError:
+            return True
+
+    dup = dict(m1098_map.M1098_FIELD_MAP)
+    dup["a_second_key_for_box1"] = {"field_no": 24, "kind": "money", "label": "clash"}
+    over_range = dict(m1098_map.M1098_FIELD_MAP)
+    over_range["invented"] = {"field_no": 46, "kind": "money", "label": "not on the screen"}
+    checks = [
+        ("every field number 1-45 is mapped, with no gaps", nums == list(range(1, 46))),
+        ("two keys claiming the same box refuses to import", refuses(fields=dup)),
+        ("a field number above the highest measured one refuses to import",
+         refuses(fields=over_range, max_field=45)),
+        ("nothing is confirmed as a dropdown that is not a dropdown",
+         spec.dropdowns_confirmed <= spec.dropdowns),
+        ("a dropdown that is NOT confirmed still gets flagged for a human",
+         all(f["field_no"] in spec.dropdowns_confirmed
+             or plan_has_confirm(spec, f["field_no"])
+             for f in m1098_map.M1098_FIELD_MAP.values() if f["field_no"] in spec.dropdowns)),
+        # TSJ, not TS: a mortgage really can be held jointly, unlike a W-2 or an SSA benefit.
+        ("field 1 is the TSJ kind, so a joint 'J' is ACCEPTED",
+         m1098_map.M1098_FIELD_MAP["tsj"]["kind"] == "tsj" and sanitize("tsj", "J") == "J"),
+        # Field 3's list contains FOUR-character codes, which is the whole reason this kind
+        # exists separately from code_an.
+        ("field 3 accepts the four-character form codes 4835 and 8829",
+         sanitize("code_form", "4835") == "4835" and sanitize("code_form", "8829") == "8829"),
+        ("...which the two-character code_an kind would have refused",
+         sanitize("code_an", "4835") is None),
+        ("...and code_form still refuses a descriptive phrase",
+         sanitize("code_form", "Schedule A") is None),
+        ("the lender is what makes two 1098s different documents",
+         spec.dedupe_key == "lender_tin"),
+    ]
+    return _table("Form 1098: 45 boxes, TSJ, and four-character form codes", checks)
+
+
+def case_m1098_country_codes():
+    """Drake's country codes are NOT ISO, and the collisions name a real country.
+
+    This is the one place in the project where the `values` membership check buys nothing:
+    ES, CH, AU, SE and AT are all valid Drake codes, so each passes, gets typed, is echoed
+    back and reads off the form as a genuine selection — while meaning a country nobody
+    chose. The defence is that the plan prints the NAME, so a human can see it."""
+    import m1098_map
+    from form_plan import sanitize
+    name = m1098_map.country_name
+    # Measured 2026-08-15 by reading the control. ISO code -> what Drake thinks it means.
+    COLLISIONS = {"ES": ("Spain", "El Salvador"), "CH": ("Switzerland", "China"),
+                  "AU": ("Australia", "Austria"), "SE": ("Sweden", "Seychelles")}
+    plan = m1098_map.build_plan({"lender_country": "ES", "box1_mortgage_interest": "100"})
+    good = m1098_map.build_plan({"lender_country": "CA", "box1_mortgage_interest": "100"})
+    junk = m1098_map.build_plan({"lender_country": "ZZ", "box1_mortgage_interest": "100"})
+    checks = [
+        ("Drake's list is the 258 codes read out of the control",
+         len(m1098_map.DRAKE_COUNTRIES) == 258),
+        ("every ISO code that collides is a VALID Drake code naming another country",
+         all(name(iso) == drake and name(iso) != real
+             for iso, (real, drake) in COLLISIONS.items())),
+        ("...so a membership check alone would pass all of them",
+         all(iso in m1098_map.COUNTRY_CODES for iso in COLLISIONS)),
+        ("the plan therefore prints the country NAME beside the code",
+         any("EL SALVADOR" in w.upper() for w in plan["warnings"])),
+        ("...for a correct code too, so the check is not only shown on failure",
+         any("CANADA" in w.upper() for w in good["warnings"])),
+        # The cheap half of the defence: a NAME can never be shortened into a code.
+        ("a country name is refused rather than cut down to two letters",
+         sanitize("country", "Switzerland") is None and sanitize("country", "Spain") is None),
+        # A code off the list never becomes an entry at all — the planner refuses it before
+        # Drake is open, which is a stronger guard than any warning about a typed value.
+        ("a code that is not on Drake's list is REFUSED, not typed",
+         not any(e["field_no"] == 13 for e in junk["entries"])
+         and any(s["key"] == "lender_country" and s["rejected"] for s in junk["skipped"])),
+        ("...and the refusal does not dump all 258 codes into the warning",
+         any(w.startswith("REJECTED lender_country") and "and 246 more" in w
+             for w in junk["warnings"])),
+        # There is no US code: a domestic address belongs in the U.S. ONLY block.
+        ("there is no United States code — a domestic address uses fields 10/11",
+         "US" not in m1098_map.COUNTRY_CODES),
+    ]
+    return _table("Form 1098: Drake country codes are not ISO, and it is invisible", checks)
+
+
+def case_m1098_not_on_screen():
+    """Two of Form 1098's own numbered boxes have nowhere to go on Drake's screen."""
+    import json as _json
+    import m1098_map
+    with open("sample_1098_full.json", encoding="utf-8-sig") as f:
+        payload = _json.load(f)
+    plan = m1098_map.build_plan(payload, ts="T")
+    off = {n["key"]: n["why"] for n in plan["not_on_screen"]} if plan.get("not_on_screen") else {}
+    entered = {e["field_no"] for e in plan["entries"]}
+    checks = [
+        ("nothing in the payload came back as an UNKNOWN key", plan["unknown_keys"] == []),
+        ("Box 4, refund of overpaid interest, is reported by name",
+         "box4_refund_overpaid_interest" in off),
+        ("...quoting Drake's own note, which sends it to Schedule 1 line 8",
+         "Schedule 1, line 8" in off.get("box4_refund_overpaid_interest", "")),
+        ("Box 9, number of properties, is reported by name",
+         "box9_number_of_properties" in off),
+        ("the loan-limit cap is reported AND pointed at the DEDM screen",
+         "DEDM" in off.get("mortgage_balance_limitation", "")),
+        ("all 45 real boxes are still entered", entered == set(range(1, 46))),
+        ("no value landed in a box the screen does not have",
+         max(entered) <= m1098_map.MAX_FIELD),
+    ]
+    return _table("Form 1098: boxes 4 and 9 have no box, and both are named", checks)
+
+
+def case_m1098_screen_signature():
+    """This screen's number and its words BOTH appear in menu link lists, separately.
+
+    'DOCS|1098/1099 Source Document Guide' sits on the Miscellaneous tab and carries the
+    number; this screen's own link, '1098|Mortgage Interest Statement', carries the words.
+    Menu links are present in every window in every state, so a signature matching either
+    half would report the screen as open while a preparer is looking at a menu."""
+    from drake_nav import screen_is_showing
+    FORM = ["Form 1098 - Mortgage Interest", "Recipient's/Lender's Information",
+            "Payer's/Borrower's Information (if different from screen 1)"]
+    MENU = ["1098|Mortgage Interest Statement", "DEDM|Deductible Mortgage Interest",
+            "DOCS|1098/1099 Source Document Guide", "8828|Recapture of Federal Mortgage Subsidy"]
+    checks = [
+        ("the 1098 screen is recognised by its printed heading",
+         screen_is_showing(FORM, "1098") is True),
+        ("the Data Entry MENU is not mistaken for it", screen_is_showing(MENU, "1098") is False),
+        ("...even though a menu link carries the number 1098",
+         any("1098" in l for l in MENU)),
+        ("...and another carries the words 'Mortgage Interest'",
+         any("Mortgage Interest" in l for l in MENU)),
+        ("the 1099-R screen is not mistaken for it",
+         screen_is_showing(["Form 1099-R - Pensions, Annuities, Retirement"], "1098") is False),
+        ("the 1098 screen is not mistaken for the 1099-R screen",
+         screen_is_showing(FORM, "1099") is False),
+        ("lower case still matches",
+         screen_is_showing(["form 1098 - mortgage interest"], "1098") is True),
+    ]
+    return _table("Form 1098: told apart from two different menu links", checks)
+
+
+def case_m1098_full_coverage_plan():
+    """The whole screen, planned from the coverage payload: 45 entries, nothing invented."""
+    import json as _json
+    import m1098_map
+    with open("sample_1098_full.json", encoding="utf-8-sig") as f:
+        payload = _json.load(f)
+    plan = m1098_map.build_plan(payload, ts="T")
+    entries = {e["field_no"]: e for e in plan["entries"]}
+    no_box1 = m1098_map.build_plan({"box2_principal": "412500"})
+    business = m1098_map.build_plan({"for_schedule": "E", "box1_mortgage_interest": "100"})
+    checks = [
+        ("all 45 boxes are planned", sorted(entries) == list(range(1, 46))),
+        ("nothing was rejected", not plan.get("skipped")),
+        ("entries come out in field-number order",
+         [e["field_no"] for e in plan["entries"]] == sorted(entries)),
+        ("the date boxes are normalised to Drake's MMDDYYYY",
+         entries[27]["value"] == "06142019" and entries[37]["value"] == "06142019"),
+        ("money keeps its cents for Drake to round, rather than being rounded here",
+         entries[24]["value"] == "14321.55"),
+        ("the four-character form code survives the planner", entries[3]["value"] == "A"),
+        # Box 1 is what the document exists to report.
+        ("a payload with no BOX 1 interest is called out, not quietly accepted",
+         any("BOX 1 MORTGAGE INTEREST" in w for w in no_box1["warnings"])),
+        ("...and a payload that has it is not nagged",
+         not any("BOX 1 MORTGAGE INTEREST" in w for w in plan["warnings"])),
+        # Schedule A is the ordinary answer; anything else is a different return.
+        ("a FOR code other than A is called out as leaving Schedule A",
+         any("NOT to Schedule A" in w for w in business["warnings"])),
+        ("...and plain Schedule A is not nagged",
+         not any("NOT to Schedule A" in w for w in plan["warnings"])),
+    ]
+    return _table("Form 1098: 45 of 45 planned from the coverage payload", checks)
+
+
+
+def case_m1098_menu_tab_walk():
+    """The Data Entry Menu draws ONE of its ten tabs at a time, and open_screen had only
+    ever been measured on the one Drake opens with.
+
+    That tab, General, carries 37 links. The menu carries 312. The other 275 are not hidden
+    from the tree — they are absent from it — so `open_screen` reported "no screen with code
+    1098 on this menu" and listed whatever tab happened to be showing. A correct refusal
+    that reads exactly like a statement that the screen does not exist. Screen 1098 is on
+    'Other Forms', which is how this was found.
+
+    Selecting a tab changes what the menu DRAWS and nothing in the return, so walking them
+    is cheap to be wrong about — unlike typing the code into the menu's search box, which
+    is an Edit control that accepts anything at all."""
+    from drake_nav import open_screen
+
+    # Measured 2026-08-15 by selecting each tab and reading its links (menu_screens.json).
+    TABS = {
+        "General": ["W2|Wages", "INT|1099-INT, Interest Income", "A|Itemized Deductions Schedule"],
+        "Other Forms": ["1098|Mortgage Interest Statement", "DEDM|Deductible Mortgage Interest",
+                        "X|1040-X, Amended Return"],
+        "Miscellaneous": ["DOCS|1098/1099 Source Document Guide", "PRNT|Print Options"],
+    }
+    HEADINGS = {"1098": "Form 1098 - Mortgage Interest", "W2": "Form W-2 Wage and Tax Statement"}
+
+    class _Menu:
+        """A Drake menu that shows one tab, and a screen that opens when a link is used."""
+
+        def __init__(self, start="General"):
+            self.tab = start
+            self.opened = None
+            self.selected = []          # tabs this run actually selected, in order
+
+        # -- the surface open_screen talks to ------------------------------------------
+        def nav_data_entry_window(self):
+            return {"hwnd": 1, "title": "Data Entry (123456789 - fynn, Test)",
+                    "kind": "form" if self.opened else "menu"}
+
+        def nav_all_elements(self):
+            els = []
+            for i, name in enumerate(TABS):
+                els.append({"automation_id": f"TAB_{i}", "name": name,
+                            "control_type": "TabItem"})
+            # Only the SELECTED tab's links exist in the tree. This is the whole point.
+            for i, name in enumerate(TABS[self.tab]):
+                els.append({"automation_id": f"LINK_0_Col0_Sel{i}", "name": name,
+                            "control_type": "Button"})
+            if self.opened:
+                els.append({"automation_id": "Label_6", "name": HEADINGS[self.opened],
+                            "control_type": "Text"})
+            return els
+
+        def nav_act(self, element, want="invoke"):
+            name = str((element or {}).get("name") or "")
+            if str((element or {}).get("control_type")) == "TabItem":
+                self.tab = name
+                self.selected.append(name)
+                return {"ok": True, "how": "select", "error": None}
+            self.opened = name.split("|")[0]
+            return {"ok": True, "how": "invoke", "error": None}
+
+        def press(self, _keys):
+            return None
+
+        def _detect_unexpected_dialog(self):
+            return None
+
+    quiet = lambda *a, **k: None
+
+    # Sitting on 'States'-like tab (here: Miscellaneous) — the situation that exposed this.
+    away = _Menu(start="Miscellaneous")
+    got_away = open_screen(away, "1098", timeout=2.0, log=quiet)
+
+    # Already on the right tab: the walk must not run at all.
+    already = _Menu(start="Other Forms")
+    got_already = open_screen(already, "1098", timeout=2.0, log=quiet)
+
+    # A code that is on NO tab must still be refused, after all of them were searched.
+    nowhere = _Menu(start="General")
+    got_nowhere = open_screen(nowhere, "SCHC", timeout=2.0, log=quiet)
+
+    # The tab walk must not disturb a screen that was always reachable.
+    w2 = _Menu(start="General")
+    got_w2 = open_screen(w2, "W2", timeout=2.0, log=quiet)
+
+    checks = [
+        ("a screen on another tab is found and opened", got_away["ok"] is True),
+        ("...by selecting the tab it is actually on", "Other Forms" in away.selected),
+        ("...and it is the 1098 screen that opened", away.opened == "1098"),
+        ("a screen on the CURRENT tab opens without selecting anything",
+         got_already["ok"] is True and already.selected == []),
+        ("a code on no tab at all is still refused", got_nowhere["ok"] is False),
+        ("...and the refusal says every tab was searched",
+         "Every tab was searched" in got_nowhere["reason"]),
+        ("...naming them, so 'not found' cannot be confused with 'not looked for'",
+         all(t in got_nowhere["reason"] for t in TABS)),
+        ("a screen on the tab Drake opens with is unaffected",
+         got_w2["ok"] is True and w2.selected == []),
+        # Each tab is selected at most once. A walk that re-selects is a walk that can loop
+        # on a menu whose tab order changes under it.
+        ("no tab is selected twice", len(away.selected) == len(set(away.selected))),
+    ]
+    return _table("Form 1098: the menu has ten tabs, and only one is drawn", checks)
+
+
 def main() -> int:
     # The suite prints '⚠' and '·', and a REDIRECTED stdout on Windows is cp1252 — which
     # raised UnicodeEncodeError inside the driver, was caught by headsdown_type's outer
@@ -3525,6 +3821,12 @@ def main() -> int:
         ('ssa_field_map', lambda: case_ssa_field_map()),
         ('ssa_not_on_screen', lambda: case_ssa_not_on_screen()),
         ('ssa_screen_signature', lambda: case_ssa_screen_signature()),
+        ('m1098_field_map', lambda: case_m1098_field_map()),
+        ('m1098_country_codes', lambda: case_m1098_country_codes()),
+        ('m1098_not_on_screen', lambda: case_m1098_not_on_screen()),
+        ('m1098_screen_signature', lambda: case_m1098_screen_signature()),
+        ('m1098_full_coverage_plan', lambda: case_m1098_full_coverage_plan()),
+        ('m1098_menu_tab_walk', lambda: case_m1098_menu_tab_walk()),
         ('form_dispatch', lambda: case_form_dispatch()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),

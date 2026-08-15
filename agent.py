@@ -683,6 +683,11 @@ _FORMS = {
     # statement going in twice, which would double their benefits. The operator checks TS.
     "SSA": {"module": "ssa_map", "label": "SSA-1099",
             "id_key": None, "id_noun": "beneficiary", "amount_noun": "Social Security benefits"},
+    # The LENDER is this screen's identity, not a payer. A client who refinanced mid-year
+    # genuinely receives two 1098s from two lenders; the same lender twice is one statement
+    # keyed twice, which doubles their mortgage interest deduction.
+    "1098": {"module": "m1098_map", "label": "Form 1098",
+             "id_key": "lender_tin", "id_noun": "lender Fed ID", "amount_noun": "mortgage interest"},
 }
 
 

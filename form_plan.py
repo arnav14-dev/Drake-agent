@@ -149,6 +149,53 @@ def _clean_code_alnum(v) -> Optional[str]:
     return s if all(ch.isalnum() or ch in DRAKE_CODE_SYMBOLS for ch in s) else None
 
 
+def _clean_code_form(v) -> Optional[str]:
+    """A Drake code naming a SCHEDULE OR FORM: 'A', 'C', 'E', 'F', '4835', '8829'.
+
+    Separate from `code_an` only because of length. That kind caps at two characters, and
+    the cap is what stops a descriptive sentence being squeezed into something code-shaped
+    — but this list genuinely contains four-character codes, so the same cap would refuse
+    Form 4835 and Form 8829 outright. Four is the measured maximum for the 1098 screen's
+    "For:" selector, read out of the control on 2026-08-15.
+
+    No symbols. `code_an` allows seven of them because Drake's pension-type list really
+    uses them; no form number does, and allowing them here would only widen what gets
+    through without matching anything real.
+    """
+    s = str(v).strip().upper()
+    if not 1 <= len(s) <= 4:
+        return None
+    return s if s.isalnum() else None
+
+
+def _clean_country(v) -> Optional[str]:
+    """A Drake COUNTRY CODE — exactly two letters. A country NAME is refused.
+
+    DRAKE'S CODES ARE NOT ISO, AND THE COLLISIONS ARE SILENT. Measured 2026-08-15 by reading
+    the 1098 screen's country list (258 codes) out of the control. Of ten common ISO codes
+    checked, five are valid Drake codes naming a DIFFERENT REAL COUNTRY:
+
+        ISO ES Spain       -> Drake ES is El Salvador   (Spain is SP)
+        ISO CH Switzerland -> Drake CH is China         (Switzerland is SZ)
+        ISO AU Australia   -> Drake AU is Austria       (Australia is AS)
+        ISO SE Sweden      -> Drake SE is Seychelles    (Sweden is SW)
+        ISO AT Austria     -> Drake AT is Ashmore And Cartier Islands
+
+    This is the one case in this codebase where the `values` membership check cannot help:
+    every code above IS on Drake's list, so it passes, gets typed, is echoed back, and reads
+    back off the form as a real selection. Nothing downstream can tell that the wrong country
+    was chosen. That is why every country field is marked `confirm` and why the plan prints
+    the country NAME Drake will select beside the code — the name is the only thing a human
+    reviewing the plan can actually check.
+
+    Refusing a NAME here is the cheap half of the defence: no rule shortens 'Switzerland'
+    into 'SZ', so anything longer than a code must never reach the comparison looking
+    code-shaped.
+    """
+    s = "".join(str(v).split()).upper()
+    return s if len(s) == 2 and s.isalpha() else None
+
+
 def sanitize(kind: str, value, *, checkbox_token: str = "X") -> Optional[str]:
     """Value as Drake should receive it, or None meaning SKIP this field entirely."""
     if value is None:
@@ -165,6 +212,10 @@ def sanitize(kind: str, value, *, checkbox_token: str = "X") -> Optional[str]:
         return _clean_date(value)
     if kind == "code_an":
         return _clean_code_alnum(value)
+    if kind == "code_form":
+        return _clean_code_form(value)
+    if kind == "country":
+        return _clean_country(value)
     return _w2_sanitize(kind, value, checkbox_token=checkbox_token)
 
 
@@ -253,7 +304,7 @@ class FormSpec:
                                f"{sorted(overlap)}")
         unknown_kinds = sorted({s["kind"] for s in self.fields.values()} - {
             "money", "ein", "ssn", "tin", "digits", "zip", "state", "code", "code_an",
-            "year", "ts", "tsj", "checkbox", "text", "pct", "date"})
+            "code_form", "country", "year", "ts", "tsj", "checkbox", "text", "pct", "date"})
         if unknown_kinds:
             raise RuntimeError(f"{where}: unknown value kind(s) {unknown_kinds} — sanitize() "
                                f"would silently fall through to plain text")
@@ -342,9 +393,15 @@ def build_plan(payload: dict, spec: FormSpec, *, checkbox_token: str = "X",
         if val is not None and allowed and val not in allowed:
             skipped.append({"key": key, "field_no": no, "label": field["label"], "raw": raw,
                             "rejected": True})
+            # Print the list, but not a list nobody will read. The 1098 country boxes have
+            # 258 legal codes, and spelling all of them into a warning buries the one thing
+            # the reader needs — which value was refused — under four lines of noise. A
+            # warning that is skimmed is a warning that did not happen.
+            opts = sorted(allowed)
+            shown = (f"{opts[:12]} and {len(opts) - 12} more" if len(opts) > 12 else f"{opts}")
             warnings.append(
                 f"REJECTED {key} = {raw!r} — field {no} ({field['label']}) accepts only "
-                f"{sorted(allowed)} on this screen, and Drake refuses anything else with a "
+                f"{shown} on this screen, and Drake refuses anything else with a "
                 f"validation window that then holds the keyboard. It was NOT entered.")
             continue
 
