@@ -37,8 +37,15 @@ MUTANTS = {
         "        if self._popup_owned:\n            prompt = self._stable_prompt(popup)",
         "        if True:\n            return {\"ok\": True}\n        if self._popup_owned:\n"
         "            prompt = self._stable_prompt(popup)"),
+    # `base_prompt = self._stable_prompt(popup, eh)` appears at TWO call sites, so both of
+    # these mutants quoted an ambiguous line and were applied to neither. Anchored on the
+    # comment above the heads-down entry path to pick one deliberately. The second site (the
+    # probe path) is left unmutated and so is NOT covered by these two — a smaller gap than
+    # the one that was there, and a stated one.
     "prompt baseline removed (classify by the edit box alone)": (
+        '            # "Drake took the number" from "Drake silently refused it".\n'
         "            base_prompt = self._stable_prompt(popup, eh)",
+        '            # "Drake took the number" from "Drake silently refused it".\n'
         '            base_prompt = ""'),
     "commit proof removed (assume every value was accepted)": (
         "                took, how = self._verify_value_committed(base_prompt, value_prompt)",
@@ -84,7 +91,9 @@ MUTANTS = {
         "                if cur and cur_norm != base_norm and cur_norm == prev_norm:",
         "                if cur and cur_norm != base_norm:"),
     "prompt BASELINE taken from a single frame (one bad read inverts every later check)": (
+        '            # "Drake took the number" from "Drake silently refused it".\n'
         "            base_prompt = self._stable_prompt(popup, eh)",
+        '            # "Drake took the number" from "Drake silently refused it".\n'
         "            base_prompt = self._popup_prompt(popup, eh)"),
     # The live field-1 halt: an unreadable frame is NO EVIDENCE, not a reading of ''.
     "informationless frame admitted as a reading (blank or punctuation-only)": (
@@ -316,9 +325,19 @@ MUTANTS = {
     # --- 1099-DIV ---------------------------------------------------------------------
     # This screen brought two things the INT screen did not: codes carrying a DIGIT, and a
     # sibling screen with an almost identical heading that it links to by name.
+    # ANCHOR REWRITTEN 2026-08-15. The original quoted _clean_code_alnum as it was when the
+    # DIV screen landed; the 1099-R symbol codes then rewrote that function's last line, and
+    # this mutant silently stopped applying. A mutant that does not apply is reported as a
+    # survivor, which reads as "the guard is untested" — the harness blaming the tests for
+    # its own stale quotation. See the anchor preflight below, which now refuses to run at
+    # all rather than let that happen again.
     "div: a dropdown's description is compressed into a code instead of refused": (
-        "    s = str(v).strip().upper()\n    return s if s.isalnum() else None",
-        '    s = "".join(ch for ch in str(v) if ch.isalnum()).upper()\n    return s or None'),
+        "    s = str(v).strip().upper()\n"
+        "    if not 1 <= len(s) <= 2:\n"
+        "        return None\n"
+        "    return s if all(ch.isalnum() or ch in DRAKE_CODE_SYMBOLS for ch in s) else None",
+        '    s = "".join(ch for ch in str(v) if ch.isalnum() or ch in DRAKE_CODE_SYMBOLS).upper()\n'
+        "    return s or None"),
     # The reason code_an is a SEPARATE kind. If someone ever "simplifies" the two together,
     # this is the W-2 behaviour that goes quiet: 'D 23' becomes 'D' and the whole deferral
     # is measured against the current year's limit.
@@ -376,6 +395,31 @@ MUTANTS = {
     "ssa_: the SSA signature stops at 'Social Security', which the MENU also says": (
         '    "SSA": r"SSA-1099,\\s*Social\\s+Security\\s+Benefits\\s+Statement",',
         '    "SSA": r"SSA-1099,\\s*Social\\s+Security",'),
+    # The 1098 country boxes are the only place where a value can be VALID, accepted, echoed,
+    # readable on the form, and still the wrong country — Drake's codes are not ISO. The plan
+    # printing the country NAME is the only check a human can make, so removing it must fail.
+    "m1098: the country code is entered without naming the country it selects": (
+        '            plan["warnings"].append(\n'
+        '                f"{whose} country {e[\'value\']!r} selects {name.upper()} in Drake. Drake\'s "\n'
+        '                f"codes are NOT ISO — check this is the country on the document.")',
+        '            pass'),
+    # A country NAME must never be shortened into a code. 'Switzerland'[:2] is 'SW', which is
+    # Sweden on Drake's list — a real country, silently wrong, and readable on the form.
+    "m1098: a country NAME is truncated into a code instead of refused": (
+        '    s = "".join(str(v).split()).upper()\n'
+        '    return s if len(s) == 2 and s.isalpha() else None',
+        '    s = "".join(str(v).split()).upper()[:2]\n'
+        '    return s if len(s) == 2 and s.isalpha() else None'),
+    # Field 3's list holds four-character codes (4835, 8829). Collapsing this kind into the
+    # two-character `code_an` refuses both, and the interest silently stays on Schedule A.
+    "m1098: the four-character form codes are squeezed through the 2-char code kind": (
+        '    if kind == "code_form":\n        return _clean_code_form(value)',
+        '    if kind == "code_form":\n        return _clean_code_alnum(value)'),
+    # Screen 1098 is on the 'Other Forms' tab. Without the tab walk, open_screen sees only
+    # whichever tab is showing and reports the screen as not existing.
+    "m1098: open_screen gives up on the first tab instead of searching the others": (
+        "        tried = []\n        for tab in _tabs():",
+        "        tried = []\n        for tab in []:"),
     "forms: an unmapped screen falls back to the W-2 map": (
         '    return _FORMS.get(str(screen or "").strip().upper())',
         '    return _FORMS.get(str(screen or "").strip().upper()) or _FORMS["W2"]'),
@@ -407,8 +451,15 @@ TARGET.update({n: "form_plan.py" for n in MUTANTS if n.startswith("ssa_:")})
 TARGET["ssa_: the SSA signature stops at 'Social Security', which the MENU also says"] = "drake_nav.py"
 TARGET["r_: Box 7's second distribution code is dropped instead of entered in its own box"] = "r_map.py"
 TARGET["r_: a joint 'J' is accepted on a screen that only offers T and S"] = "w2_map.py"
+# The 1098 guards are spread across three files, which is the point of naming them here:
+# the country NAMING lives in the map, the country/code SHAPE rules in the planner, and the
+# menu-tab walk in the navigator.
+TARGET.update({n: "form_plan.py" for n in MUTANTS if n.startswith("m1098:")})
+TARGET["m1098: the country code is entered without naming the country it selects"] = "m1098_map.py"
+TARGET["m1098: open_screen gives up on the first tab instead of searching the others"] = "drake_nav.py"
 MUTABLE_FILES = ("drake_driver.py", "w2_map.py", "drake_nav.py", "form_plan.py",
-                 "int_map.py", "div_map.py", "r_map.py", "ssa_map.py", "agent.py")
+                 "int_map.py", "div_map.py", "r_map.py", "ssa_map.py", "m1098_map.py",
+                 "agent.py")
 
 
 # Mutants whose guard belongs to one family of cases may name that family, so the harness
@@ -426,6 +477,7 @@ FAMILY.update({n: "int" for n in MUTANTS if n.startswith("int:")})
 FAMILY.update({n: "div" for n in MUTANTS if n.startswith("div:")})
 FAMILY.update({n: "r_" for n in MUTANTS if n.startswith("r_:")})
 FAMILY.update({n: "ssa_" for n in MUTANTS if n.startswith("ssa_:")})
+FAMILY.update({n: "m1098" for n in MUTANTS if n.startswith("m1098:")})
 FAMILY.update({n: "form_dispatch" for n in MUTANTS if n.startswith("forms:")})
 # The grid-mode guard lives in drake_nav (so it is a `nav:` mutant) but the cases that
 # prove it are the INT ones — the grid only exists on screens like INT. Filtering to the
@@ -468,13 +520,33 @@ if pick:
 # tests of a gap that is really its own.
 COPY_FILES = ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py",
               "drake_nav.py", "form_plan.py", "int_map.py", "div_map.py", "r_map.py",
-              "ssa_map.py", "agent.py", "sample_1099int_full.json",
+              "ssa_map.py", "m1098_map.py", "agent.py", "sample_1099int_full.json",
               "sample_1099div_full.json", "sample_1099r_full.json",
-              "sample_ssa1099_full.json")
+              "sample_ssa1099_full.json", "sample_1098_full.json")
 missing = sorted(set(MUTABLE_FILES) - set(COPY_FILES))
 if missing:
     raise SystemExit(f"mutants.py: {missing} can be mutated but is never copied into the "
                      f"sandbox — every mutant against it would falsely SURVIVE")
+
+# ANCHOR PREFLIGHT. Every mutant quotes a piece of source verbatim; when that source is
+# edited for an unrelated reason, the quotation goes stale and the mutant stops applying.
+# The harness then reports it as SURVIVED — indistinguishable, in the output, from a guard
+# that genuinely has no test. That happened to the DIV description mutant: the 1099-R symbol
+# work rewrote the function it quoted, and the mutant read as an untested guard for two days.
+#
+# Checked for EVERY mutant up front, not just the ones this run selected, because a stale
+# anchor in a family nobody filtered to is exactly how the last one hid.
+stale = []
+for _name, (_anchor, _repl) in MUTANTS.items():
+    _tgt = TARGET.get(_name, "drake_driver.py")
+    _n = (SRC / _tgt).read_text(encoding="utf-8").count(_anchor)
+    if _n != 1:
+        stale.append(f"  {_name}\n      quotes {_tgt}, found {_n} match(es), expected exactly 1")
+if stale:
+    raise SystemExit("mutants.py: these mutants quote source that no longer exists, so they "
+                     "would be applied to nothing and reported as SURVIVED — a gap in the "
+                     "harness masquerading as a gap in the tests. Re-quote them:\n"
+                     + "\n".join(stale))
 
 base_dir = tempfile.mkdtemp()
 for f in COPY_FILES:
