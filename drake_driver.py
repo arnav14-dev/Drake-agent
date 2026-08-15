@@ -3305,6 +3305,15 @@ class DrakeDriver:
                     index, count = pos["index"], pos["count"]
                 break
 
+        # KNOWN LIMIT: only Edit and ComboBox count. A CheckBox holds its state as a GLYPH
+        # with no readable `value`, so a record whose ONLY content is ticked boxes reads as
+        # populated=0 — "blank" — and plan_record_use will use it.
+        #
+        # Measured 2026-08-15 while chasing why a DIV run proceeded where the duplicate guard
+        # should have stopped it: the record's text boxes had been cleared by hand, its ticks
+        # had not, and the run correctly saw nothing to preserve. That is the right outcome
+        # (a record holding only ticks is not an entered document), but it is worth knowing
+        # that "blank" here means "no text or selections", not "untouched".
         values, seen = [], set()
         for e in els:
             if e.get("control_type") not in ("Edit", "ComboBox"):
