@@ -675,6 +675,14 @@ _FORMS = {
             "id_key": "payer_tin", "id_noun": "payer TIN", "amount_noun": "dividend income"},
     "1099": {"module": "r_map", "label": "1099-R",
              "id_key": "payer_tin", "id_noun": "payer TIN", "amount_noun": "pension income"},
+    # NO id_key, and that is a real gap rather than an oversight. Every other screen dedupes
+    # on the PAYER, but Social Security's payer is the government — it is the same on every
+    # SSA-1099 there will ever be. What makes a second record legitimate here is a different
+    # PERSON (field 1, T or S), and that is a letter, not an id the duplicate check can
+    # normalise. So this screen has no automatic protection against the same person's
+    # statement going in twice, which would double their benefits. The operator checks TS.
+    "SSA": {"module": "ssa_map", "label": "SSA-1099",
+            "id_key": None, "id_noun": "beneficiary", "amount_noun": "Social Security benefits"},
 }
 
 

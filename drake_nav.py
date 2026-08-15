@@ -123,6 +123,11 @@ SCREEN_SIGNATURES = {
     # checkbox captions ("1099-R for disability", "1099-R altered or handwritten") and which
     # the Data Entry Menu carries in its screen-link list in every window in every state.
     "1099": r"Form\s+1099-R\s*-\s*Pensions,\s*Annuities,\s*Retirement",
+    # Measured 2026-08-15. Anchored on "Benefits Statement" for a sharper reason than usual:
+    # the Data Entry Menu's link for this screen reads 'SSA|SSA-1099, Social Security', which
+    # is a PREFIX of the heading. A pattern stopping at "Social Security" would match the
+    # menu — present in every window in every state — and report the screen as open from it.
+    "SSA": r"SSA-1099,\s*Social\s+Security\s+Benefits\s+Statement",
 }
 
 # Drake can draw some screens as a SPREADSHEET instead of a form — the INT screen prints

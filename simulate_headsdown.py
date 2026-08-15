@@ -2857,10 +2857,10 @@ def case_form_dispatch():
         ("...and asking for its map raises rather than falling back to the W-2",
          unknown is not None),
         ("the refusal names the screens the agent CAN drive",
-         unknown is not None and all(s in unknown for s in ("W2", "INT", "DIV", "1099"))),
+         unknown is not None and all(s in unknown for s in ("W2", "INT", "DIV", "1099", "SSA"))),
         ("every mapped screen exposes the same planning entry points",
          all(callable(getattr(ag._load_form_map(s)[0], fn))
-             for s in ("W2", "INT", "DIV", "1099") for fn in ("build_plan", "format_plan"))),
+             for s in ("W2", "INT", "DIV", "1099", "SSA") for fn in ("build_plan", "format_plan"))),
         # The two Schedule B screens share a dedupe id NAME and must not share a map.
         ("INT and DIV are different maps, not one map reached twice",
          ag._load_form_map("INT")[0] is not ag._load_form_map("DIV")[0]),
@@ -3350,6 +3350,131 @@ def case_r_full_coverage_plan():
     return _table("1099-R: the dummy payload covers every box on the screen", checks)
 
 
+def case_ssa_field_map():
+    """The SSA-1099 map. Small, and interesting for what it does NOT have.
+
+    Drake gives this screen ten boxes for a form with twenty printed values, and says why on
+    the screen itself: '* No input required since there is no impact on the tax return'. The
+    map's job here is to carry that distinction, not to invent boxes."""
+    import ssa_map
+    from form_plan import FormSpec
+    spec = ssa_map.SSA_SPEC
+    nums = sorted(f["field_no"] for f in ssa_map.SSA_FIELD_MAP.values())
+
+    def refuses(**over):
+        kw = dict(screen="TST", label="t", fields=dict(ssa_map.SSA_FIELD_MAP),
+                  max_field=ssa_map.MAX_FIELD)
+        kw.update(over)
+        try:
+            FormSpec(**kw)
+            return False
+        except RuntimeError:
+            return True
+
+    dup = dict(ssa_map.SSA_FIELD_MAP)
+    dup["a_second_key_for_net_benefits"] = {"field_no": 4, "kind": "money", "label": "clash"}
+    over_range = dict(ssa_map.SSA_FIELD_MAP)
+    over_range["invented"] = {"field_no": 11, "kind": "money", "label": "not on the screen"}
+    checks = [
+        ("every field number 1-10 is mapped, with no gaps", nums == list(range(1, 11))),
+        ("two keys claiming the same box refuses to import", refuses(fields=dup)),
+        ("a field number above the highest measured one refuses to import",
+         refuses(fields=over_range, max_field=10)),
+        ("nothing is confirmed as a dropdown that is not a dropdown",
+         spec.dropdowns_confirmed <= spec.dropdowns),
+        ("a dropdown that is NOT confirmed still gets flagged for a human",
+         all(f["field_no"] in spec.dropdowns_confirmed
+             or plan_has_confirm(spec, f["field_no"])
+             for f in ssa_map.SSA_FIELD_MAP.values() if f["field_no"] in spec.dropdowns)),
+        # TS, not TSJ — the same shape as the 1099-R.
+        ("field 1 is the TS kind, so a joint 'J' is REFUSED, not downgraded",
+         ssa_map.SSA_FIELD_MAP["ts"]["kind"] == "ts"
+         and __import__("form_plan").sanitize("ts", "J") is None),
+        # The leading zero. '1' is not '01' and Drake's list has no '1'.
+        ("field 8's codes keep their LEADING ZERO",
+         ssa_map.BENEFIT_DESIGNATIONS == {"01", "02", "03", "04", "05"}),
+        ("...so '1' is refused where '01' is accepted",
+         (lambda bad, good: not any(e["field_no"] == 8 for e in bad["entries"])
+                            and any(e["field_no"] == 8 and e["value"] == "01"
+                                    for e in good["entries"]))(
+             ssa_map.build_plan({"state_benefit_designation": "1"}),
+             ssa_map.build_plan({"state_benefit_designation": "01"}))),
+        # There is no payer to dedupe on, and that is recorded rather than papered over.
+        ("this screen has NO dedupe id — the payer is the government",
+         spec.dedupe_key is None),
+        # Box 5 is the only number the return actually runs on.
+        ("a payload with no NET BENEFITS is called out, not quietly accepted",
+         any("NET BENEFITS" in w for w in
+             ssa_map.build_plan({"federal_tax_withheld": "1800"})["warnings"])),
+        ("...and a payload that has it is not nagged",
+         not any("NET BENEFITS" in w for w in
+                 ssa_map.build_plan({"net_benefits": "18000"})["warnings"])),
+    ]
+    return _table("SSA-1099: ten boxes, and Drake's own reason for the rest", checks)
+
+
+def case_ssa_not_on_screen():
+    """A value Drake has no box for must be reported BY NAME, never dropped as unknown.
+
+    This screen is the sharpest test of that rule in the project: eleven of the values an
+    extractor reads off an SSA-1099 have nowhere to go on it. Two of them — the benefits
+    paid for an EARLIER year — would actively harm a return if someone decided to squeeze
+    them into Box 5, because that taxes the whole back payment in the current year and
+    throws away the lump-sum election."""
+    import json as _json
+    import ssa_map
+    with open("sample_ssa1099_full.json", encoding="utf-8-sig") as f:
+        payload = _json.load(f)
+    plan = ssa_map.build_plan(payload, ts="T")
+    off = {n["key"]: n["why"] for n in plan["not_on_screen"]} if plan.get("not_on_screen") else {}
+    entered = {e["field_no"] for e in plan["entries"]}
+    checks = [
+        ("nothing in the payload came back as an UNKNOWN key", plan["unknown_keys"] == []),
+        ("Box 3 is reported as not-on-this-screen, by name", "benefits_paid" in off),
+        ("Box 4 likewise", "benefits_repaid" in off),
+        ("...and each says WHY, in Drake's own words",
+         "no impact on the tax return" in off.get("benefits_paid", "")),
+        ("the Medicare split is reported, since only the total has a box",
+         {"medicare_part_b", "medicare_part_c", "medicare_part_d"} <= set(off)),
+        ("prior-year benefits are reported AND pointed at the LUMP SUM screen",
+         "LUMP SUM" in off.get("benefits_for_prior_years", "").upper()),
+        ("none of them was quietly typed into a box anyway", len(entered) == 10),
+        # The beneficiary is the CLIENT, so it is acknowledged as identity rather than
+        # reported as a value with no home.
+        ("the beneficiary's name and SSN are acknowledged as identity, not as gaps",
+         "beneficiary_ssn" in plan["identity_keys"] and "beneficiary_ssn" not in off),
+    ]
+    return _table("SSA-1099: a value with no box is named, not dropped", checks)
+
+
+def case_ssa_screen_signature():
+    """The menu's link for this screen is a PREFIX of the screen's own heading.
+
+    'SSA|SSA-1099, Social Security' sits in the Data Entry Menu's link list, which is present
+    in every window in every state. A signature stopping at 'Social Security' would match it
+    and report the screen as open while a preparer is looking at the menu."""
+    from drake_nav import screen_is_showing
+    SSA_FORM = ["SSA-1099, Social Security Benefits Statement",
+                "RRB-1099, Railroad Retirement Board Payments",
+                "No input required since there is no impact on the tax return"]
+    MENU = ["SSA|SSA-1099, Social Security", "1099|1099-R, Retirement",
+            "INT|1099-INT, Interest Income"]
+    checks = [
+        ("the SSA screen is recognised by its full printed heading",
+         screen_is_showing(SSA_FORM, "SSA") is True),
+        ("the Data Entry MENU is not mistaken for it", screen_is_showing(MENU, "SSA") is False),
+        ("...even though the menu link is a PREFIX of the heading",
+         any(l.startswith("SSA|SSA-1099, Social Security") for l in MENU)),
+        ("the 1099-R screen is not mistaken for it",
+         screen_is_showing(["Form 1099-R - Pensions, Annuities, Retirement"], "SSA") is False),
+        ("the SSA screen is not mistaken for the 1099-R screen",
+         screen_is_showing(SSA_FORM, "1099") is False),
+        ("lower case still matches",
+         screen_is_showing(["ssa-1099, social security benefits statement"], "SSA") is True),
+    ]
+    return _table("SSA-1099: told apart from the menu link that prefixes it", checks)
+
+
 def main() -> int:
     # The suite prints '⚠' and '·', and a REDIRECTED stdout on Windows is cp1252 — which
     # raised UnicodeEncodeError inside the driver, was caught by headsdown_type's outer
@@ -3397,6 +3522,9 @@ def main() -> int:
         ('r_screen_signature', lambda: case_r_screen_signature()),
         ('r_full_coverage_plan', lambda: case_r_full_coverage_plan()),
         ('drake_symbol_codes', lambda: case_drake_symbol_codes()),
+        ('ssa_field_map', lambda: case_ssa_field_map()),
+        ('ssa_not_on_screen', lambda: case_ssa_not_on_screen()),
+        ('ssa_screen_signature', lambda: case_ssa_screen_signature()),
         ('form_dispatch', lambda: case_form_dispatch()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),

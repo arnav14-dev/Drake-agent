@@ -363,6 +363,19 @@ MUTANTS = {
     "codes: a selection code of any length is accepted, so a description becomes a code": (
         "    if not 1 <= len(s) <= 2:\n        return None",
         "    if False:\n        return None"),
+    # --- SSA-1099 ---------------------------------------------------------------------
+    # A value the screen has no box for must be reported BY NAME with the reason. Dropping it
+    # silently is the failure this whole layer exists to prevent, and the SSA screen is where
+    # it bites hardest: eleven of the twenty values on the form have nowhere to go, and two
+    # of them are the prior-year benefits the lump-sum election runs on.
+    "ssa_: a value the screen has no box for is dropped silently instead of reported": (
+        '            not_on_screen.append({"key": key, "raw": raw, "why": spec.not_on_screen[key]})',
+        "            pass"),
+    # The menu link 'SSA|SSA-1099, Social Security' is a PREFIX of the screen's heading, so a
+    # signature that stops early reports the screen as open from the Data Entry Menu.
+    "ssa_: the SSA signature stops at 'Social Security', which the MENU also says": (
+        '    "SSA": r"SSA-1099,\\s*Social\\s+Security\\s+Benefits\\s+Statement",',
+        '    "SSA": r"SSA-1099,\\s*Social\\s+Security",'),
     "forms: an unmapped screen falls back to the W-2 map": (
         '    return _FORMS.get(str(screen or "").strip().upper())',
         '    return _FORMS.get(str(screen or "").strip().upper()) or _FORMS["W2"]'),
@@ -390,10 +403,12 @@ TARGET["div: the DIV screen signature is loose enough to match the INT screen"] 
 # The `r_:` mutants split the same way: the Box 7 guard lives in the 1099-R map itself,
 # the TS guard is the W-2's own sanitizer, and the code-shape guards are in the planner.
 TARGET.update({n: "form_plan.py" for n in MUTANTS if n.startswith("codes:")})
+TARGET.update({n: "form_plan.py" for n in MUTANTS if n.startswith("ssa_:")})
+TARGET["ssa_: the SSA signature stops at 'Social Security', which the MENU also says"] = "drake_nav.py"
 TARGET["r_: Box 7's second distribution code is dropped instead of entered in its own box"] = "r_map.py"
 TARGET["r_: a joint 'J' is accepted on a screen that only offers T and S"] = "w2_map.py"
 MUTABLE_FILES = ("drake_driver.py", "w2_map.py", "drake_nav.py", "form_plan.py",
-                 "int_map.py", "div_map.py", "r_map.py", "agent.py")
+                 "int_map.py", "div_map.py", "r_map.py", "ssa_map.py", "agent.py")
 
 
 # Mutants whose guard belongs to one family of cases may name that family, so the harness
@@ -410,6 +425,7 @@ FAMILY.update({n: "nav" for n in MUTANTS if n.startswith("nav:")})
 FAMILY.update({n: "int" for n in MUTANTS if n.startswith("int:")})
 FAMILY.update({n: "div" for n in MUTANTS if n.startswith("div:")})
 FAMILY.update({n: "r_" for n in MUTANTS if n.startswith("r_:")})
+FAMILY.update({n: "ssa_" for n in MUTANTS if n.startswith("ssa_:")})
 FAMILY.update({n: "form_dispatch" for n in MUTANTS if n.startswith("forms:")})
 # The grid-mode guard lives in drake_nav (so it is a `nav:` mutant) but the cases that
 # prove it are the INT ones — the grid only exists on screens like INT. Filtering to the
@@ -452,8 +468,9 @@ if pick:
 # tests of a gap that is really its own.
 COPY_FILES = ("drake_driver.py", "simulate_headsdown.py", "w2_map.py", "protocol.py",
               "drake_nav.py", "form_plan.py", "int_map.py", "div_map.py", "r_map.py",
-              "agent.py", "sample_1099int_full.json", "sample_1099div_full.json",
-              "sample_1099r_full.json")
+              "ssa_map.py", "agent.py", "sample_1099int_full.json",
+              "sample_1099div_full.json", "sample_1099r_full.json",
+              "sample_ssa1099_full.json")
 missing = sorted(set(MUTABLE_FILES) - set(COPY_FILES))
 if missing:
     raise SystemExit(f"mutants.py: {missing} can be mutated but is never copied into the "
