@@ -1122,6 +1122,47 @@ def _enter_one_payload(driver, payload: dict, args, *, token: str) -> dict:
     return report
 
 
+def _run_one_payload(driver, payload: dict, args, token: str) -> dict:
+    """Navigate to this payload's screen, enter it, and report what happened.
+
+    Extracted from `cmd_watch` so the CONNECTOR runs the identical path. There are two
+    transports now — a folder (local runs) and the cloud connector (a firm's PC) — and if
+    each had its own copy of this, the copies would drift, and the one that drifted would
+    be the one typing into somebody's tax return without the guard that was added to the
+    other. Every field map, read-back gate, duplicate guard and halt rule lives below this
+    line and neither transport can skip any of it.
+
+    Returns a report dict. Never raises for a payload problem: an unenterable payload comes
+    back as `ok: False` with a reason, because a caller that has to catch exceptions to
+    find out a return was left half-entered is a caller that will eventually forget to.
+    """
+    navr = None
+    if not args.no_navigate:
+        # NAVIGATE FIRST, and be answerable for WHICH return was picked: it ends with an
+        # identity check against Drake's own window title and refuses on any mismatch.
+        # Nothing is typed until that passes.
+        navr = _navigate_for_payload(driver, payload, args)
+        if not navr["ok"]:
+            print(f"\nNAVIGATION STOPPED: {navr['reason']}", file=sys.stderr)
+            return {"ok": False, "reason": navr["reason"], "navigation": navr["steps"],
+                    "entered": 0, "not_found": navr.get("not_found", False)}
+
+    # The caret Drake needs to arm heads-down. Navigation leaves the form open but not
+    # necessarily carrying a caret, and Ctrl+N is a silent no-op without one.
+    if not driver._focus_canvas_field():
+        reason = ("could not put the caret on a Drake data-entry box after navigating. "
+                  "Nothing was typed.")
+        print(f"\n{reason}", file=sys.stderr)
+        return {"ok": False, "entered": 0, "reason": reason}
+
+    report = _enter_one_payload(driver, payload, args, token=token)
+    if navr is not None:
+        report["navigation"] = navr["steps"]
+        report["return_title"] = navr.get("return_title")
+        report["record"] = navr.get("record")
+    return report
+
+
 def cmd_watch(args) -> int:
     """Watch a folder for payloads and enter each one into Drake.
 
@@ -1200,46 +1241,13 @@ def cmd_watch(args) -> int:
                 # "the popup never showed field number '1'". Focusing a real data-entry box
                 # through UIA does both jobs at once, and is the same call the caret re-arm
                 # uses. It changes no value; it only decides where the next key lands.
-                navr = None
                 try:
                     payload = json.loads(path.read_text(encoding="utf-8-sig"))
                 except Exception as e:
                     report = {"ok": False, "reason": f"unreadable JSON: {type(e).__name__}: {e}"}
-                    payload = None
                 else:
-                    report = None
-
-                # NAVIGATE FIRST. Until now this step was a human: they opened the client
-                # and the W-2 screen, and the agent typed into whatever was in front of it.
-                # Doing it in code is what lets an operator just open Drake — and it is
-                # also the first time the agent is answerable for WHICH return it picked,
-                # so it ends with an identity check against Drake's own title and refuses
-                # on any mismatch. Nothing is typed until it passes.
-                if payload is not None and not args.no_navigate:
-                    navr = _navigate_for_payload(driver, payload, args)
-                    if not navr["ok"]:
-                        report = {"ok": False, "reason": navr["reason"],
-                                  "navigation": navr["steps"], "entered": 0,
-                                  "not_found": navr.get("not_found", False)}
-                        print(f"\nNAVIGATION STOPPED: {navr['reason']}", file=sys.stderr)
-                    else:
-                        report = None
-
-                if report is None:
-                    # The caret Drake needs to arm heads-down. Navigation leaves the form
-                    # open but not necessarily carrying a caret, and Ctrl+N is a silent
-                    # no-op without one.
-                    if not driver._focus_canvas_field():
-                        report = {"ok": False, "entered": 0,
-                                  "reason": "could not put the caret on a Drake data-entry "
-                                            "box after navigating. Nothing was typed."}
-                        print(f"\n{report['reason']}", file=sys.stderr)
-                    else:
-                        report = _enter_one_payload(driver, payload, args, token=token)
-                        if navr is not None:
-                            report["navigation"] = navr["steps"]
-                            report["return_title"] = navr.get("return_title")
-                            report["record"] = navr.get("record")
+                    # Identical to what the connector runs — see `_run_one_payload`.
+                    report = _run_one_payload(driver, payload, args, token)
                 processed += 1
 
                 shot = driver.save_screenshot(str(root / f"{path.stem}.png"))
