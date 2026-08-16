@@ -43,6 +43,17 @@ MAX_CONFIRMED_FIELD = 87
 # Keys an extractor may legitimately produce that have NO box on the W-2 screen. They are
 # reported by name instead of being lumped into the generic "unknown key" warning — a
 # dropped SSN must be loud, not silent.
+# Keys that are TRANSPORT, not values on any form. They tell the agent how to handle the
+# payload rather than what to type, so reporting them as unrecognised would put a permanent,
+# meaningless warning on every document the backend sends.
+#
+#   drake_screen  which form this payload is for — it is what chose this map
+#   doc_type      the extractor's own name for the document
+#   batch_seq     where this payload sits in a batch's ORDER. The agent stops at the first
+#                 document that does not complete cleanly, so the order is what "it stopped
+#                 at number 3" means and which documents were never attempted.
+TRANSPORT_KEYS = frozenset({"drake_screen", "doc_type", "batch_seq"})
+
 NOT_ON_THIS_SCREEN = {
     "employee_ssn": "the W-2 screen has no SSN box — the SSN comes from screen 1 "
                     "(demographics), which is why the employee block is captioned "
@@ -616,7 +627,7 @@ def build_plan(payload: dict, *, checkbox_token: str = "X", include_zeros: bool 
         # Transport, not a value: `drake_screen` is how a payload names the form it is for,
         # and it is what chose this map in the first place. Reporting it as an unrecognised
         # key would put a permanent, meaningless warning on every W-2 the backend sends.
-        if key.startswith("_") or key in ("drake_screen", "doc_type"):
+        if key.startswith("_") or key in TRANSPORT_KEYS:
             continue
         if key in NOT_ON_THIS_SCREEN:
             not_on_screen.append({"key": key, "raw": raw, "why": NOT_ON_THIS_SCREEN[key]})

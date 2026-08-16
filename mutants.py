@@ -420,6 +420,36 @@ MUTANTS = {
     "m1098: open_screen gives up on the first tab instead of searching the others": (
         "        tried = []\n        for tab in _tabs():",
         "        tried = []\n        for tab in []:"),
+    # The exact state two screens shipped in: their extractor's identity key is not on the
+    # list, so the payload has no client and the screen cannot be sent from the browser at
+    # all — while every other test, and a perfect live run, stays green.
+    "forms: the client-identity key list forgets the two screens that do not say 'recipient'": (
+        '    return {"ssn": first("client_ssn", "employee_ssn", "recipient_tin", "recipient_ssn",\n'
+        '                         "beneficiary_ssn", "borrower_ssn"),',
+        '    return {"ssn": first("client_ssn", "employee_ssn", "recipient_tin", "recipient_ssn"),'),
+    # A screen link clicked from a form opens Drake's RECORD CHOOSER, not the screen. Every
+    # batch meets this on its second document; a single-document run never does, because
+    # those always start from the menu.
+    "nav: a screen is opened from whatever is on screen, so Drake shows its record chooser": (
+        '    if cur["kind"] == "form":',
+        '    if False:'),
+    # The chooser lists every record on the screen. Skipping that check is a WEAKER duplicate
+    # guard than the one that existed before it — a client's second identical 1099 goes in.
+    "chooser: the record list is not checked for this payer, so a duplicate is entered": (
+        "            dupes = nav.forms_list_matches(rows, payload[key])" + chr(10) +
+        "    return dupes",
+        "            dupes = nav.forms_list_matches(rows, payload[key])" + chr(10) +
+        "    return []"),
+    # Matching only on the ID never fires on a W-2 chooser, which prints Employer Name and
+    # no EIN at all — the screen where doubling someone's wages is easiest.
+    "chooser: only the payer ID is compared, not the name the chooser actually prints": (
+        '        if not dupes and str(payload.get(key) or "").strip():',
+        "        if False:"),
+    # Open on 'whatever row is selected' puts this document's values on top of an existing
+    # record instead of adding one.
+    "chooser: any row will do, not the New Record row": (
+        "        if FORMS_LIST_NEW_CELL not in texts:" + chr(10) + "            continue",
+        "        if False:" + chr(10) + "            continue"),
     "forms: an unmapped screen falls back to the W-2 map": (
         '    return _FORMS.get(str(screen or "").strip().upper())',
         '    return _FORMS.get(str(screen or "").strip().upper()) or _FORMS["W2"]'),
@@ -455,6 +485,9 @@ TARGET["r_: a joint 'J' is accepted on a screen that only offers T and S"] = "w2
 # the country NAMING lives in the map, the country/code SHAPE rules in the planner, and the
 # menu-tab walk in the navigator.
 TARGET.update({n: "form_plan.py" for n in MUTANTS if n.startswith("m1098:")})
+TARGET.update({n: "drake_nav.py" for n in MUTANTS if n.startswith("chooser:")})
+TARGET["chooser: the record list is not checked for this payer, so a duplicate is entered"] = "agent.py"
+TARGET["chooser: only the payer ID is compared, not the name the chooser actually prints"] = "agent.py"
 TARGET["m1098: the country code is entered without naming the country it selects"] = "m1098_map.py"
 TARGET["m1098: open_screen gives up on the first tab instead of searching the others"] = "drake_nav.py"
 MUTABLE_FILES = ("drake_driver.py", "w2_map.py", "drake_nav.py", "form_plan.py",
@@ -478,7 +511,11 @@ FAMILY.update({n: "div" for n in MUTANTS if n.startswith("div:")})
 FAMILY.update({n: "r_" for n in MUTANTS if n.startswith("r_:")})
 FAMILY.update({n: "ssa_" for n in MUTANTS if n.startswith("ssa_:")})
 FAMILY.update({n: "m1098" for n in MUTANTS if n.startswith("m1098:")})
+FAMILY.update({n: "record_chooser" for n in MUTANTS if n.startswith("chooser:")})
+FAMILY["nav: a screen is opened from whatever is on screen, so Drake shows its record chooser"] = "nav_menu_first"
 FAMILY.update({n: "form_dispatch" for n in MUTANTS if n.startswith("forms:")})
+# This one is proven by the identity case, not the dispatcher cases.
+FAMILY["forms: the client-identity key list forgets the two screens that do not say 'recipient'"] = "payload_target"
 # The grid-mode guard lives in drake_nav (so it is a `nav:` mutant) but the cases that
 # prove it are the INT ones — the grid only exists on screens like INT. Filtering to the
 # 'nav' family would run a set of cases that never touches it, and a mutant that survives

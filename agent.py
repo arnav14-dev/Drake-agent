@@ -830,6 +830,31 @@ def cmd_write_form(args) -> int:
     return code
 
 
+def _queue_order(path) -> tuple:
+    """Sort key for the watch folder: the batch's stated order, then mtime, then name.
+
+    `batch_seq` is transport, like `drake_screen` — it says WHEN this payload should be
+    entered relative to its siblings, and it is never a value on any form. A payload without
+    one sorts after every payload that has one, and among themselves those keep the old
+    oldest-first behaviour.
+
+    Reading each file to sort them is a few kilobytes per pass and buys the one thing the
+    timestamps cannot give: an order that survives six files being written in the same
+    millisecond. An unreadable file sorts last rather than raising — it will be picked up,
+    fail its own JSON parse, and be reported properly with a report beside it.
+    """
+    try:
+        seq = json.loads(path.read_text(encoding="utf-8-sig")).get("batch_seq")
+        seq = int(seq) if seq is not None else None
+    except Exception:
+        seq = None
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = float("inf")
+    return (0, seq, mtime, path.name) if seq is not None else (1, 0, mtime, path.name)
+
+
 def _payload_target(payload: dict) -> dict:
     """Who and what this payload is for: {ssn, first, last, ein, screen, form}.
 
@@ -846,12 +871,47 @@ def _payload_target(payload: dict) -> dict:
     first = lambda *keys: next((g(k) for k in keys if g(k)), "")
     screen = (g("drake_screen") or "W2").upper()
     form = _form_for(screen) or {}
-    return {"ssn": first("client_ssn", "employee_ssn", "recipient_tin", "recipient_ssn"),
-            "first": first("client_first_name", "employee_first_name", "recipient_first_name"),
-            "last": first("client_last_name", "employee_last_name", "recipient_last_name"),
+    # EVERY drivable screen must have one of these, or the agent cannot tell whose return
+    # the document belongs to and refuses having typed nothing. Two screens shipped without
+    # one and neither was noticed, because both had only ever been run from a hand-written
+    # sample that happened to carry `client_ssn`:
+    #   SSA-1099 emits `beneficiary_ssn` — the statement names a BENEFICIARY, not a recipient
+    #   Form 1098 emits `borrower_ssn`   — the RECIPIENT on a 1098 is the lender, so calling
+    #                                      the client "recipient" here would be backwards
+    # `test_payload_target_covers_every_screen` in the simulator is what keeps this list and
+    # the screen maps from drifting apart again.
+    return {"ssn": first("client_ssn", "employee_ssn", "recipient_tin", "recipient_ssn",
+                         "beneficiary_ssn", "borrower_ssn"),
+            "first": first("client_first_name", "employee_first_name", "recipient_first_name",
+                           "borrower_first_name"),
+            "last": first("client_last_name", "employee_last_name", "recipient_last_name",
+                          "borrower_last_name"),
             "ein": g(form.get("id_key") or "employer_ein"),
             "screen": screen,
             "form": form or None}
+
+
+def _chooser_duplicates(rows: list, target: dict, payload: dict) -> list:
+    """Rows of Drake's record chooser that are ALREADY this document. [] if it is new.
+
+    THE STRONGEST FORM OF THE DUPLICATE CHECK. Until the chooser was understood, this could
+    only read the ONE record that happened to be open — so a client's third identical
+    1099-INT was caught if that record was in front of us and missed otherwise. The chooser
+    lists every record on the screen, so the payer is compared against all of them.
+
+    Two identifiers, because the chooser prints a NAME and the payload's dedupe key is an
+    ID. A W-2 chooser shows 'Employer Name' and no EIN at all; matching only on the id would
+    therefore never fire on the very screen where doubling someone's wages is easiest.
+
+    Extracted from `_navigate_for_payload` so it can be tested. It was inline, and the
+    mutation harness proved the point immediately: deleting the check left every test green.
+    """
+    import drake_nav as nav
+    dupes = nav.forms_list_matches(rows, target.get("ein")) if target.get("ein") else []
+    for key in ("employer_name", "payer_name", "lender_name"):
+        if not dupes and str(payload.get(key) or "").strip():
+            dupes = nav.forms_list_matches(rows, payload[key])
+    return dupes
 
 
 def _navigate_for_payload(driver, payload: dict, args) -> dict:
@@ -893,6 +953,52 @@ def _navigate_for_payload(driver, payload: dict, args) -> dict:
         print(f"    still needs a human on screen 1: {', '.join(r.get('incomplete') or [])}")
 
     s = nav.open_screen(driver, t["screen"], timeout=args.nav_timeout)
+
+    # DRAKE ASKED WHICH RECORD. `open_screen` reports the chooser rather than answering it,
+    # because the answer depends on the payload and a navigation helper has never seen one.
+    #
+    # This is also where the duplicate check gets STRONGER. Until now it could only read the
+    # ONE record that happened to be open, so a client's third identical 1099-INT was caught
+    # only if that record was in front of us. The chooser lists every existing record on the
+    # screen, so the payer is checked against all of them before anything is opened.
+    if not s["ok"] and s.get("chooser"):
+        rows = s.get("rows") or []
+        dupes = _chooser_duplicates(rows, t, payload)
+        if dupes:
+            nav.resolve_forms_list(driver, s["chooser"], take_new=False, log=print)
+            steps.append({"step": "screen", "ok": False, "reason": "duplicate"})
+            out["reason"] = (
+                f"this {t['form']['label']} is ALREADY on the return — Drake's record list "
+                f"already shows {dupes[0][:3]}. Entering it again would double the client's "
+                f"{t['form']['amount_noun']}. Nothing was typed and the list was closed.")
+            out["duplicate"] = True
+            return out
+        picked = nav.resolve_forms_list(driver, s["chooser"], take_new=True, log=print)
+        if picked["ok"]:
+            # Prove the screen actually opened this time. The chooser closing is not proof
+            # that the screen is up, and everything below types field numbers into it.
+            import time as _t
+            deadline = _t.time() + float(args.nav_timeout)
+            while _t.time() < deadline:
+                if nav.screen_is_showing(
+                        [e.get("name") for e in driver.nav_all_elements()
+                         if e.get("control_type") == "Text"], t["screen"]) is not False:
+                    s = {"ok": True, "step": "screen", "reason": None,
+                         "chose": "new record via Drake's list"}
+                    break
+                _t.sleep(0.2)
+        if not s.get("ok"):
+            # Say which of the two actually happened. The first version of this reported
+            # "Drake's record list was answered" whether or not it had been, and sent me
+            # looking at Drake's timing for half an hour when the truth was that the row had
+            # never been selected at all.
+            out["reason"] = (
+                picked.get("reason") if not picked["ok"]
+                else (f"Drake's record list was answered and a new record chosen, but screen "
+                      f"{t['screen']} still did not appear — nothing was typed."))
+            steps.append({"step": "screen", "ok": False, "reason": out["reason"]})
+            return out
+
     steps.append({"step": "screen", **{k: s.get(k) for k in ("ok", "reason", "step")}})
     if not s["ok"]:
         out["reason"] = s["reason"]
@@ -1068,8 +1174,20 @@ def cmd_watch(args) -> int:
         while True:
             # Oldest first, and NEVER a '.part' — the backend renames into place, so a name
             # ending .json is a file that is completely written.
+            #
+            # MTIME ALONE IS NOT AN ORDER. A batch writes its payloads in a tight loop, and
+            # on Windows all six can land inside one clock tick — the timestamps then tie and
+            # the run order comes from whatever `glob` happened to return. Measured
+            # 2026-08-15: a six-document batch written W-2 first started on the 1099-INT.
+            #
+            # That matters because the agent STOPS at the first document that does not
+            # complete cleanly. The order is what a person is watching, it is what "it
+            # stopped at number 3" means, and it is what tells them which documents were
+            # never attempted. So a batch states its order in the payload and this honours
+            # it; anything without one keeps the old mtime behaviour and sorts after, which
+            # is what a single hand-dropped payload should do.
             queue = sorted((p for p in root.glob("*.json") if not p.name.endswith(".part")),
-                           key=lambda p: p.stat().st_mtime)
+                           key=_queue_order)
             for path in queue:
                 print("=" * 74)
                 print(f"ENTERING {path.name}")

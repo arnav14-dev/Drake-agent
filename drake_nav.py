@@ -149,6 +149,166 @@ GRID_MODE_ID_PREFIX = "ucTaxGrid"
 GRID_MODE_TOGGLE_KEY = "F3"
 
 
+# ---------------------------------------------------------------------------------------
+# Drake's RECORD CHOOSER.
+#
+# Opening a repeatable screen that already holds records does not always open the screen:
+# Drake may put up 'Existing Forms List', a grid of every existing record plus a 'New Record'
+# row, with Open and Cancel. Measured 2026-08-15/16 — it appeared for a W-2 screen holding
+# two records and not for an INT screen holding five, so it is NOT simply "more than one
+# record" and it is not only about which window the link was clicked from. Both of those
+# were hypotheses this code no longer relies on: the chooser is handled wherever it appears.
+#
+# It was invisible for as long as documents went in one at a time. A batch meets it on its
+# second document, and `open_screen` rightly refused — the screen's heading never appears
+# while the chooser is up, and typing field numbers into a chooser would be worse than
+# useless.
+#
+# It is also an OPPORTUNITY, and that is why this reads the grid rather than dismissing it.
+# The chooser lists every existing record with its identifying columns; today's duplicate
+# guard can only see the ONE record that happens to be open. Reading the list makes the
+# duplicate check stronger, not weaker — which is the only basis on which a safety gate is
+# allowed to change.
+FORMS_LIST_TITLE = "Existing Forms List"
+FORMS_LIST_OPEN_ID = "MultiInstanceSelectionWindow_ButtonOpen"
+FORMS_LIST_CANCEL_ID = "MultiInstanceSelectionWindow_ButtonCancel"
+# The row Drake pre-selects. Matched on the '#' cell, which reads 'New' for it.
+FORMS_LIST_NEW_CELL = "NEW"
+
+
+def forms_list_hwnd(driver):
+    """The record chooser's window handle, or None."""
+    from drake_driver import _enum_toplevel_windows
+    try:
+        pid = int(driver.pid or driver.win.element_info.process_id)
+        for w in _enum_toplevel_windows(pid):
+            if w.get("visible") and FORMS_LIST_TITLE.lower() in (w.get("title") or "").lower():
+                return int(w["hwnd"])
+    except Exception:
+        pass
+    return None
+
+
+def read_forms_list(driver, hwnd) -> list:
+    """Every row of the chooser as a list of cell strings, header first.
+
+    Read off the DataGrid's own DataItem rows. Returned as raw cells rather than as named
+    fields on purpose: the columns differ per screen (a W-2 chooser shows Employer Name and
+    Wages, an INT chooser shows Name and Interest Income), and inventing a schema for each
+    would be a second field map to keep in step with Drake.
+    """
+    rows = []
+    try:
+        win = driver.app.window(handle=int(hwnd))
+        header = [e.window_text().strip()
+                  for e in win.descendants(control_type="HeaderItem")
+                  if (e.window_text() or "").strip()]
+        if header:
+            rows.append(header)
+        for item in win.descendants(control_type="DataItem"):
+            cells = []
+            for c in item.descendants(control_type="Text"):
+                try:
+                    cells.append((c.window_text() or "").strip())
+                except Exception:
+                    cells.append("")
+            if cells:
+                rows.append(cells)
+    except Exception:
+        pass
+    return rows
+
+
+def forms_list_matches(rows: list, value: str) -> list:
+    """Rows whose cells contain `value`, normalised. [] when it is new to this return.
+
+    Compared with `_strip_name_noise`, the SAME normaliser the client identity check uses:
+    the chooser prints what Drake STORED, which is not what we sent — it title-cases an
+    employer name and drops punctuation — so an exact string comparison would report every
+    real duplicate as new, which is the wrong direction for a duplicate check to fail in.
+    """
+    want = _strip_name_noise(value)
+    if not want:
+        return []
+    out = []
+    for row in rows[1:] if rows else []:
+        if any(_strip_name_noise(c) == want for c in row):
+            out.append(row)
+    return out
+
+
+def resolve_forms_list(driver, hwnd, *, take_new: bool, log=print) -> dict:
+    """Answer the chooser: take the New Record row, or cancel out of it.
+
+    Never 'whatever row is selected'. Every row here is a record in a live return, and Open
+    on the wrong one puts this document's values on top of somebody else's 1099.
+    """
+    import time
+    try:
+        win = driver.app.window(handle=int(hwnd))
+    except Exception as e:
+        return {"ok": False, "reason": f"the record chooser could not be read: {e}"}
+
+    if not take_new:
+        try:
+            win.child_window(auto_id=FORMS_LIST_CANCEL_ID, control_type="Button").wrapper_object().invoke()
+            return {"ok": True, "action": "cancelled"}
+        except Exception as e:
+            return {"ok": False, "reason": f"could not cancel the record chooser: {e}"}
+
+    # Select the New Record row explicitly rather than trusting Drake's pre-selection: the
+    # pre-selected row is what a PERSON would see, and this code does not see it.
+    #
+    # `descendants()` hands back objects that are ALREADY WRAPPED. Calling .wrapper_object()
+    # on one raises AttributeError, and when that was swallowed by a bare `except` the row
+    # was never selected, Open was never pressed, and the run reported that Drake's list
+    # "was answered" when nothing had been touched. Both shapes are accepted here so a
+    # pywinauto version cannot reintroduce it, and NOTHING is swallowed: a row that will not
+    # select is a refusal with the reason attached, never a silent pass.
+    picked, why = False, []
+    try:
+        rows = win.descendants(control_type="DataItem")
+    except Exception as e:
+        return {"ok": False, "reason": f"the record chooser's list could not be read: {e}"}
+
+    for item in rows:
+        try:
+            texts = [(c.window_text() or "").strip().upper()
+                     for c in item.descendants(control_type="Text")]
+        except Exception:
+            continue
+        if FORMS_LIST_NEW_CELL not in texts:
+            continue
+        target = item.wrapper_object() if hasattr(item, "wrapper_object") else item
+        for how in ("select", "click_input"):
+            try:
+                getattr(target, how)()
+                picked = True
+                break
+            except Exception as e:
+                why.append(f"{how}: {type(e).__name__}")
+        break
+
+    if not picked:
+        return {"ok": False,
+                "reason": ("the record chooser's 'New Record' row could not be selected"
+                           + (f" ({'; '.join(why)})" if why else
+                              " — no row on it is marked 'New'")
+                           + ". Nothing was opened: the alternative is picking an existing "
+                             "record, which would overwrite somebody's document.")}
+    time.sleep(0.25)
+    try:
+        btn = win.child_window(auto_id=FORMS_LIST_OPEN_ID, control_type="Button")
+        btn = btn.wrapper_object() if hasattr(btn, "wrapper_object") else btn
+        btn.invoke()
+    except Exception as e:
+        return {"ok": False, "reason": f"could not press Open on the record chooser: {e}"}
+    log("  (Drake asked which record — chose a NEW one)")
+    time.sleep(0.6)
+    return {"ok": True, "action": "new-record"}
+
+
+
 # -- identity --------------------------------------------------------------------------
 
 def normalize_id(value) -> str:
@@ -747,6 +907,51 @@ def open_screen(driver, code, *, timeout: float = 10.0, log=print) -> dict:
     if cur["kind"] == "none":
         return _fail("screen", "no return is open, so there is no screen to open")
 
+    # BACK TO THE MENU FIRST, when a form screen is open.
+    #
+    # This function used to click the link from wherever it was, on the measurement that all
+    # the links are present and enabled from every state. They are — but what they DO is not
+    # the same from every state, and that is what the measurement missed. Measured 2026-08-15
+    # on a return holding several records per screen:
+    #
+    #     clicked from the Data Entry Menu -> the screen opens
+    #     clicked from a form screen       -> Drake opens 'Existing Forms List', a chooser
+    #                                         listing every existing record plus 'New Record'
+    #
+    # The chooser is not a screen, so the heading never appears and this function rightly
+    # refused. Which was invisible for a year of single-document runs, because every one of
+    # those starts from the menu — and fatal to a batch, where every document after the first
+    # is opened from the form the previous one just finished.
+    #
+    # Escape is the way back, and on a Drake data-entry screen it SAVES and closes: the values
+    # the previous document just entered are kept. Deliberately not answered by learning to
+    # drive the chooser — every row on it is a record in a live return, and picking the wrong
+    # one silently overwrites somebody's 1099 instead of adding one.
+    # Escape is sent TO THE CANVAS WINDOW, not through the global keyboard. `driver.press`
+    # injects into whatever holds focus, and after a run that is the heads-down popup or the
+    # main frame — the form never sees the key and this loop reported "still showing a form"
+    # about a screen that had simply not been asked to close.
+    if cur["kind"] == "form":
+        for _ in range(3):
+            try:
+                win = driver.app.window(handle=int(cur["hwnd"]))
+                win.set_focus()
+                time.sleep(0.2)
+                win.type_keys("{ESC}")
+            except Exception:
+                driver.press(["Esc"])
+            time.sleep(0.55)
+            cur = driver.nav_data_entry_window()
+            if cur["kind"] == "menu":
+                break
+        if cur["kind"] != "menu":
+            return _fail("screen",
+                         f"could not get back to the Data Entry Menu before opening screen "
+                         f"{want} — Drake is still showing {cur['kind']!r}. Clicking a screen "
+                         f"link from a form makes Drake open its record chooser instead of "
+                         f"the screen, so nothing was clicked and nothing was typed.")
+        log("  (closed the previous screen — a screen link opens a record chooser from a form)")
+
     def _links():
         return [e for e in driver.nav_all_elements()
                 if re.match(SCREEN_LINK_ID_RE, e_id(e)) and (e.get("name") or "")]
@@ -843,6 +1048,21 @@ def open_screen(driver, code, *, timeout: float = 10.0, log=print) -> dict:
     deadline = time.time() + float(timeout)
     showing = None
     while time.time() < deadline:
+        # THE RECORD CHOOSER, NOT THE SCREEN. Drake may answer a screen link with 'Existing
+        # Forms List' instead of the screen. Its heading never appears, so without this the
+        # wait burns the whole timeout and reports "the heading never appeared" — true, and
+        # useless: the caller cannot tell a chooser it must answer from a screen that failed
+        # to open. Reported as its own outcome, with the rows already read, because the
+        # decision (a new record, or a duplicate to refuse) belongs to whoever knows the
+        # payload — not to a navigation helper.
+        picker = forms_list_hwnd(driver)
+        if picker:
+            rows = read_forms_list(driver, picker)
+            return {"ok": False, "step": "screen", "chooser": picker, "rows": rows,
+                    "reason": (f"Drake asked which {want} record to open instead of opening "
+                               f"the screen — its 'Existing Forms List' is up, listing "
+                               f"{max(0, len(rows) - 1)} existing record(s). Nothing was "
+                               f"typed.")}
         showing = screen_is_showing(_labels(), want)
         if showing is not False:
             break

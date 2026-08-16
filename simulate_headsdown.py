@@ -3771,6 +3771,537 @@ def case_m1098_menu_tab_walk():
     return _table("Form 1098: the menu has ten tabs, and only one is drawn", checks)
 
 
+
+def case_payload_target_covers_every_screen():
+    """Every drivable screen must hand the agent a client SSN it RECOGNISES.
+
+    `_payload_target` resolves whose return a document belongs to by trying a fixed list of
+    key names. A screen whose extractor spells that key differently produces a payload with
+    no client at all, and `_navigate_for_payload` refuses it having typed nothing — correct,
+    but the screen is then completely undrivable through the watch folder, which is the only
+    path the product actually uses.
+
+    TWO SHIPPED THAT WAY. SSA-1099 emits `beneficiary_ssn` (an SSA statement names a
+    beneficiary, not a recipient) and Form 1098 emits `borrower_ssn` (on a 1098 the
+    RECIPIENT is the lender, so the client cannot be called that). Both passed every other
+    test, both entered every box perfectly in a live run, and neither could be sent from
+    the browser — because every live run so far used a hand-written sample that happened to
+    carry `client_ssn`, a key no extractor produces.
+
+    This case walks the SCREENS rather than the keys, so a seventh form cannot be added
+    without an identity path."""
+    import agent
+
+    # What the backend's screenMap actually emits as the client identity, per screen. Kept
+    # here rather than imported because the two repos ship separately: this is the contract
+    # between them, and a test that read it from one side could not detect them drifting.
+    EMITTED = {
+        "W2":   ("employee_ssn",     "employee_first_name",  "employee_last_name"),
+        "INT":  ("recipient_tin",    "recipient_first_name", "recipient_last_name"),
+        "DIV":  ("recipient_tin",    "recipient_first_name", "recipient_last_name"),
+        "1099": ("recipient_tin",    "recipient_first_name", "recipient_last_name"),
+        "SSA":  ("beneficiary_ssn",  "recipient_first_name", "recipient_last_name"),
+        "1098": ("borrower_ssn",     "borrower_first_name",  "borrower_last_name"),
+    }
+
+    missing_screen = sorted(set(agent._FORMS) - set(EMITTED))
+    unresolved, no_name = [], []
+    for screen, (ssn_key, first_key, last_key) in EMITTED.items():
+        if screen not in agent._FORMS:
+            continue
+        t = agent._payload_target({"drake_screen": screen, ssn_key: "123456789",
+                                   first_key: "TEST", last_key: "FYNN"})
+        if t["ssn"] != "123456789":
+            unresolved.append(f"{screen} via {ssn_key}")
+        if t["first"] != "TEST" or t["last"] != "FYNN":
+            no_name.append(f"{screen} via {first_key}/{last_key}")
+
+    # The failure itself, spelled out: no identity at all must REFUSE, not default.
+    blank = agent._payload_target({"drake_screen": "1098"})
+
+    checks = [
+        ("every screen the agent can drive is covered by this case", missing_screen == []),
+        ("every screen's client SSN key resolves", unresolved == []),
+        ("...including SSA-1099's beneficiary_ssn",
+         agent._payload_target({"drake_screen": "SSA",
+                                "beneficiary_ssn": "123456789"})["ssn"] == "123456789"),
+        ("...and Form 1098's borrower_ssn",
+         agent._payload_target({"drake_screen": "1098",
+                                "borrower_ssn": "123456789"})["ssn"] == "123456789"),
+        ("every screen's client NAME keys resolve", no_name == []),
+        ("a payload with no identity resolves to no SSN, so navigation refuses it",
+         blank["ssn"] == ""),
+        ("the screen still resolves to its form map", blank["form"] is not None),
+        # The dedupe id is per-form and must not fall back to the W-2's employer key.
+        ("each screen's dedupe id comes from its own form definition",
+         agent._payload_target({"drake_screen": "1098", "lender_tin": "12-3456789"})["ein"]
+         == "12-3456789"
+         and agent._payload_target({"drake_screen": "INT", "payer_tin": "99"})["ein"] == "99"),
+    ]
+    return _table("navigation: every screen hands over a client the agent recognises", checks)
+
+
+
+def case_batch_queue_order():
+    """A batch's order is stated in the payload, because timestamps cannot carry it.
+
+    The watch folder used to be drained oldest-first, which is right for payloads dropped one
+    at a time by a person. A BATCH writes all of them in a tight loop, and on Windows they
+    land inside a single clock tick: the modification times tie, `sorted` keeps whatever
+    order `glob` returned, and the run order is effectively arbitrary. Measured 2026-08-15 —
+    a six-document batch written W-2 first began on the 1099-INT.
+
+    That is not cosmetic. The agent STOPS at the first document that does not complete
+    cleanly, so the order is what a person is watching, it is what "it stopped at number 3"
+    means, and it is what says which documents were never attempted at all. A UI that lists
+    them in one order while the agent works in another is telling someone the wrong document
+    halted, and pointing them at the wrong screenshot as evidence."""
+    import json as _json
+    import os
+    import tempfile
+    from pathlib import Path
+    from agent import _queue_order
+
+    tmp = Path(tempfile.mkdtemp())
+
+    def drop(name, seq=None, age=0.0, text=None):
+        p = tmp / name
+        if text is not None:
+            p.write_text(text, encoding="utf-8")
+        else:
+            body = {"drake_screen": "W2", "client_ssn": "123456789"}
+            if seq is not None:
+                body["batch_seq"] = seq
+            p.write_text(_json.dumps(body), encoding="utf-8")
+        # Force the tie the real bug depends on: every file the same mtime.
+        os.utime(p, (1_700_000_000 + age, 1_700_000_000 + age))
+        return p
+
+    # Written in one order, named in another, all with an IDENTICAL timestamp — the exact
+    # shape of a batch drop.
+    drop("zz-third.json", seq=3)
+    drop("aa-first.json", seq=1)
+    drop("mm-second.json", seq=2)
+    ordered = [p.name for p in sorted(tmp.glob("*.json"), key=_queue_order)]
+
+    # A hand-dropped payload has no seq. It must not jump the queue, and among its own kind
+    # it keeps the oldest-first behaviour the folder has always had.
+    tmp2 = Path(tempfile.mkdtemp())
+
+    def drop2(name, seq=None, age=0.0):
+        p = tmp2 / name
+        body = {"drake_screen": "W2"}
+        if seq is not None:
+            body["batch_seq"] = seq
+        p.write_text(_json.dumps(body), encoding="utf-8")
+        os.utime(p, (1_700_000_000 + age, 1_700_000_000 + age))
+
+    drop2("loose-newer.json", age=200)
+    drop2("loose-older.json", age=100)
+    drop2("batch-2.json", seq=2, age=999)
+    drop2("batch-1.json", seq=1, age=999)
+    mixed = [p.name for p in sorted(tmp2.glob("*.json"), key=_queue_order)]
+
+    # A file that is not JSON must not take the sorter down. It gets picked up, fails its own
+    # parse, and is reported with a report beside it — which is a result, not a crash.
+    tmp3 = Path(tempfile.mkdtemp())
+    drop3 = lambda n, t: (tmp3 / n).write_text(t, encoding="utf-8")
+    drop3("broken.json", "{not json")
+    drop3("fine.json", _json.dumps({"batch_seq": 1}))
+    try:
+        survived = [p.name for p in sorted(tmp3.glob("*.json"), key=_queue_order)]
+        crashed = False
+    except Exception:
+        survived, crashed = [], True
+
+    checks = [
+        ("a batch runs in the order it stated, not the order the files were named",
+         ordered == ["aa-first.json", "mm-second.json", "zz-third.json"]),
+        ("...even though every file has the SAME modification time",
+         len({(tmp / n).stat().st_mtime for n in ordered}) == 1),
+        ("a batch runs before loose payloads that were dropped by hand",
+         mixed[:2] == ["batch-1.json", "batch-2.json"]),
+        ("...and those loose payloads keep the old oldest-first behaviour",
+         mixed[2:] == ["loose-older.json", "loose-newer.json"]),
+        ("...even though the batch's files are the NEWEST in the folder",
+         (tmp2 / "batch-1.json").stat().st_mtime > (tmp2 / "loose-newer.json").stat().st_mtime),
+        ("a file that is not JSON does not take the sorter down", not crashed),
+        ("...it sorts last, to be picked up and reported on its own terms",
+         survived == ["fine.json", "broken.json"]),
+    ]
+    return _table("watch folder: a batch's order is stated, not inferred from timestamps", checks)
+
+
+def case_transport_keys_are_not_values():
+    """`batch_seq` tells the agent WHEN to enter a payload, not what to type.
+
+    Every key in a payload is either a box on the form, a declared not-on-this-screen value,
+    an identity the agent navigates on, or an unrecognised key that gets reported. Transport
+    is none of those, and a transport key reported as unrecognised would put a permanent,
+    meaningless warning on every document the backend ever sends — which is how people learn
+    to skim warnings, and skimmed warnings are why the whole read-back layer exists."""
+    import importlib
+    from w2_map import TRANSPORT_KEYS
+
+    TRANSPORT = {"drake_screen": "W2", "doc_type": "w2", "batch_seq": 3}
+    leaked = []
+    for mod, screen, key, value in [
+        ("w2_map", "W2", "box1_wages", "52000"),
+        ("int_map", "INT", "box1_interest", "1200"),
+        ("div_map", "DIV", "box1a_ordinary_dividends", "1200"),
+        ("r_map", "1099", "box1_gross_distribution", "1200"),
+        ("ssa_map", "SSA", "net_benefits", "18000"),
+        ("m1098_map", "1098", "box1_mortgage_interest", "1200"),
+    ]:
+        m = importlib.import_module(mod)
+        payload = {**TRANSPORT, "drake_screen": screen, key: value}
+        plan = m.build_plan(payload)
+        if plan["unknown_keys"]:
+            leaked.append(f"{mod}: {plan['unknown_keys']}")
+
+    # A wrong key name here would surface as "a transport key was reported as unrecognised",
+    # which is a finding about the maps — and it would be a finding about this table. Every
+    # probe key is checked against its map first, so the two can never be confused.
+    unreal = []
+    for mod, _screen, key, _v in [
+        ("w2_map", "W2", "box1_wages", "52000"),
+        ("int_map", "INT", "box1_interest", "1200"),
+        ("div_map", "DIV", "box1a_ordinary_dividends", "1200"),
+        ("r_map", "1099", "box1_gross_distribution", "1200"),
+        ("ssa_map", "SSA", "net_benefits", "18000"),
+        ("m1098_map", "1098", "box1_mortgage_interest", "1200"),
+    ]:
+        m = importlib.import_module(mod)
+        table = next(v for v in vars(m).values()
+                     if isinstance(v, dict)
+                     and any(isinstance(x, dict) and "field_no" in x for x in v.values()))
+        if key not in table:
+            unreal.append(f"{mod}.{key}")
+
+    checks = [
+        ("every probe key below is a real box on its screen", unreal == []),
+        ("batch_seq is transport, alongside drake_screen and doc_type",
+         "batch_seq" in TRANSPORT_KEYS and "drake_screen" in TRANSPORT_KEYS),
+        ("no screen reports a transport key as unrecognised", leaked == []),
+        ("...and one map is asserted directly, so an empty loop cannot pass",
+         importlib.import_module("m1098_map").build_plan(
+             {"drake_screen": "1098", "batch_seq": 1, "box1_mortgage_interest": "1"}
+         )["unknown_keys"] == []),
+        # The other half: a key that IS junk must still be reported.
+        ("a genuinely unknown key is still reported by name",
+         "not_a_real_box" in importlib.import_module("m1098_map").build_plan(
+             {"drake_screen": "1098", "batch_seq": 1, "not_a_real_box": "x"}
+         )["unknown_keys"]),
+    ]
+    return _table("watch folder: transport keys are not values, and junk still is", checks)
+
+
+
+def case_screen_link_from_a_form_returns_to_the_menu():
+    """A screen link clicked from a FORM opens Drake's record chooser, not the screen.
+
+    Measured 2026-08-15 on a return holding several records per screen:
+
+        clicked from the Data Entry Menu -> the screen opens
+        clicked from a form screen       -> 'Existing Forms List' opens: a chooser listing
+                                            every existing record plus 'New Record'
+
+    `open_screen` used to click the link from wherever it happened to be, on the measurement
+    that every link is present and enabled in every state. They are. What they DO is not the
+    same, and that is the half the measurement missed.
+
+    It was invisible for as long as documents went in one at a time, because every one of
+    those runs starts from the menu. A BATCH opens every document after the first from the
+    form the previous one just finished — so the second document of every batch would meet
+    the chooser, the heading would never appear, and the run would halt having entered
+    exactly one document.
+
+    Not answered by teaching the agent to drive the chooser: every row on it is a record in
+    a live return, and picking the wrong one overwrites somebody's 1099 instead of adding
+    one. Answered by going back to the menu, where the link does what it says."""
+    from drake_nav import open_screen
+
+    LINKS = ["W2|Wages", "INT|1099-INT, Interest Income", "DIV|1099-DIV, Dividend Income"]
+    HEADINGS = {
+        "W2": "Form W-2 Wage and Tax Statement",
+        "INT": "Schedule B - Interest Income (1099-INT)",
+    }
+
+    class _Drake:
+        """A Drake that shows the record chooser when a link is clicked from a form."""
+
+        def __init__(self, start_kind, chooser_from_form=True):
+            self.kind = start_kind
+            self.open_screen_code = "INT" if start_kind == "form" else None
+            self.chooser = False
+            self.chooser_from_form = chooser_from_form
+            self.escapes = 0
+
+        def nav_data_entry_window(self):
+            return {"hwnd": 1, "title": "Data Entry (123456789 - fynn, Test)", "kind": self.kind}
+
+        def nav_all_elements(self):
+            els = [{"automation_id": f"LINK_0_Col0_Sel{i}", "name": n, "control_type": "Button"}
+                   for i, n in enumerate(LINKS)]
+            els.append({"automation_id": "TAB_0", "name": "General", "control_type": "TabItem"})
+            # The chooser is a separate window: the SCREEN's heading is simply absent while
+            # it is up, which is exactly how the live failure presented.
+            if self.open_screen_code and not self.chooser:
+                els.append({"automation_id": "Label_6", "control_type": "Text",
+                            "name": HEADINGS[self.open_screen_code]})
+            return els
+
+        def nav_act(self, element, want="invoke"):
+            code = str((element or {}).get("name") or "").split("|")[0]
+            if self.kind == "form" and self.chooser_from_form:
+                self.chooser = True          # Drake asks which record; no screen opens
+            else:
+                self.open_screen_code = code
+                self.kind = "form"
+            return {"ok": True, "how": "invoke", "error": None}
+
+        def press(self, keys):
+            if any(str(k).lower() == "esc" for k in keys):
+                self.escapes += 1
+                self.kind = "menu"
+                self.open_screen_code = None
+            return None
+
+        def _detect_unexpected_dialog(self):
+            return None
+
+    quiet = lambda *a, **k: None
+
+    # The batch's second document: a form is open, and the next screen must still open.
+    from_form = _Drake("form")
+    got_form = open_screen(from_form, "W2", timeout=2.0, log=quiet)
+
+    # The first document: already on the menu, and nothing should be closed for nothing.
+    from_menu = _Drake("menu")
+    got_menu = open_screen(from_menu, "W2", timeout=2.0, log=quiet)
+
+    # If Escape cannot get back to the menu, refuse — never click into the chooser anyway.
+    class _Stuck(_Drake):
+        def press(self, keys):
+            return None                       # Escape does nothing; still on the form
+
+    stuck = _Stuck("form")
+    got_stuck = open_screen(stuck, "W2", timeout=2.0, log=quiet)
+
+    checks = [
+        ("a screen opened from a FORM still opens", got_form["ok"] is True),
+        ("...by closing the previous screen first", from_form.escapes >= 1),
+        ("...so Drake's record chooser never appears", from_form.chooser is False),
+        ("...and it is the requested screen that is open", from_form.open_screen_code == "W2"),
+        ("from the MENU nothing is closed for nothing", from_menu.escapes == 0),
+        ("...and the screen still opens", got_menu["ok"] is True),
+        ("if the way back to the menu is blocked, it REFUSES", got_stuck["ok"] is False),
+        ("...saying why, in terms of the chooser",
+         "record chooser" in str(got_stuck.get("reason", ""))),
+        ("...and nothing was clicked", stuck.chooser is False and stuck.open_screen_code == "INT"),
+    ]
+    return _table("navigation: a screen link from a form opens a chooser, not the screen", checks)
+
+
+
+def case_record_chooser():
+    """Drake's record chooser: read it, refuse a duplicate, never pick a row at random.
+
+    Opening a repeatable screen that already holds records does not always open the screen —
+    Drake may put up 'Existing Forms List', a grid of every existing record plus a 'New
+    Record' row. Measured 2026-08-15/16: it appeared for a W-2 screen holding two records and
+    NOT for an INT screen holding five, so neither "more than one record" nor "clicked from a
+    form" predicts it. It is handled wherever it appears rather than predicted.
+
+    THE CHOOSER MAKES THE DUPLICATE CHECK STRONGER, which is the only basis on which a safety
+    gate is allowed to change. Until now the check could read only the ONE record that
+    happened to be open: a client's third identical 1099-INT was caught if that record was in
+    front of us and missed otherwise. The chooser lists every record on the screen, so the
+    payer is checked against all of them before anything is opened.
+
+    And Open is never pressed on 'whatever is selected'. Every row is a record in a live
+    return; the wrong one puts this document's values on top of somebody else's."""
+    import drake_nav as nav
+
+    W2_ROWS = [
+        ["#", "TS", "Employer Name", "Wages, Tips", "Federal Tax Withholding"],
+        ["1", "T", "navigation test employer", "52000", "6000"],
+        ["2", "T", "test employer llc", "52000", "6000"],
+        ["New", "New Record", "", "", ""],
+    ]
+
+    class _Row:
+        """A grid row as pywinauto really hands it back: ALREADY WRAPPED.
+
+        Deliberately has NO `wrapper_object`. The first version of this stub had one, so
+        `item.wrapper_object().select()` passed here and raised AttributeError against live
+        Drake — swallowed by an outer except, leaving the row unselected, Open unpressed, and
+        the run reporting that Drake's list "was answered". A stub that answers to whatever
+        it is called is worse than no stub: it certifies the one thing it cannot see."""
+
+        def __init__(self, cells):
+            self.cells = cells
+            self.selected = False
+
+        def descendants(self, control_type=None):
+            return [_Cell(c) for c in self.cells]
+
+        def select(self):
+            self.selected = True
+
+    class _Cell:
+        def __init__(self, t):
+            self.t = t
+
+        def window_text(self):
+            return self.t
+
+    class _Btn:
+        def __init__(self, owner, name):
+            self.owner, self.name = owner, name
+
+        def wrapper_object(self):
+            return self
+
+        def invoke(self):
+            self.owner.pressed = self.name
+
+    class _Chooser:
+        def __init__(self, rows):
+            self.rows = [_Row(r) for r in rows]
+            self.pressed = None
+
+        def descendants(self, control_type=None):
+            return self.rows if control_type == "DataItem" else []
+
+        def child_window(self, auto_id=None, control_type=None):
+            return _Btn(self, auto_id)
+
+    class _Driver:
+        def __init__(self, chooser):
+            self.chooser = chooser
+
+        class _App:
+            def __init__(self, outer):
+                self.outer = outer
+
+            def window(self, handle=None):
+                return self.outer.chooser
+
+        @property
+        def app(self):
+            return _Driver._App(self)
+
+    quiet = lambda *a, **k: None
+
+    # Taking a NEW record: the New row is selected explicitly, then Open pressed.
+    ch = _Chooser(W2_ROWS)
+    took = nav.resolve_forms_list(_Driver(ch), 1, take_new=True, log=quiet)
+    new_row_selected = ch.rows[-1].selected
+    other_rows_selected = any(r.selected for r in ch.rows[:-1])
+
+    # Refusing: Cancel, and Open is never touched.
+    ch2 = _Chooser(W2_ROWS)
+    left = nav.resolve_forms_list(_Driver(ch2), 1, take_new=False, log=quiet)
+
+    # A chooser with no New row cannot be answered without overwriting somebody.
+    ch3 = _Chooser(W2_ROWS[:-1])
+    stuck = nav.resolve_forms_list(_Driver(ch3), 1, take_new=True, log=quiet)
+
+    checks = [
+        # The shape that caused the live failure, asserted directly so it cannot come back.
+        ("a grid row is already wrapped — calling .wrapper_object() on one would fail",
+         not hasattr(_Row(["New"]), "wrapper_object")),
+        # --- the duplicate check, now against EVERY record on the screen ---------------
+        ("a payer already on the screen is found", len(nav.forms_list_matches(W2_ROWS, "test employer llc")) == 1),
+        ("...however Drake reformatted it when it stored it",
+         len(nav.forms_list_matches(W2_ROWS, "Test Employer, L.L.C.")) == 1),
+        ("a payer that is new to this return is not a duplicate",
+         nav.forms_list_matches(W2_ROWS, "first national bank") == []),
+        ("an empty id never matches anything, so a missing payer is not 'a duplicate'",
+         nav.forms_list_matches(W2_ROWS, "") == []),
+        ("the header row is never treated as a record",
+         nav.forms_list_matches(W2_ROWS, "Employer Name") == []),
+        # --- answering it ---------------------------------------------------------------
+        ("taking a new record selects the NEW row", took["ok"] and new_row_selected),
+        ("...and no existing record is ever selected", not other_rows_selected),
+        ("...then presses Open", ch.pressed == nav.FORMS_LIST_OPEN_ID),
+        ("refusing presses Cancel", left["ok"] and ch2.pressed == nav.FORMS_LIST_CANCEL_ID),
+        ("...and never Open", ch2.pressed != nav.FORMS_LIST_OPEN_ID),
+        ("a chooser with no 'New Record' row is REFUSED, not guessed at",
+         stuck["ok"] is False and ch3.pressed is None),
+        ("...saying so in terms of what it would have had to overwrite",
+         "overwrite" in str(stuck.get("reason", ""))),
+    ]
+    return _table("Drake's record chooser: read it, and let it strengthen the duplicate check", checks)
+
+
+
+def case_chooser_duplicate_decision():
+    """Is this document ALREADY on the return? Decided against every record, not just one.
+
+    The mutation harness found this one, and it is worth saying how: the matching helper in
+    drake_nav was covered, so `record_chooser` was green — but the DECISION that calls it sat
+    inline in `_navigate_for_payload`, and deleting it left every test passing. A guard whose
+    mutant survives has no test, however well its parts are covered.
+
+    TWO IDENTIFIERS, and the second is not redundant. The chooser prints a NAME; the dedupe
+    key is an ID. A W-2 chooser's columns are '#, TS, Employer Name, Wages…' — no EIN
+    anywhere — so an id-only comparison would never fire on the screen where doubling
+    somebody's wages is easiest.
+
+    What is at stake: entering a second copy doubles a client's income on their return, and
+    every read-back and form check would pass, because Drake really did accept every value."""
+    from agent import _chooser_duplicates
+
+    W2_ROWS = [
+        ["#", "TS", "Employer Name", "Wages, Tips"],
+        ["1", "T", "navigation test employer", "52000"],
+        ["2", "T", "test employer llc", "52000"],
+        ["New", "New Record", "", ""],
+    ]
+    INT_ROWS = [
+        ["#", "Name", "Interest Income"],
+        ["1", "first national test bank", "1000"],
+        ["New", "New Record", ""],
+    ]
+
+    w2_target = {"ein": "12-3456789", "screen": "W2"}
+    int_target = {"ein": "98-7654321", "screen": "INT"}
+
+    checks = [
+        # The name path — the only one a W-2 chooser can answer, since it prints no EIN.
+        ("an employer already on the screen is caught by NAME",
+         _chooser_duplicates(W2_ROWS, w2_target, {"employer_name": "TEST EMPLOYER LLC"}) != []),
+        ("...however Drake reformatted it when it stored it",
+         _chooser_duplicates(W2_ROWS, w2_target, {"employer_name": "Test Employer, L.L.C."}) != []),
+        ("a payer new to this return is not a duplicate",
+         _chooser_duplicates(W2_ROWS, w2_target, {"employer_name": "brand new employer"}) == []),
+        # The id path, for the screens whose chooser does print one.
+        ("a payer already on the screen is caught by ID",
+         _chooser_duplicates([["#", "TIN"], ["1", "98-7654321"], ["New", "New Record"]],
+                             int_target, {}) != []),
+        # Each form's own name key, so a new screen cannot quietly fall through the check.
+        ("the 1099 screens are checked on payer_name",
+         _chooser_duplicates(INT_ROWS, int_target,
+                             {"payer_name": "FIRST NATIONAL TEST BANK"}) != []),
+        ("the 1098 screen is checked on lender_name",
+         _chooser_duplicates([["#", "Name"], ["1", "first test mortgage bank"], ["New", "New Record"]],
+                             {"ein": ""}, {"lender_name": "First Test Mortgage Bank"}) != []),
+        # Nothing to compare is NOT proof of newness — but it must not invent a match either.
+        ("a payload with no id and no name matches nothing",
+         _chooser_duplicates(W2_ROWS, {"ein": ""}, {}) == []),
+        ("an empty chooser matches nothing",
+         _chooser_duplicates([], w2_target, {"employer_name": "test employer llc"}) == []),
+        ("the header row is never mistaken for a record",
+         _chooser_duplicates(W2_ROWS, {"ein": ""}, {"employer_name": "Employer Name"}) == []),
+        ("what is returned is the matching ROW, so the refusal can name it",
+         _chooser_duplicates(W2_ROWS, w2_target,
+                             {"employer_name": "test employer llc"})[0][2] == "test employer llc"),
+    ]
+    return _table("the record chooser: is this document already on the return?", checks)
+
+
 def main() -> int:
     # The suite prints '⚠' and '·', and a REDIRECTED stdout on Windows is cp1252 — which
     # raised UnicodeEncodeError inside the driver, was caught by headsdown_type's outer
@@ -3828,6 +4359,12 @@ def main() -> int:
         ('m1098_full_coverage_plan', lambda: case_m1098_full_coverage_plan()),
         ('m1098_menu_tab_walk', lambda: case_m1098_menu_tab_walk()),
         ('form_dispatch', lambda: case_form_dispatch()),
+        ('payload_target_screens', lambda: case_payload_target_covers_every_screen()),
+        ('batch_queue_order', lambda: case_batch_queue_order()),
+        ('batch_transport_keys', lambda: case_transport_keys_are_not_values()),
+        ('nav_menu_first', lambda: case_screen_link_from_a_form_returns_to_the_menu()),
+        ('record_chooser', lambda: case_record_chooser()),
+        ('record_chooser_duplicate', lambda: case_chooser_duplicate_decision()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),
         ('caret_rearm_impossible_halts', lambda: case_rearm_that_cannot_work_halts_clean()),

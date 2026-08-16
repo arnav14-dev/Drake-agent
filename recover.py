@@ -25,7 +25,7 @@ nothing here knows which you want.
 Esc on a Drake data-entry screen SAVES and closes it, so data already entered is kept.
 
     python recover.py            # report only: what is open, and whether anything blocks
-    python recover.py --go       # leave grid mode, then Esc back to the Data Entry Menu
+    python recover.py --go       # cancel record choosers, leave grid mode, Esc back to the menu
 
 Nothing here types a value into a return, and this agent has no file/e-file command.
 """
@@ -80,6 +80,56 @@ def _blocker(d):
         return None
 
 
+# Drake's record chooser. It appears on a repeatable screen that already has records, it is
+# NOT a data-entry canvas, and this tool used to walk straight past it — so a halted run left
+# one open and every later navigation stacked another behind it instead of opening a screen.
+FORMS_LIST_TITLE = "Existing Forms List"
+# Measured 2026-08-15 off the live chooser. Ids, not labels: a label is localised.
+CANCEL_BUTTON_ID = "MultiInstanceSelectionWindow_ButtonCancel"
+OPEN_BUTTON_ID = "MultiInstanceSelectionWindow_ButtonOpen"
+
+
+def cancel_forms_lists(d, act: bool) -> int:
+    """Close any 'Existing Forms List' chooser. Returns how many were found.
+
+    CANCEL, never Open. Open picks whatever row happens to be selected, and every row on this
+    chooser is a record in a real client's return — the wrong one adds a duplicate 1099 or
+    overwrites a real one. Cancel is the only answer that cannot change a return.
+
+    Driven through UIA, not win32. This window is pure WPF: it has NO win32 child windows
+    carrying text at all, so a button hunt through EnumChildWindows finds nothing and reports
+    success having pressed nothing. Its buttons do carry exact automation ids, which is a
+    better handle than a label anyway — a label is localised, an id is not.
+    """
+    found = 0
+    for hwnd in _forms_list_hwnds(d):
+        title = d.nav_window_title(hwnd) if hasattr(d, "nav_window_title") else ""
+        print(f"   record chooser open: {str(title).strip()!r}")
+        found += 1
+        if not act:
+            continue
+        try:
+            win = d.app.window(handle=int(hwnd))
+            btn = win.child_window(auto_id=CANCEL_BUTTON_ID, control_type="Button")
+            btn.wrapper_object().invoke()
+            print("      cancelled")
+        except Exception as e:
+            print(f"      could not cancel it: {type(e).__name__}: {e}")
+        time.sleep(0.4)
+    return found
+
+
+def _forms_list_hwnds(d) -> list:
+    from drake_driver import _enum_toplevel_windows
+    try:
+        pid = int(d.pid or d.win.element_info.process_id)
+        return [int(w["hwnd"]) for w in _enum_toplevel_windows(pid)
+                if w.get("visible")
+                and FORMS_LIST_TITLE.lower() in (w.get("title") or "").lower()]
+    except Exception:
+        return []
+
+
 def _buttons_of(hwnd) -> list:
     if not hwnd:
         return []
@@ -100,6 +150,7 @@ def report(d) -> list:
         print(f"   hwnd={s['hwnd']:<10} {what:<18} {s['controls']} controls")
     b = _blocker(d)
     print(f"blocking modal: {b['summary'] if b else 'none'}")
+    cancel_forms_lists(d, act=False)
     return state
 
 
@@ -170,6 +221,9 @@ def main() -> int:
         print(f"\nREPORT ONLY — nothing was pressed. Re-run with --go to press "
               f"{GRID_MODE_TOGGLE_KEY} and Esc back to the menu.")
         return 0
+    # The record chooser first: it is not a data-entry canvas, so the unwind below walks
+    # straight past it, and a leftover one swallows every later attempt to open a screen.
+    cancel_forms_lists(d, act=True)
     if not leave_grid_mode(d):
         return 1
     ok = unwind_to_menu(d)

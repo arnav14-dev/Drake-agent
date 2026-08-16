@@ -26,6 +26,7 @@ from typing import Optional
 # reasons only. IMPORTED, never copied: two implementations of "what does this value mean"
 # is exactly the drift that puts a wrong number in a real return.
 from w2_map import (  # noqa: F401
+    TRANSPORT_KEYS,
     sanitize as _w2_sanitize,
     _clean_money,
     _clean_text,
@@ -335,7 +336,7 @@ def build_plan(payload: dict, spec: FormSpec, *, checkbox_token: str = "X",
             payload[k] = v
 
     for key, raw in payload.items():
-        if key.startswith("_") or key in ("drake_screen", "doc_type"):
+        if key.startswith("_") or key in TRANSPORT_KEYS:
             continue
         if key in spec.identity_keys:
             identity.append(key)
