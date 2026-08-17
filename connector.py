@@ -404,6 +404,9 @@ def cmd_run(args) -> int:
                 print(f"  report held on disk and will be retried: {path}", file=sys.stderr)
 
             print("Values are IN Drake but NOT filed: a human still reviews and executes.")
+            if args.once:
+                print("\n--once: that job is reported. Stopping.")
+                return 0 if report.get("ok") else 2
             if not report.get("ok"):
                 print("\nThat document did not complete cleanly. Nothing further will be "
                       "handed to this machine until somebody reviews it in the portal.",
@@ -414,7 +417,12 @@ def cmd_run(args) -> int:
             return 0
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI, exposed so the simulator can check the real thing.
+
+    A test that rebuilds a copy of this parser proves nothing about the parser the connector
+    actually runs — delete the `parents=[...]` below and a copy-based test stays green while
+    the connector goes back to crashing on its first job in front of a live Drake."""
     p = argparse.ArgumentParser(
         prog="connector.py",
         description="Fynn Drake connector — takes work from Fynn and enters it into Drake.",
@@ -432,16 +440,24 @@ def main(argv=None) -> int:
     ss = sub.add_parser("status", help="is this machine paired, and can it reach Fynn?")
     ss.set_defaults(func=cmd_status)
 
-    sr = sub.add_parser("run", help="take work and enter it into Drake")
+    # INHERITED, not re-declared. The entry path is shared with the folder watcher, so the
+    # options it reads are shared too — declaring them here by hand is what put a connector
+    # in front of a live Drake missing `--nav-timeout`, which crashed it on its first job.
+    import agent as _agent_opts
+    sr = sub.add_parser("run", parents=[_agent_opts.entry_options_parser()],
+                        help="take work and enter it into Drake")
     sr.add_argument("--binding", default="binding.json")
-    sr.add_argument("--no-navigate", action="store_true",
-                    help="do not open the client/screen — enter into whatever is in front "
-                         "(for debugging only; the identity check is what this skips)")
     sr.add_argument("--slow", action="store_true", help="slower keystrokes so you can watch")
     sr.add_argument("--dry-run", action="store_true", help="plan and report, type nothing")
+    sr.add_argument("--once", action="store_true",
+                    help="do the job that is waiting, report it, then exit — what to use for a test")
     sr.set_defaults(func=cmd_run)
 
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
     return args.func(args)
 
 

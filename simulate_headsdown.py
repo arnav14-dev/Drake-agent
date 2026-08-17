@@ -4237,6 +4237,79 @@ def case_record_chooser():
 
 
 
+
+def case_connector_entry_options():
+    """Does the CONNECTOR's parser produce every option the entry path reads?
+
+    Found the hard way, in front of a live Drake. `_run_one_payload` is shared by the folder
+    watcher and the cloud connector so that neither can skip a field map, a read-back gate or
+    a halt rule. Sharing the CODE without sharing the OPTIONS left the connector's parser
+    defining four of the nine attributes that code reads, and the first job it ever claimed
+    died instantly on `args.nav_timeout` (2026-08-17).
+
+    What made it worse than a crash: the job was already marked running on the server, so the
+    firm-wide halt guard fired and blocked everything until a human cleared it. Nothing was
+    typed only because navigation happens before entry — an option read three fields into a
+    W-2 would have stopped halfway through somebody's return.
+
+    So this compares what the code READS against what the parsers PRODUCE. Purely static: no
+    Drake, no server, runs anywhere."""
+    import argparse
+    import ast
+    import io
+    import os
+
+    import agent
+
+    src = io.open(os.path.join(os.path.dirname(os.path.abspath(agent.__file__)), "agent.py"),
+                  encoding="utf-8").read()
+    tree = ast.parse(src)
+    entry_fns = {"_run_one_payload", "_navigate_for_payload", "_enter_one_payload"}
+    needed = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in entry_fns:
+            for n in ast.walk(node):
+                if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                        and n.value.id == "args"):
+                    needed.add(n.attr)
+
+    shared = vars(agent.entry_options_parser().parse_args([]))
+
+    # THE REAL PARSER, imported — not a copy rebuilt here. A copy proves nothing about the
+    # parser the connector actually runs: delete `parents=[...]` from connector.py and a
+    # copy-based check stays green while the connector goes back to crashing on its first
+    # job in front of a live Drake. That is the whole failure this case exists for.
+    import connector
+    produced = set(vars(connector.build_parser().parse_args(["run"])))
+
+    missing_shared = sorted(needed - set(shared))
+    missing_conn = sorted(needed - produced)
+
+    checks = [
+        ("the entry path reads the options we think it does", len(needed) >= 8),
+        (f"the shared parser covers every one (missing: {missing_shared or 'none'})",
+         not missing_shared),
+        (f"the connector produces every one (missing: {missing_conn or 'none'})",
+         not missing_conn),
+        # Named explicitly: this is the one that crashed in front of a live Drake.
+        ("nav_timeout, the attribute that crashed the first live run", "nav_timeout" in produced),
+        ("and it carries a real default rather than None",
+         isinstance(shared.get("nav_timeout"), float)),
+        # Defaults must MATCH the folder watcher's. If they drift, the same document entered
+        # through the two transports behaves differently — the precise failure that sharing
+        # the entry path exists to prevent.
+        ("zero-value money fields are skipped by default, as on the watcher",
+         shared.get("include_zeros") is False),
+        ("navigation — and with it the identity check — is ON by default",
+         shared.get("no_navigate") is False),
+        ("a client Drake has never seen is REFUSED by default, never created",
+         shared.get("create") is False),
+        ("Ctrl+N is injected by scancode, which is what Drake accepts",
+         shared.get("toggle_method") == "scancode"),
+    ]
+    return _table("the connector inherits every option the entry path reads", checks)
+
+
 def case_chooser_duplicate_decision():
     """Is this document ALREADY on the return? Decided against every record, not just one.
 
@@ -4365,6 +4438,7 @@ def main() -> int:
         ('nav_menu_first', lambda: case_screen_link_from_a_form_returns_to_the_menu()),
         ('record_chooser', lambda: case_record_chooser()),
         ('record_chooser_duplicate', lambda: case_chooser_duplicate_decision()),
+        ('connector_entry_options', lambda: case_connector_entry_options()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),
         ('caret_rearm_impossible_halts', lambda: case_rearm_that_cannot_work_halts_clean()),

@@ -1122,6 +1122,56 @@ def _enter_one_payload(driver, payload: dict, args, *, token: str) -> dict:
     return report
 
 
+def entry_options_parser():
+    """Every option the shared entry path reads off `args`, defined in ONE place.
+
+    `_run_one_payload` is shared by the folder watcher and the cloud connector, so the
+    OPTIONS it reads have to be shared too. They were not: the connector's parser defined
+    four of them, the entry path reads nine, and the first live run against Drake died on
+    `args.nav_timeout` the instant it claimed a job — after marking the job as running on
+    the server, which then blocked the whole firm.
+
+    Nothing was typed, because the crash happened during navigation. That is luck, not
+    design: an option read later, in the middle of entering fields, would have stopped
+    halfway through a return.
+
+    A parser both callers inherit means adding an option to the entry path cannot silently
+    break one of its two callers. `case_connector_entry_options` in the simulator checks
+    this holds by comparing what the code READS against what the parsers PRODUCE.
+    """
+    import argparse
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--ts", choices=["T", "S", "J"],
+                   help="whose documents these are (field 1), when the payload does not say. "
+                        "J (joint) is valid on the 1099 screens only — the W-2 screen's "
+                        "selector is TS and refuses it")
+    p.add_argument("--allow-rejected", dest="allow_rejected", action="store_true",
+                   help="enter the rest even when some extracted values could not be resolved "
+                        "(they stay blank for you to key by hand)")
+    p.add_argument("--include-zeros", action="store_true",
+                   help="also enter money fields that are zero (default: skip — a blank box "
+                        "is zero on a tax form)")
+    p.add_argument("--toggle-method", dest="toggle_method",
+                   choices=["scancode", "vkhold", "pywinauto"], default="scancode",
+                   help="how Ctrl+N is injected (default scancode — what Drake accepts)")
+    p.add_argument("--settle-after", dest="settle_after", type=float, default=0.15,
+                   help="seconds to let Drake settle after each field")
+    p.add_argument("--no-navigate", dest="no_navigate", action="store_true",
+                   help="do NOT open the client and screen — type into whatever a human "
+                        "already opened. The identity check goes away with it")
+    p.add_argument("--nav-timeout", dest="nav_timeout", type=float, default=12.0,
+                   help="seconds to wait for each Drake window while navigating")
+    p.add_argument("--create", dest="create", action="store_true",
+                   help="create a client Drake has never seen instead of refusing. OFF by "
+                        "default: clients are created by a human, and a run that refuses tells "
+                        "the operator which SSN was missing rather than quietly opening a new "
+                        "empty return")
+    p.add_argument("--no-new-record", dest="no_new_record", action="store_true",
+                   help="refuse instead of pressing Page Down when the open record already "
+                        "has another payer on it")
+    return p
+
+
 def _run_one_payload(driver, payload: dict, args, token: str) -> dict:
     """Navigate to this payload's screen, enter it, and report what happened.
 
