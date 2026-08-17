@@ -2455,6 +2455,8 @@ def case_nav_record_safety():
     no read-back would catch it — every value would verify perfectly."""
     from drake_nav import parse_record_position, plan_record_use
     blank = {"ok": True, "index": 1, "count": 1, "populated": 0, "values": []}
+    # FAKE employer, and it must stay fake — this file is in a PUBLIC repository and this
+    # fixture held a real client's employer EIN and trading name until 2026-08-17.
     occupied = {"ok": True, "index": 1, "count": 1, "populated": 3, "values": [
         {"value": "00-1112222"}, {"value": "test employer llc"}, {"value": "29477"}]}
     unreadable = {"ok": False, "reason": "the form's control tree could not be read",
@@ -2843,6 +2845,11 @@ def case_form_dispatch():
         ag._load_form_map("99N")
     except ValueError as e:
         unknown = str(e)
+    # FAKE identifiers, and they must stay fake. This file is committed to a PUBLIC
+    # repository: a real SSN, EIN or client name in a test fixture is a disclosure, and it
+    # is permanent the moment it is pushed. Caught on 2026-08-17 with a live taxpayer's SSN
+    # and surname sitting in this very line, one `git push` away from being world-readable.
+    # Use 000-11-2222 / 00-1112222 and a name nobody has.
     w2_target = ag._payload_target({"employee_ssn": "000112222", "employer_ein": "001112222",
                                     "employee_first_name": "Test", "employee_last_name": "Taxpayer"})
     int_target = ag._payload_target({"drake_screen": "INT", "recipient_tin": "123456789",
