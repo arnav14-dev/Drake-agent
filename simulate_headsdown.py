@@ -4430,6 +4430,131 @@ def case_connector_exe_carries_every_form():
     return _table("the packaged exe carries every field map", checks)
 
 
+def case_connector_network_death():
+    """Does a dying network dial retry — or does it kill the connector?
+
+    The failure this replays is not hypothetical: on the first day a person ran the
+    connector unattended, the held long poll's READ timed out while the server restarted
+    under a deploy, `TimeoutError` sailed past handlers written for `HTTPError`/`URLError`,
+    and the whole process died with a traceback on a window nobody could see. The office's
+    view of that failure mode is "nothing has gone into Drake since Tuesday".
+
+    The contract under test: `_request` converts EVERY way a network dies into
+    `ServerError`, because `ServerError` is the one exception the run loop treats as
+    "wait and ask again". These are real calls through the real `_request` with only
+    `urlopen` swapped — a source grep would pass on an except clause that catches the
+    wrong thing.
+
+    The last two checks cover the loop itself: whatever still escapes must hit a
+    catch-all that continues, and that catch-all must come AFTER KeyboardInterrupt —
+    swap the order and Ctrl+C becomes just another "unexpected error, continuing"."""
+    import http.client as hc
+    import io
+    import json as jsonmod
+    import os
+    import urllib.error
+    import urllib.request
+
+    import connector
+
+    def raises_server_error(exc) -> bool:
+        real = urllib.request.urlopen
+
+        def dying(*a, **k):
+            raise exc
+
+        urllib.request.urlopen = dying
+        try:
+            connector._request("https://example.invalid", "/x", timeout=1)
+            return False  # no exception at all — impossible, but never "pass"
+        except connector.ServerError:
+            return True
+        except Exception:
+            return False  # the crash the exe shipped with
+        finally:
+            urllib.request.urlopen = real
+
+    class _FakeResp:
+        """Just enough of a response for `_request` to read a body from."""
+        def __init__(self, raw: bytes):
+            self._raw = raw
+        def read(self) -> bytes:
+            return self._raw
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def garbage_body_is_server_error() -> bool:
+        real = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: _FakeResp(b"<html>hotel wifi login</html>")
+        try:
+            connector._request("https://example.invalid", "/x", timeout=1)
+            return False
+        except connector.ServerError:
+            return True
+        except Exception:
+            return False
+        finally:
+            urllib.request.urlopen = real
+
+    here = os.path.dirname(os.path.abspath(connector.__file__))
+    src = io.open(os.path.join(here, "connector.py"), encoding="utf-8").read()
+    loop = src.split("def cmd_run(", 1)[-1].split("def build_parser(", 1)[0]
+    kb = loop.find("except KeyboardInterrupt")
+    # NOT the first `except Exception` — the entry section has its own (it converts a
+    # mid-document crash into a reported halt, and it sits earlier in the function). The
+    # last-line net is the one that comes AFTER the KeyboardInterrupt handler.
+    net = loop.find("except Exception", kb) if kb >= 0 else -1
+
+    checks = [
+        ("a read timeout retries instead of crashing (the shipped bug)",
+         raises_server_error(TimeoutError("The read operation timed out"))),
+        ("a connection reset retries",
+         raises_server_error(ConnectionResetError(10054, "reset by peer"))),
+        ("a server that hangs up mid-response retries",
+         raises_server_error(hc.RemoteDisconnected("closed connection without response"))),
+        ("a half-broken HTTP response retries",
+         raises_server_error(hc.BadStatusLine("garbage"))),
+        ("plain OS-level socket failure retries",
+         raises_server_error(OSError(64, "host is down"))),
+        ("and the errors it already knew still work",
+         raises_server_error(urllib.error.URLError("dns says no"))),
+        ("a proxy answering with HTML instead of JSON retries",
+         garbage_body_is_server_error()),
+        ("HTTP errors still carry their status",
+         (lambda: (lambda f: f())(lambda: _http_error_status(connector)))()),
+        ("the run loop has a last-line catch-all", net >= 0),
+        ("...that cannot swallow Ctrl+C (KeyboardInterrupt handled first)",
+         0 <= kb < net),
+    ]
+    return _table("a dying network dial retries, never crashes", checks)
+
+
+def _http_error_status(connector) -> bool:
+    """A real HTTPError still becomes a ServerError WITH its status code — the loop's
+    401 branch (re-pair, do not retry forever) depends on that surviving the rewrite."""
+    import io as iomod
+    import urllib.error
+    import urllib.request
+
+    real = urllib.request.urlopen
+
+    def dying(*a, **k):
+        raise urllib.error.HTTPError("https://x", 401, "nope", {}, iomod.BytesIO(b"{}"))
+
+    urllib.request.urlopen = dying
+    try:
+        connector._request("https://example.invalid", "/x", timeout=1)
+        return False
+    except connector.ServerError as e:
+        return e.status == 401
+    except Exception:
+        return False
+    finally:
+        urllib.request.urlopen = real
+
+
 def case_connector_tray_state():
     """Does the tray icon show a HALT, or does it show "waiting for work"?
 
@@ -4640,6 +4765,7 @@ def main() -> int:
         ('record_chooser_duplicate', lambda: case_chooser_duplicate_decision()),
         ('connector_entry_options', lambda: case_connector_entry_options()),
         ('connector_exe_forms', lambda: case_connector_exe_carries_every_form()),
+        ('connector_network_death', lambda: case_connector_network_death()),
         ('connector_tray_state', lambda: case_connector_tray_state()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),

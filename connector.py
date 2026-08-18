@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+import http.client
 import json
 import os
 import subprocess
@@ -222,6 +223,18 @@ def _request(server: str, path: str, token: str | None = None, body: dict | None
         # No network, DNS failure, TLS problem, server down. NOT a Drake problem — the
         # caller retries rather than treating it as a halt.
         raise ServerError(f"could not reach {server}: {e.reason}") from e
+    except (TimeoutError, OSError, http.client.HTTPException) as e:
+        # The connection died MID-RESPONSE: the read timed out, the server restarted
+        # under a deploy, a proxy cut an idle line. For a long poll this is ROUTINE — a
+        # held request is exactly the kind a middlebox kills — and it crashed the whole
+        # connector the first day a person ran it unattended (TimeoutError escaped raw,
+        # 2026-08-18). Ordering matters: URLError is itself an OSError, so its more
+        # specific handler above must come first.
+        raise ServerError(f"connection to {server} dropped: {type(e).__name__}: {e}") from e
+    except json.JSONDecodeError as e:
+        # A captive portal or interfering proxy answered with HTML. Retryable, like
+        # every other "the network did something" — never a crash.
+        raise ServerError(f"unreadable response from {server}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +702,23 @@ def cmd_run(args) -> int:
         except KeyboardInterrupt:
             print("\nstopped.")
             return 0
+        except Exception as e:  # noqa: BLE001 — the last line of defence, deliberately broad
+            # THE SERVICE MUST OUTLIVE THE SURPRISE. This program sits unattended through
+            # a filing season; any exception that reaches here would otherwise kill it
+            # silently (the window is invisible) and the office would find out days later
+            # as "nothing has gone into Drake since Tuesday".
+            #
+            # Continuing is safe against the one thing that must never happen — retyping a
+            # document — because the entry section has its own handler that converts a
+            # crash into a reported halt, and the server never re-hands-out a job that is
+            # `running` or an unreviewed halt. Everything else in the loop (polling,
+            # spool delivery, Drake connection) is idempotent.
+            print(f"unexpected error — continuing in 10s ({type(e).__name__}: {e})",
+                  file=sys.stderr)
+            _state("offline", f"{type(e).__name__}: {e}"[:80])
+            # The driver may be mid-something unknowable; drop it and reconnect fresh.
+            driver = None
+            time.sleep(10)
 
 
 def build_parser() -> argparse.ArgumentParser:
