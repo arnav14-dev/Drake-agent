@@ -10,3 +10,7 @@ pytesseract>=0.3.10
 pillow>=10.0.0
 # connect mode only (live link to Fynn):
 websocket-client>=1.6.0
+
+# packaging only — builds FynnConnector.exe from connector.spec; not needed to run the
+# agent from a checkout:
+pyinstaller>=6.0

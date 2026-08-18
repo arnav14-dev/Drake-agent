@@ -27,3 +27,8 @@ explore*.json
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# PyInstaller build output
+dist/
+build/
+*.manifest

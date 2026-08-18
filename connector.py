@@ -50,6 +50,7 @@ import argparse
 import base64
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -71,6 +72,27 @@ POLL_WAIT_SEC = 25          # server caps at 25; must stay under proxy idle time
 HTTP_TIMEOUT_SEC = 45       # generous margin over the server's hold
 RESULT_ATTEMPTS = 6         # ~2 minutes of retries before spooling
 DRAKE_RETRY_SEC = 15        # how often to look for Drake when it is not open
+
+# Name of the logon task. One per user; `install` replaces rather than duplicates.
+TASK_NAME = "FynnDrakeConnector"
+
+
+def is_frozen() -> bool:
+    """True when running from the packaged .exe rather than a checkout."""
+    return getattr(sys, "frozen", False)
+
+
+def resource_path(name: str) -> str:
+    """A file that ships INSIDE the exe (PyInstaller unpacks these to sys._MEIPASS).
+
+    A copy sitting beside the exe wins, so a firm whose Drake build needs a tweaked binding
+    can drop one in without waiting for us to cut a release.
+    """
+    beside = Path(sys.executable).parent / name if is_frozen() else Path.cwd() / name
+    if beside.is_file():
+        return str(beside)
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +225,151 @@ def cmd_unpair(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Setup, for a person with no terminal
+# ---------------------------------------------------------------------------
+
+def _ask_gui(server_default: str):
+    """A small window asking for the Fynn address and the pairing code.
+
+    tkinter, because it is in the standard library. A tray icon or a real installer UI
+    would be nicer, and both are a dependency and a build problem; what has to work on day
+    one is that somebody who has never opened a terminal can finish setup.
+
+    Returns (server, code), or None if they closed it.
+    """
+    import tkinter as tk
+    from tkinter import ttk
+
+    out = {}
+    root = tk.Tk()
+    root.title("Set up the Fynn Drake connector")
+    root.resizable(False, False)
+
+    frm = ttk.Frame(root, padding=16)
+    frm.grid()
+    ttk.Label(
+        frm,
+        text="Paste the pairing code from Fynn.\nIt works once and expires in 15 minutes.",
+        justify="left",
+    ).grid(column=0, row=0, columnspan=2, sticky="w", pady=(0, 12))
+
+    ttk.Label(frm, text="Fynn address").grid(column=0, row=1, sticky="w")
+    server = ttk.Entry(frm, width=44)
+    server.insert(0, server_default)
+    server.grid(column=1, row=1, pady=4)
+
+    ttk.Label(frm, text="Pairing code").grid(column=0, row=2, sticky="w")
+    code = ttk.Entry(frm, width=44)
+    code.grid(column=1, row=2, pady=4)
+    code.focus()
+
+    msg = ttk.Label(frm, text="", foreground="#b00")
+    msg.grid(column=0, row=4, columnspan=2, sticky="w", pady=(8, 0))
+
+    def go(*_):
+        if not code.get().strip():
+            msg.config(text="Enter the code shown in Fynn.")
+            return
+        out["server"] = server.get().strip()
+        out["code"] = code.get().strip()
+        root.destroy()
+
+    ttk.Button(frm, text="Connect", command=go).grid(column=1, row=3, sticky="e", pady=(10, 0))
+    root.bind("<Return>", go)
+    root.mainloop()
+    return (out["server"], out["code"]) if out else None
+
+
+def _tell(title: str, message: str) -> None:
+    """Say something to a person with no console. Falls back to stdout when there is one."""
+    if not is_frozen():
+        print(message)
+        return
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(title, message)
+        root.destroy()
+    except Exception:
+        print(message)
+
+
+def cmd_setup(args) -> int:
+    """Pair this machine and make it start at login — the whole install, for a normal person."""
+    cred = _cred_read()
+    default_server = (cred or {}).get("server", getattr(args, "server", "") or "")
+    asked = _ask_gui(default_server)
+    if not asked:
+        return 1
+    server, code = asked
+
+    try:
+        res = _request(server, "/api/v1/connector/pair",
+                       body={"code": code, "version": VERSION}, timeout=30)
+    except ServerError as e:
+        _tell("Fynn", f"Could not pair: {e}")
+        return 1
+    if not res.get("token"):
+        _tell("Fynn", "Could not pair: the server did not return a token.")
+        return 1
+
+    _cred_write({"server": server.rstrip("/"), "token": res["token"],
+                 "agent_id": res.get("agent_id"), "name": res.get("name")})
+
+    installed = _install_autostart()
+    started = ("This PC will start the connector automatically when you log in."
+               if installed else
+               "Pairing worked, but automatic start-up could not be set up. Start "
+               "'Fynn Connector' by hand after each restart.")
+    _tell("Fynn", f"Connected as {res.get('name')!r}.\n\n{started}\n\n"
+                  "Leave Drake open on its home screen when you want documents entered.")
+    return 0
+
+
+def _install_autostart() -> bool:
+    """Run at logon, in the user's own session.
+
+    NOT a Windows Service. Services run in session 0, which has no desktop — and this agent
+    has to SEE Drake's windows in order to drive them. A service would start, find nothing
+    to attach to, and fail forever in a way that looks exactly like a network problem.
+
+    Task Scheduler rather than a Run registry key, because it can restart a task that dies,
+    which matters for something meant to sit there for a whole filing season.
+    """
+    if is_frozen():
+        cmd = f'"{sys.executable}" run'
+    else:
+        cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}" run'
+    try:
+        subprocess.run(
+            ["schtasks", "/Create", "/F", "/TN", TASK_NAME, "/SC", "ONLOGON",
+             "/RL", "LIMITED", "/TR", cmd],
+            check=True, capture_output=True, text=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def cmd_install(args) -> int:
+    print("Start-at-login installed." if _install_autostart()
+          else "Could not install the logon task.")
+    return 0
+
+
+def cmd_uninstall(args) -> int:
+    try:
+        subprocess.run(["schtasks", "/Delete", "/F", "/TN", TASK_NAME],
+                       check=True, capture_output=True, text=True)
+        print("Start-at-login removed.")
+    except Exception:
+        print("No logon task was installed.")
+    return 0
+
+
 def cmd_status(args) -> int:
     cred = _cred_read()
     if not cred:
@@ -301,7 +468,8 @@ def cmd_run(args) -> int:
     import agent as agent_mod
     from drake_driver import DrakeDriver
 
-    binding = agent_mod.load_binding(args.binding)
+    # Frozen: binding.json ships inside the exe (a copy beside the exe still wins).
+    binding = agent_mod.load_binding(resource_path(args.binding) if is_frozen() else args.binding)
     nav_token = (binding.get("navigation", {}) or {}).get("headsdown_checkbox_true", "X")
 
     print(f"Fynn Drake connector {VERSION}")
@@ -317,7 +485,8 @@ def cmd_run(args) -> int:
             # running on the server and manufacture a stuck job needing a human.
             if driver is None:
                 try:
-                    d = DrakeDriver(binding)
+                    # --slow was inert until now, for the same reason --dry-run was.
+                    d = DrakeDriver(binding, key_pause=0.12 if args.slow else 0.03)
                     d.connect()
                     if d.w32 is None:
                         raise RuntimeError("no win32 popup connection — heads-down entry needs it")
@@ -448,10 +617,26 @@ def build_parser() -> argparse.ArgumentParser:
                         help="take work and enter it into Drake")
     sr.add_argument("--binding", default="binding.json")
     sr.add_argument("--slow", action="store_true", help="slower keystrokes so you can watch")
-    sr.add_argument("--dry-run", action="store_true", help="plan and report, type nothing")
+    # NO --dry-run HERE, deliberately. It existed and did nothing: no function in the shared
+    # entry path reads it, and the driver is built without it — so `run --dry-run` would have
+    # typed into a live tax return while telling the operator it would not. A safety flag
+    # that is only sometimes true is worse than no flag, because it is the one somebody
+    # reaches for precisely when they are unsure. Plan offline with
+    # `agent.py write-form --dry-run`, which does honour it.
     sr.add_argument("--once", action="store_true",
                     help="do the job that is waiting, report it, then exit — what to use for a test")
     sr.set_defaults(func=cmd_run)
+
+    # The whole install for somebody with no terminal: one window, then start-at-login.
+    ssu = sub.add_parser("setup", help="pair this PC and start automatically at login")
+    ssu.add_argument("--server", default="", help="prefilled Fynn address")
+    ssu.set_defaults(func=cmd_setup)
+
+    si = sub.add_parser("install", help="just the start-at-login part")
+    si.set_defaults(func=cmd_install)
+
+    sun = sub.add_parser("uninstall", help="stop starting at login")
+    sun.set_defaults(func=cmd_uninstall)
 
     return p
 

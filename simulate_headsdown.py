@@ -4313,8 +4313,86 @@ def case_connector_entry_options():
          shared.get("create") is False),
         ("Ctrl+N is injected by scancode, which is what Drake accepts",
          shared.get("toggle_method") == "scancode"),
+        # A FLAG THAT PROMISES NOT TO TYPE MUST ACTUALLY NOT TYPE.
+        # `run --dry-run` existed and was inert: no function in the entry path read it and
+        # the driver was constructed without it, so it would have typed into a live return
+        # while telling the operator it would not. That is the flag somebody reaches for
+        # exactly when they are unsure, which makes a silent lie there worse than having
+        # no flag at all. It is gone; this fails if it comes back without being honoured.
+        ("the connector exposes no dry-run it cannot honour",
+         ("dry_run" not in produced) or ("dry_run" in needed)),
     ]
     return _table("the connector inherits every option the entry path reads", checks)
+
+
+
+def case_connector_exe_carries_every_form():
+    """Does the packaged .exe carry a field map for every screen the agent claims to drive?
+
+    `agent._load_form_map` resolves a screen to its module with
+    `importlib.import_module(name)`. PyInstaller reads `import` statements and cannot see a
+    module named by a string at runtime, so every field map has to be listed by hand in
+    connector.spec.
+
+    The failure mode if one is missed is unusually nasty. The build succeeds. The exe
+    starts, pairs, polls, and claims a job — which marks it `running` on the server — and
+    only THEN dies with ModuleNotFoundError. The job is stuck in `running`, which the
+    firm-wide halt guard turns into "no further work for this firm", and the operator sees
+    a Drake that never moved and a queue that stopped, with nothing on screen to explain it.
+
+    Adding a seventh form is a two-line change in `_FORMS` that nobody would think of as a
+    packaging change. This is what notices."""
+    import ast
+    import io
+    import os
+
+    import agent
+
+    here = os.path.dirname(os.path.abspath(agent.__file__))
+    spec_path = os.path.join(here, "connector.spec")
+    if not os.path.isfile(spec_path):
+        return _table("the packaged exe carries every field map",
+                      [("connector.spec exists", False)])
+    spec = io.open(spec_path, encoding="utf-8").read()
+
+    # Read the declared list out of the spec rather than regexing the whole file, so a
+    # module named only in a comment cannot pass for a real entry.
+    declared = set()
+    for node in ast.walk(ast.parse(spec)):
+        if (isinstance(node, ast.Assign) and node.targets
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "FORM_MAP_MODULES"
+                and isinstance(node.value, ast.List)):
+            declared = {e.value for e in node.value.elts if isinstance(e, ast.Constant)}
+
+    required = {f["module"] for f in agent._FORMS.values()}
+    missing = sorted(required - declared)
+    stale = sorted(declared - required)
+
+    # Everything the connector reaches for that PyInstaller also cannot infer.
+    runtime_needed = {"agent", "drake_driver", "drake_nav", "form_plan", "win32cred", "tkinter"}
+    hidden_missing = sorted(m for m in runtime_needed if f"'{m}'" not in spec)
+
+    checks = [
+        ("connector.spec declares its field-map modules explicitly", bool(declared)),
+        (f"every screen the agent drives has a map in the build (missing: {missing or 'none'})",
+         not missing),
+        (f"and the list has no modules the agent no longer uses (stale: {stale or 'none'})",
+         not stale),
+        ("the count matches the agent's own registry",
+         len(declared) == len(required) == len(agent._FORMS)),
+        (f"the lazily-imported runtime modules are listed too (missing: {hidden_missing or 'none'})",
+         not hidden_missing),
+        # binding.json describes Drake's UI and the exe cannot run without it.
+        ("binding.json ships inside the exe", "'binding.json'" in spec),
+        # The console stays until something replaces it. A silent exe with no tray icon
+        # leaves a firm no way to tell whether the thing is running at all.
+        ("the build is not silent while there is no tray icon", "console=True" in spec),
+        # The test harness must never end up inside a binary that drives a tax return.
+        ("the simulator and mutation harness are excluded from the build",
+         "'simulate_headsdown'" in spec and "'mutants'" in spec),
+    ]
+    return _table("the packaged exe carries every field map", checks)
 
 
 def case_chooser_duplicate_decision():
@@ -4446,6 +4524,7 @@ def main() -> int:
         ('record_chooser', lambda: case_record_chooser()),
         ('record_chooser_duplicate', lambda: case_chooser_duplicate_decision()),
         ('connector_entry_options', lambda: case_connector_entry_options()),
+        ('connector_exe_forms', lambda: case_connector_exe_carries_every_form()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),
         ('caret_rearm_impossible_halts', lambda: case_rearm_that_cannot_work_halts_clean()),
