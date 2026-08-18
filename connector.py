@@ -503,9 +503,17 @@ def cmd_run(args) -> int:
             if sys.stdout is None or not is_frozen():
                 print("(no tray icon on this machine — pystray/Pillow unavailable)")
             else:
-                _tell("Fynn connector",
-                      f"Running in the background.\n\nNo tray icon could be shown on this "
-                      f"machine, so the log is the only view:\n{log_path}")
+                # IN A THREAD. `_tell` is a modal message box and blocks until somebody
+                # clicks OK. The connector starts at LOGON, so a machine that cannot show
+                # a tray icon would sit behind a dialog nobody is looking at and enter
+                # nothing all day, while the portal showed the office as simply offline.
+                threading.Thread(
+                    target=_tell,
+                    args=("Fynn connector",
+                          f"Running in the background.\n\nNo tray icon could be shown on "
+                          f"this machine, so the log is the only view:\n{log_path}"),
+                    daemon=True,
+                ).start()
 
     def _state(name: str, detail: str = "") -> None:
         if tray is not None:
