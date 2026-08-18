@@ -78,6 +78,38 @@ DRAKE_RETRY_SEC = 15        # how often to look for Drake when it is not open
 # Name of the logon task. One per user; `install` replaces rather than duplicates.
 TASK_NAME = "FynnDrakeConnector"
 
+# The single-instance lock, held for the life of the process (module-level so the garbage
+# collector cannot quietly release the OS handle mid-run).
+_RUN_MUTEX = None
+
+
+def _already_running() -> bool:
+    """True when another connector run loop is alive in this session.
+
+    A windowed exe shows nothing when it starts, so the natural response to "nothing
+    happened" is to double-click again — a real first run of this produced TWELVE copies,
+    every one of them polling for the same firm's work. The server's claim is atomic, so
+    no document is typed twice, but twelve processes taking turns at one keyboard is not a
+    system anybody intended.
+
+    A named mutex is the standard Windows answer: first `run` grabs it, every later `run`
+    sees ERROR_ALREADY_EXISTS, says where the icon is, and exits. `Local\\` scopes it to
+    this login session — elevated and non-elevated copies share it there, so "Run as
+    administrator" cannot sneak a second keyboard past the check. The OS frees the mutex
+    when the process dies, however it dies, so a crash can never wedge the next start.
+    """
+    global _RUN_MUTEX
+    try:
+        import win32event
+        import win32api
+        import winerror
+        _RUN_MUTEX = win32event.CreateMutex(None, False, "Local\\FynnConnector-run")
+        return win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS
+    except Exception:
+        # No pywin32 — a dev checkout on a bare machine. Two dev copies are the
+        # developer's own business; never block the real loop over the guard itself.
+        return False
+
 
 def is_frozen() -> bool:
     """True when running from the packaged .exe rather than a checkout."""
@@ -460,6 +492,16 @@ def _flush_spool(server: str, token: str) -> int:
 def cmd_run(args) -> int:
     """The loop: hold the line, take one job, do it in Drake, report, repeat."""
     import tray as tray_mod
+
+    # Before ANYTHING — even the log tee. One keyboard, one connector.
+    if _already_running():
+        _tell("Fynn connector",
+              "The connector is already running.\n\n"
+              "Look for the round icon near the clock, bottom-right — it may be "
+              "behind the ^ arrow.\n\n"
+              "Grey: waiting for Drake to be opened.  Green: ready and waiting for "
+              "documents.  Blue: entering one now.")
+        return 0
 
     # BEFORE the first print, including the banner — the banner names the version that
     # wrote every line under it, and a log that starts halfway through is a log that

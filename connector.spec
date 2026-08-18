@@ -42,6 +42,9 @@ a = Analysis(
         'form_plan',
         'protocol',
         'win32cred',      # the token store
+        'win32event',     # the single-instance mutex — see _already_running
+        'win32api',
+        'winerror',
         'win32timezone',  # pywin32 pulls this in at runtime, not at import
         'tkinter',        # setup window for a person with no terminal
         'tray',           # the tray icon and the log file; imported inside cmd_run

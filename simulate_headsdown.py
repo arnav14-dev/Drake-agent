@@ -4371,8 +4371,19 @@ def case_connector_exe_carries_every_form():
 
     # Everything the connector reaches for that PyInstaller also cannot infer.
     runtime_needed = {"agent", "drake_driver", "drake_nav", "form_plan", "win32cred",
-                      "tkinter", "tray", "pystray", "PIL"}
+                      "tkinter", "tray", "pystray", "PIL", "win32event", "winerror"}
     hidden_missing = sorted(m for m in runtime_needed if f"'{m}'" not in spec)
+
+    # The single-instance guard. A windowed exe shows nothing at launch, so a person's
+    # natural response to "nothing happened" is to double-click again — the first live
+    # install produced twelve connectors from one confused minute of clicking. The run
+    # command must check the mutex before it does anything else, including the log tee:
+    # a second instance that starts writing the shared log is already a mess.
+    connector_src = io.open(os.path.join(here, "connector.py"), encoding="utf-8").read()
+    run_body = connector_src.split("def cmd_run(", 1)[-1]
+    guard_first = run_body.find("_already_running()")
+    tee_after = run_body.find("install_log_tee()")
+    single_instance_ok = 0 <= guard_first < tee_after
 
     # The console/tray pairing. A windowed build with nothing in the tray is a process a
     # firm cannot see, cannot check and cannot stop — worse than the console it replaced.
@@ -4411,6 +4422,7 @@ def case_connector_exe_carries_every_form():
         ("the log file survives the console being turned off",
          (not silent) or (logs_to_disk and calls_log_tee)),
         ("the connector installs the log tee before it prints anything", calls_log_tee),
+        ("a second double-click cannot start a second keyboard", single_instance_ok),
         # The test harness must never end up inside a binary that drives a tax return.
         ("the simulator and mutation harness are excluded from the build",
          "'simulate_headsdown'" in spec and "'mutants'" in spec),
