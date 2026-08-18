@@ -10,6 +10,10 @@ pytesseract>=0.3.10
 pillow>=10.0.0
 # connect mode only (live link to Fynn):
 websocket-client>=1.6.0
+# the connector's tray icon. Not optional in the packaged build: the exe is windowed
+# (console=False), so without this there is nothing on screen at all — see connector.spec.
+# pillow above draws the icon; no .ico file ships.
+pystray>=0.19
 
 # packaging only — builds FynnConnector.exe from connector.spec; not needed to run the
 # agent from a checkout:

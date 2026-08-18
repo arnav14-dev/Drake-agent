@@ -4370,8 +4370,26 @@ def case_connector_exe_carries_every_form():
     stale = sorted(declared - required)
 
     # Everything the connector reaches for that PyInstaller also cannot infer.
-    runtime_needed = {"agent", "drake_driver", "drake_nav", "form_plan", "win32cred", "tkinter"}
+    runtime_needed = {"agent", "drake_driver", "drake_nav", "form_plan", "win32cred",
+                      "tkinter", "tray", "pystray", "PIL"}
     hidden_missing = sorted(m for m in runtime_needed if f"'{m}'" not in spec)
+
+    # The console/tray pairing. A windowed build with nothing in the tray is a process a
+    # firm cannot see, cannot check and cannot stop — worse than the console it replaced.
+    silent = "console=False" in spec
+    has_tray = (
+        "'tray'" in spec
+        and "'pystray'" in spec
+        and os.path.isfile(os.path.join(here, "tray.py"))
+    )
+    # And a log, because the console was the only record of what got typed. Without a file
+    # on disk, turning the window off deletes the answer to "what did it put in the return?".
+    tray_src = ""
+    if os.path.isfile(os.path.join(here, "tray.py")):
+        tray_src = io.open(os.path.join(here, "tray.py"), encoding="utf-8").read()
+    logs_to_disk = "def install_log_tee" in tray_src
+    calls_log_tee = "install_log_tee()" in io.open(
+        os.path.join(here, "connector.py"), encoding="utf-8").read()
 
     checks = [
         ("connector.spec declares its field-map modules explicitly", bool(declared)),
@@ -4385,14 +4403,99 @@ def case_connector_exe_carries_every_form():
          not hidden_missing),
         # binding.json describes Drake's UI and the exe cannot run without it.
         ("binding.json ships inside the exe", "'binding.json'" in spec),
-        # The console stays until something replaces it. A silent exe with no tray icon
-        # leaves a firm no way to tell whether the thing is running at all.
-        ("the build is not silent while there is no tray icon", "console=True" in spec),
+        # The console may only go away once something has replaced it. Both directions
+        # are checked: a windowed build without a tray, and a tray that ships without the
+        # log that is the actual record of what a robot typed into somebody's return.
+        ("the build is not silent unless a tray icon ships with it",
+         (not silent) or has_tray),
+        ("the log file survives the console being turned off",
+         (not silent) or (logs_to_disk and calls_log_tee)),
+        ("the connector installs the log tee before it prints anything", calls_log_tee),
         # The test harness must never end up inside a binary that drives a tax return.
         ("the simulator and mutation harness are excluded from the build",
          "'simulate_headsdown'" in spec and "'mutants'" in spec),
     ]
     return _table("the packaged exe carries every field map", checks)
+
+
+def case_connector_tray_state():
+    """Does the tray icon show a HALT, or does it show "waiting for work"?
+
+    The icon is the only thing an office sees once the console is gone, so the one state
+    it must never get wrong is the one that means somebody has to act. A halt stops work
+    for the whole firm — the server hands out nothing more until a person reviews the
+    document that stopped — and an icon sitting on green through that is a day lost before
+    anybody thinks to look at the portal.
+
+    `state_for` is pure and this checks the priority ORDER, not the colours: the interesting
+    failure is not a wrong shade, it is a halt that loses to something cosmetic. Ordering
+    bugs survive every test that checks one condition at a time, so every check here sets
+    at least two conditions true at once and asserts which one wins.
+
+    The last check is the one that pays for the rest: a state that means "act" must not be
+    green, whatever future states get added."""
+    import os
+
+    try:
+        import tray
+    except Exception as e:
+        return _table("the tray icon reports the state that matters",
+                      [(f"tray.py imports ({type(e).__name__})", False)])
+
+    s = tray.state_for
+
+    checks = [
+        # Nothing to report while there is nothing to report it for.
+        ("a paired, connected, quiet machine is idle",
+         s(paired=True, drake_connected=True, server_reachable=True,
+           halted=False, working=False) == "idle"),
+
+        # A halt outranks a running job: the document being entered is finished, but the
+        # firm is blocked the moment it lands, and that is what a person needs to see.
+        ("a halt beats work in progress",
+         s(paired=True, drake_connected=True, server_reachable=True,
+           halted=True, working=True) == "halted"),
+
+        # A halt outranks Drake being closed. Reopening Drake will not clear it, and
+        # "waiting for Drake" sends the office to fix the wrong thing.
+        ("a halt beats Drake being closed",
+         s(paired=True, drake_connected=False, server_reachable=True,
+           halted=True, working=False) == "halted"),
+
+        # ...but an unpaired machine outranks even a halt: nothing on this PC can clear a
+        # halt it has no credentials to see, and re-pairing is the only useful next step.
+        ("not being paired beats everything",
+         s(paired=False, drake_connected=True, server_reachable=True,
+           halted=True, working=True) == "unpaired"),
+
+        # Drake closed is the operator's most common problem and must not read as a
+        # network fault, which is somebody else's problem entirely.
+        ("Drake closed is reported as Drake closed, not as offline",
+         s(paired=True, drake_connected=False, server_reachable=False,
+           halted=False, working=False) == "no-drake"),
+
+        ("a working machine says so",
+         s(paired=True, drake_connected=True, server_reachable=True,
+           halted=False, working=True) == "working"),
+
+        # Every state the function can return has to be drawable.
+        ("every state it returns has a colour",
+         all(st in tray.STATES for st in
+             {s(p, d, r, h, w)
+              for p in (True, False) for d in (True, False) for r in (True, False)
+              for h in (True, False) for w in (True, False)})),
+
+        # The point of the colour: green must never mean "somebody has to do something".
+        ("no state that needs a person is green",
+         all(tray.STATES[st][0] != tray.STATES["idle"][0]
+             for st in ("halted", "unpaired", "no-drake", "offline"))),
+
+        # The log path is what the tray menu opens and what the operator is told; it has
+        # to be a real, absolute location rather than something relative to a working
+        # directory the exe does not control when it starts at login.
+        ("the log has a fixed absolute home", os.path.isabs(str(tray.LOG_PATH))),
+    ]
+    return _table("the tray icon reports the state that matters", checks)
 
 
 def case_chooser_duplicate_decision():
@@ -4525,6 +4628,7 @@ def main() -> int:
         ('record_chooser_duplicate', lambda: case_chooser_duplicate_decision()),
         ('connector_entry_options', lambda: case_connector_entry_options()),
         ('connector_exe_forms', lambda: case_connector_exe_carries_every_form()),
+        ('connector_tray_state', lambda: case_connector_tray_state()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),
         ('caret_rearm_impossible_halts', lambda: case_rearm_that_cannot_work_halts_clean()),

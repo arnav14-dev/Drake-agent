@@ -44,6 +44,12 @@ a = Analysis(
         'win32cred',      # the token store
         'win32timezone',  # pywin32 pulls this in at runtime, not at import
         'tkinter',        # setup window for a person with no terminal
+        'tray',           # the tray icon and the log file; imported inside cmd_run
+        'pystray',        # both are imported lazily and behind try/except, so a missing
+        'PIL',            # one costs an icon, never a document — but ship them anyway
+        'PIL.Image',
+        'PIL.ImageDraw',
+        'pystray._win32', # pystray picks its backend at runtime; PyInstaller sees none
     ],
     hookspath=[],
     runtime_hooks=[],
@@ -71,10 +77,18 @@ exe = EXE(
     strip=False,
     upx=False,
     runtime_tmpdir=None,
-    # A CONSOLE WINDOW, on purpose, for now. This thing types into live tax returns; while
-    # it is new, an operator being able to see what it is doing is worth more than a tidy
-    # desktop. Flip to console=False once there is a tray icon to replace it — going silent
-    # before then would leave a firm with no way at all to tell whether it is running.
-    console=True,
+    # NO CONSOLE WINDOW — but only because both halves of its replacement now exist.
+    #
+    # The console was kept deliberately while this was new: it types into live tax returns
+    # and an operator being able to watch beat a tidy desktop. It was always a bad
+    # permanent answer, because a console window looks closeable and closing it kills the
+    # connector silently, mid-batch, with the office assuming it is still running.
+    #
+    # `tray.py` replaces it with the two things that actually mattered: a tray icon whose
+    # colour is the current state, and a log file holding every line both this and the
+    # agent print — which outlives the window and answers "what did it type?".
+    # `case_connector_exe_carries_every_form` enforces the pairing: this may only be False
+    # while a tray module ships inside the exe.
+    console=False,
     icon=None,
 )

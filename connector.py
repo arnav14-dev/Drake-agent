@@ -47,11 +47,13 @@ THREE RULES THIS FILE IS RESPONSIBLE FOR
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -457,6 +459,13 @@ def _flush_spool(server: str, token: str) -> int:
 
 def cmd_run(args) -> int:
     """The loop: hold the line, take one job, do it in Drake, report, repeat."""
+    import tray as tray_mod
+
+    # BEFORE the first print, including the banner — the banner names the version that
+    # wrote every line under it, and a log that starts halfway through is a log that
+    # answers "what did it type?" with "some of it".
+    log_path = tray_mod.install_log_tee()
+
     cred = _cred_read()
     if not cred:
         print("Not paired. Run:  connector.py pair --server <url> --code <CODE>", file=sys.stderr)
@@ -472,15 +481,51 @@ def cmd_run(args) -> int:
     binding = agent_mod.load_binding(resource_path(args.binding) if is_frozen() else args.binding)
     nav_token = (binding.get("navigation", {}) or {}).get("headsdown_checkbox_true", "X")
 
+    # Quit from the tray sets this; the loop reads it at the TOP of an iteration only.
+    # Stopping the instant somebody clicks would mean stopping mid-document — Drake left
+    # holding half a W-2 and the server still holding the job as `running`, which is the
+    # exact stranded state rule 3 exists to prevent. So a quit waits for a safe point.
+    stop = threading.Event()
+
+    tray = None
+    if not getattr(args, "no_tray", False):
+        tray = tray_mod.Tray(machine_name=str(cred.get("name") or ""), server=server,
+                             on_quit=stop.set)
+        if tray.start():
+            # Registered rather than placed in a `finally`: cmd_run returns from six
+            # different points, and Windows leaves a ghost icon behind until something
+            # hovers over it if the process dies without removing it.
+            atexit.register(tray.stop)
+        else:
+            tray = None
+            # Windowed build with no console AND no tray means an invisible process. Say
+            # so once, in the only channel left, rather than running unseen.
+            if sys.stdout is None or not is_frozen():
+                print("(no tray icon on this machine — pystray/Pillow unavailable)")
+            else:
+                _tell("Fynn connector",
+                      f"Running in the background.\n\nNo tray icon could be shown on this "
+                      f"machine, so the log is the only view:\n{log_path}")
+
+    def _state(name: str, detail: str = "") -> None:
+        if tray is not None:
+            tray.set_state(name, detail)
+
+    _state("starting")
+
     print(f"Fynn Drake connector {VERSION}")
     print(f"Server : {server}")
     print(f"Machine: {cred.get('name')!r}")
+    print(f"Log    : {log_path}")
     print("Leave Drake on its home screen. The connector opens the client, the screen and "
           "the record itself.\nCtrl+C to stop.\n")
 
     driver = None
     while True:
         try:
+            if stop.is_set():
+                print("\nstopping (asked to quit from the tray).")
+                return 0
             # RULE 1 — Drake first, then work. Claiming a job we cannot do would mark it
             # running on the server and manufacture a stuck job needing a human.
             if driver is None:
@@ -493,10 +538,12 @@ def cmd_run(args) -> int:
                     wi = d.window_info()
                     print(f"Drake connected: {wi.get('title')!r}")
                     driver = d
+                    _state("idle")
                 except Exception as e:
                     # Liveness only. The portal then says the honest thing — the PC is on,
                     # Drake is not open — rather than showing the office as offline.
                     print(f"waiting for Drake ({type(e).__name__}: {e})")
+                    _state("no-drake", "Open Drake and leave it on its home screen.")
                     try:
                         _request(server, "/api/v1/connector/jobs?wait=0&ready=0",
                                  token=token, timeout=20)
@@ -517,21 +564,26 @@ def cmd_run(args) -> int:
                 if e.status == 401:
                     print("This machine is no longer authorised (revoked, or the token was "
                           "replaced). Re-pair from the portal.", file=sys.stderr)
+                    _state("unpaired", "Re-pair this PC from the Fynn portal.")
                     return 1
                 print(f"waiting to reach the server: {e}", file=sys.stderr)
+                _state("offline", str(e)[:80])
                 time.sleep(10)
                 continue
 
             if res.get("halted"):
                 print(f"HELD: {res['halted']['note']}")
+                _state("halted", str(res["halted"].get("note", ""))[:80])
                 time.sleep(20)
                 continue
 
             job = res.get("job")
             if not job:
+                _state("idle")
                 continue  # normal — nothing to do, ask again
 
             job_id = job["job_id"]
+            _state("working", f"{job.get('doc_type')} — document {job.get('seq')} in this batch")
             print("=" * 74)
             print(f"ENTERING {job.get('doc_type')}  (document {job.get('doc_id')}, "
                   f"number {job.get('seq')} in this batch)")
@@ -580,6 +632,9 @@ def cmd_run(args) -> int:
                 print("\nThat document did not complete cleanly. Nothing further will be "
                       "handed to this machine until somebody reviews it in the portal.",
                       file=sys.stderr)
+                _state("halted", str(report.get("reason", ""))[:80])
+            else:
+                _state("idle")
 
         except KeyboardInterrupt:
             print("\nstopped.")
@@ -617,6 +672,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="take work and enter it into Drake")
     sr.add_argument("--binding", default="binding.json")
     sr.add_argument("--slow", action="store_true", help="slower keystrokes so you can watch")
+    sr.add_argument("--no-tray", action="store_true",
+                    help="skip the tray icon (the log file is written either way)")
     # NO --dry-run HERE, deliberately. It existed and did nothing: no function in the shared
     # entry path reads it, and the driver is built without it — so `run --dry-run` would have
     # typed into a live tax return while telling the operator it would not. A safety flag
@@ -642,6 +699,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    # Before any output. The packaged exe is windowed, so `status` and `pair` typed into a
+    # terminal would otherwise print nowhere at all.
+    try:
+        import tray as _tray
+        _tray.attach_parent_console()
+    except Exception:
+        pass
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # DOUBLE-CLICKED. argparse would exit(2) with a usage message onto a stderr nobody can
+    # see, so the exe would look like it did nothing at all — the single most likely thing
+    # for a firm to do with a file we emailed them.
+    if not argv and is_frozen():
+        argv = ["run"] if _cred_read() else ["setup"]
+
     args = build_parser().parse_args(argv)
     return args.func(args)
 
