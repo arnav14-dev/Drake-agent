@@ -62,6 +62,14 @@ from pathlib import Path
 
 VERSION = "1.0.0"
 
+# Where a fresh install points unless somebody says otherwise. Baked in because the person
+# running setup is a tax preparer, not IT: the address field used to open EMPTY on a fresh
+# machine, which meant copying a Railway URL by hand — and a typo there looks exactly like
+# "Fynn is down". The field stays editable (a staging or self-hosted backend is typed over
+# it), and `pair` still REQUIRES --server, because the CLI path is the explicit one.
+# This URL is public by design; everything behind it is auth-gated.
+DEFAULT_SERVER = "https://fynn-backend-production.up.railway.app"
+
 # Where the token lives. Windows Credential Manager, not a file next to the .exe: the token
 # can drive a keyboard inside a tax office, and "it was in a text file on the desktop" is
 # not an answer anybody wants to give afterwards.
@@ -347,7 +355,12 @@ def _tell(title: str, message: str) -> None:
 def cmd_setup(args) -> int:
     """Pair this machine and make it start at login — the whole install, for a normal person."""
     cred = _cred_read()
-    default_server = (cred or {}).get("server", getattr(args, "server", "") or "")
+    # The prefill, most specific first: where this machine is ALREADY paired, then whatever
+    # the command line said, then the baked-in production default. Chained with `or` rather
+    # than dict defaults so an empty stored server still falls through to something a
+    # person can actually use — this is a prefill, never a lock; the field stays editable.
+    default_server = ((cred or {}).get("server") or getattr(args, "server", "")
+                      or DEFAULT_SERVER)
     asked = _ask_gui(default_server)
     if not asked:
         return 1
@@ -574,6 +587,20 @@ def cmd_run(args) -> int:
         if tray is not None:
             tray.set_state(name, detail)
 
+    def _notify(title: str, message: str) -> None:
+        # A toast when a document finishes, so the operator does not have to walk back to
+        # the portal and guess. OUTPUT ONLY, exactly like _state: it reports what already
+        # happened and can influence nothing — not the job, not the halt, not this loop.
+        # Tray.notify already promises never to raise, and the promise is not trusted
+        # here anyway: a broken toast must never cost the loop an iteration, because the
+        # loop is the thing the toast exists to report on.
+        if tray is None:
+            return
+        try:
+            tray.notify(title, message)
+        except Exception:
+            pass
+
     _state("starting")
 
     print(f"Fynn Drake connector {VERSION}")
@@ -696,8 +723,20 @@ def cmd_run(args) -> int:
                       "handed to this machine until somebody reviews it in the portal.",
                       file=sys.stderr)
                 _state("halted", str(report.get("reason", ""))[:80])
+                # After the report is delivered (or spooled), never before: the toast may
+                # only repeat what the report already said. It tells the operator the firm
+                # is blocked — that is a fact about the server's halt guard, not a request.
+                _notify("Fynn — run stopped",
+                        f"The {job.get('doc_type')} run stopped and needs your review in "
+                        f"the Fynn portal. Nothing else will be entered until someone "
+                        f"reviews it.")
             else:
                 _state("idle")
+                # "entered" is the report's own count — the toast claims nothing the report
+                # did not say, and it never says "filed", because nothing here files.
+                _notify("Fynn — document entered",
+                        f"{job.get('doc_type')} entered ({report.get('entered')} fields). "
+                        f"Review it in the Fynn portal — nothing is filed.")
 
         except KeyboardInterrupt:
             print("\nstopped.")
@@ -766,7 +805,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # The whole install for somebody with no terminal: one window, then start-at-login.
     ssu = sub.add_parser("setup", help="pair this PC and start automatically at login")
-    ssu.add_argument("--server", default="", help="prefilled Fynn address")
+    # Default "" on purpose: the prefill chain in cmd_setup resolves a blank to the stored
+    # credential and then to DEFAULT_SERVER. Baking the constant in HERE would let the
+    # parser's value shadow a stored credential, and a paired machine's setup window must
+    # show where it actually points.
+    ssu.add_argument("--server", default="",
+                     help="prefill a different Fynn address (default: the production server)")
     ssu.set_defaults(func=cmd_setup)
 
     si = sub.add_parser("install", help="just the start-at-login part")

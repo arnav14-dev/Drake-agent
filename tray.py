@@ -319,6 +319,23 @@ class Tray:
         except Exception:
             pass
 
+    def notify(self, title: str, message: str) -> None:
+        """A Windows toast — "document entered", "run stopped". Never raises, never blocks.
+
+        Same posture as `set_state`, and the same rule: the tray REPORTS, it never
+        decides. A toast is fire-and-forget output — pystray's `notify` posts the balloon
+        and returns, there is nothing to wait on — and any failure in it is cosmetic. On
+        a machine with no icon there is nobody to toast at, so it is a silent no-op,
+        exactly like a state change on a machine that could not show the icon.
+        """
+        if self._icon is None:
+            return
+        try:
+            # pystray's argument order is (message, title).
+            self._icon.notify(message, title)
+        except Exception:
+            pass
+
     # -- internals ---------------------------------------------------------
 
     def _title(self) -> str:

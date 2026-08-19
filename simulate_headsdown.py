@@ -4635,6 +4635,298 @@ def case_connector_tray_state():
     return _table("the tray icon reports the state that matters", checks)
 
 
+def case_connector_setup_prefill():
+    """Does a fresh machine's setup window open with the Fynn address already filled in?
+
+    The bug this pins down: the setup GUI's address field opened EMPTY on a fresh machine,
+    so a tax preparer had to type a Railway URL by hand — and a typo there looks exactly
+    like "Fynn is down". The fix is a baked-in DEFAULT_SERVER, resolved through a chain a
+    later edit could silently reorder: stored credential first (a paired machine's setup
+    window must show where it actually points), then an explicit --server, then the
+    default.
+
+    THE REAL cmd_setup RUNS HERE — not a copy of its resolution line. `_ask_gui` is
+    swapped for a recorder that captures the prefill and then answers "the person closed
+    the window", so the command returns before it can pair, write a credential, or touch
+    the network; `_cred_read` is swapped to model each machine. A copy-based check would
+    stay green while cmd_setup went back to prefilling ""."""
+    import connector
+
+    def prefill(cred, argv):
+        captured = {}
+        real_ask, real_read = connector._ask_gui, connector._cred_read
+        connector._cred_read = lambda: cred
+
+        def fake_ask(server_default):
+            captured["prefill"] = server_default
+            return None  # window closed: setup must stop, side-effect free
+
+        connector._ask_gui = fake_ask
+        try:
+            rc = connector.cmd_setup(connector.build_parser().parse_args(argv))
+        finally:
+            connector._ask_gui, connector._cred_read = real_ask, real_read
+        return captured.get("prefill"), rc
+
+    fresh, rc_fresh = prefill(None, ["setup"])
+    cli, _ = prefill(None, ["setup", "--server", "https://staging.fynn.example"])
+    stored, _ = prefill({"server": "https://firm.fynn.example", "token": "t"},
+                        ["setup", "--server", "https://staging.fynn.example"])
+    blank_cred, _ = prefill({"server": "", "token": "t"}, ["setup"])
+
+    def pair_requires_server() -> bool:
+        # The explicit CLI path stays explicit: `pair` with no --server must refuse to
+        # parse, not quietly borrow the default. argparse exits(2) after printing usage;
+        # the usage noise is muffled so a PASSING suite does not look like a crash.
+        import contextlib
+        import io
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                connector.build_parser().parse_args(["pair", "--code", "X"])
+            return False
+        except SystemExit:
+            return True
+
+    checks = [
+        ("a fresh machine — nothing stored, no --server — prefills the baked-in default",
+         fresh == connector.DEFAULT_SERVER),
+        ("...and the default is a real https URL with no trailing slash",
+         str(connector.DEFAULT_SERVER).startswith("https://")
+         and not str(connector.DEFAULT_SERVER).endswith("/")),
+        ("closing the window aborts setup without pairing", rc_fresh == 1),
+        ("an explicit --server outranks the baked-in default",
+         cli == "https://staging.fynn.example"),
+        ("a stored credential outranks both — the window shows where this PC points",
+         stored == "https://firm.fynn.example"),
+        ("a credential with an EMPTY server still falls through to the default",
+         blank_cred == connector.DEFAULT_SERVER),
+        ("`pair` still REQUIRES --server — the explicit CLI path stays explicit",
+         pair_requires_server()),
+    ]
+    return _table("the setup window opens already pointing at Fynn", checks)
+
+
+def case_tray_notify_is_output_only():
+    """Can a toast take the connector down? The tray reports state, it never decides it —
+    and a notification failure must never break the thing it reports on.
+
+    These call the REAL Tray.notify. The icon underneath is faked three ways: absent (a
+    machine with no pystray), working (to pin pystray's argument order — `notify(message,
+    title)`, backwards from ours, and swapping them silently titles every toast with its
+    own body), and actively broken (pystray raising out of the shell call), because those
+    are the ways Windows actually behaves."""
+    try:
+        import tray as tray_mod
+    except Exception as e:
+        return _table("a toast can fail; the tray cannot",
+                      [(f"tray.py imports ({type(e).__name__})", False)])
+
+    calls = []
+
+    class _GoodIcon:
+        def notify(self, *a, **k):
+            calls.append((a, k))
+
+    class _BrokenIcon:
+        def notify(self, *a, **k):
+            raise RuntimeError("Shell_NotifyIcon said no")
+
+    t = tray_mod.Tray(machine_name="SimPC")
+
+    def survives(icon) -> bool:
+        t._icon = icon
+        try:
+            t.notify("Fynn — document entered", "W-2 entered (7 fields).")
+            return True
+        except BaseException:
+            return False
+
+    no_icon_ok = survives(None) and not calls  # nobody to toast at: silent no-op
+    good_ok = survives(_GoodIcon())
+    passed = calls[-1][0] if calls else ()
+    broken_ok = survives(_BrokenIcon())
+
+    checks = [
+        ("no icon on this machine: notify is a silent no-op", no_icon_ok),
+        ("a working icon gets exactly the one toast", good_ok and len(calls) == 1),
+        ("...in pystray's order — (message, title), not (title, message)",
+         passed == ("W-2 entered (7 fields).", "Fynn — document entered")),
+        ("an icon that RAISES does not take notify with it", broken_ok),
+        ("a broken toast leaves the tray's state alone", t._state == "starting"),
+    ]
+    return _table("a toast can fail; the tray cannot", checks)
+
+
+def case_connector_run_toasts():
+    """When a document finishes, does the operator hear about it — and can that toast, at
+    its worst, cost anything?
+
+    Before this, a finished document was invisible: the operator walked back to the portal
+    and guessed. So the run loop toasts after each report lands. The doctrine that guards
+    it: notifications are OUTPUT ONLY. A toast must never claim more than the report said
+    — which is why the ORDER of events is asserted, not just their presence — and a toast
+    that fails must never break the loop it reports on.
+
+    THE REAL cmd_run RUNS HERE. Like case_connector_network_death, only the edges are
+    swapped: urlopen answers with a canned job, DrakeDriver and _run_one_payload are stubs
+    (entry logic has its own hundred cases), and the injected tray's notify RAISES on
+    every call — the hostile version of a toast. The iteration must complete anyway:
+    report delivered first, tray state set, and the loop back at its safe stop point."""
+    import contextlib
+    import io
+    import json as jsonmod
+    import tempfile
+    import urllib.request
+    from pathlib import Path as _P
+
+    import agent
+    import connector
+    import drake_driver as dd
+    import tray as tray_mod
+
+    def run_once(report):
+        events = []   # everything observable, in the order it happened
+        toasts = []
+        states = []
+
+        class _FakeTray:
+            def __init__(self, machine_name="", server="", on_quit=None):
+                self._on_quit = on_quit
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+            def set_state(self, state, detail=""):
+                states.append(state)
+
+            def notify(self, title, message):
+                toasts.append((title, message))
+                events.append("notify")
+                # Ask for the safe-point quit first, then blow up. The raise is the
+                # point: the real Tray.notify never raises, so this is strictly nastier
+                # than anything pystray can do, and the loop must shrug it off.
+                if self._on_quit is not None:
+                    self._on_quit()
+                raise RuntimeError("toast backend exploded")
+
+        class _FakeDriver:
+            def __init__(self, binding, key_pause=0.03):
+                self.w32 = object()
+
+            def connect(self):
+                pass
+
+            def window_info(self):
+                return {"title": "Drake 2025 (sim)"}
+
+            def save_screenshot(self, path):
+                return {"ok": False}  # no screenshot; the loop must shrug (it is evidence,
+                                      # not the record) and never write a file from here
+
+        class _Resp:
+            def __init__(self, body):
+                self._raw = jsonmod.dumps(body).encode("utf-8")
+
+            def read(self):
+                return self._raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        polls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            if "/result" in req.full_url:
+                events.append("result")
+                return _Resp({"ok": True})
+            events.append("poll")
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return _Resp({"job": {"job_id": "sim-1", "doc_type": "W-2", "doc_id": "d1",
+                                      "seq": 1, "payload": {"screen": "W2"}}})
+            if polls["n"] > 3:
+                # The brake for the regression this case exists to catch: if the toast
+                # (whose side effect asks for the quit) never fires, the loop would poll
+                # forever and the suite would HANG instead of failing. KeyboardInterrupt
+                # is the loop's own clean exit, and the missing toast fails the checks.
+                raise KeyboardInterrupt
+            return _Resp({})
+
+        class _FakeTime:
+            # Any sleep at all means the loop took an error detour (catch-all, offline,
+            # no-Drake). Recorded rather than slept, so a broken build fails fast.
+            def sleep(self, secs):
+                events.append(f"sleep:{secs}")
+
+        saved = (connector._already_running, connector._cred_read, connector.SPOOL_DIR,
+                 connector.time, urllib.request.urlopen, tray_mod.install_log_tee,
+                 tray_mod.Tray, dd.DrakeDriver, agent.load_binding, agent._run_one_payload)
+        try:
+            connector._already_running = lambda: False
+            connector._cred_read = lambda: {"server": "https://example.invalid",
+                                            "token": "T", "agent_id": "a1", "name": "SimPC"}
+            # NEVER the real spool: cmd_run flushes it through the faked urlopen, which
+            # would "deliver" — and delete — a real machine's held reports.
+            connector.SPOOL_DIR = _P(tempfile.mkdtemp()) / "spool"
+            connector.time = _FakeTime()
+            urllib.request.urlopen = fake_urlopen
+            # The tee is proven by connector_exe_forms; here it would swallow the suite's
+            # own stdout and append this rehearsal to a real machine's connector.log.
+            tray_mod.install_log_tee = lambda: _P("sim-connector.log")
+            tray_mod.Tray = _FakeTray
+            dd.DrakeDriver = _FakeDriver
+            agent.load_binding = lambda p: {"navigation": {}}
+            agent._run_one_payload = lambda driver, payload, args, token: dict(report)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                rc = connector.cmd_run(connector.build_parser().parse_args(["run"]))
+        finally:
+            (connector._already_running, connector._cred_read, connector.SPOOL_DIR,
+             connector.time, urllib.request.urlopen, tray_mod.install_log_tee,
+             tray_mod.Tray, dd.DrakeDriver, agent.load_binding,
+             agent._run_one_payload) = saved
+        return rc, events, toasts, states
+
+    ok_rc, ok_events, ok_toasts, ok_states = run_once({"ok": True, "entered": 7})
+    bad_rc, bad_events, bad_toasts, bad_states = run_once(
+        {"ok": False, "entered": 2, "reason": "read-back mismatch on field 23"})
+
+    ok_title, ok_msg = ok_toasts[0] if ok_toasts else ("", "")
+    bad_title, bad_msg = bad_toasts[0] if bad_toasts else ("", "")
+
+    checks = [
+        ("a finished document raises exactly one toast", len(ok_toasts) == 1),
+        ("...titled as entered, never as filed",
+         "entered" in ok_title and "filed" not in ok_title),
+        ("...only AFTER the report was delivered — 'entered' means the report said so",
+         "result" in ok_events and "notify" in ok_events
+         and ok_events.index("result") < ok_events.index("notify")),
+        ("...naming the document and the report's own field count",
+         "W-2" in ok_msg and "7 fields" in ok_msg),
+        ("...and pointing at the portal without claiming a filing",
+         "portal" in ok_msg and "nothing is filed" in ok_msg),
+        ("the toast RAISED, and the loop still reached its safe stop point", ok_rc == 0),
+        ("no error detour on the way: no sleeps, never 'offline'",
+         not any(e.startswith("sleep") for e in ok_events) and "offline" not in ok_states),
+        ("a halted run raises the other toast, pointing at review",
+         len(bad_toasts) == 1 and "review" in bad_msg and "stopped" in bad_title),
+        ("...saying the firm is blocked until a person acts",
+         "Nothing else will be entered" in bad_msg),
+        ("the raising toast could not knock the tray off 'halted'",
+         bad_states[-1:] == ["halted"]),
+        ("and the halted loop also survived to its safe stop point",
+         bad_rc == 0 and not any(e.startswith("sleep") for e in bad_events)),
+    ]
+    return _table("run-finished toasts: heard by the operator, harmless at their worst",
+                  checks)
+
+
 def case_chooser_duplicate_decision():
     """Is this document ALREADY on the return? Decided against every record, not just one.
 
@@ -4767,6 +5059,9 @@ def main() -> int:
         ('connector_exe_forms', lambda: case_connector_exe_carries_every_form()),
         ('connector_network_death', lambda: case_connector_network_death()),
         ('connector_tray_state', lambda: case_connector_tray_state()),
+        ('connector_setup_prefill', lambda: case_connector_setup_prefill()),
+        ('connector_run_toasts', lambda: case_connector_run_toasts()),
+        ('tray_notify_output_only', lambda: case_tray_notify_is_output_only()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),
         ('caret_rearm_impossible_halts', lambda: case_rearm_that_cannot_work_halts_clean()),
