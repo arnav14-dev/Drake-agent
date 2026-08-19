@@ -655,6 +655,27 @@ def cmd_run(args) -> int:
                     print("This machine is no longer authorised (revoked, or the token was "
                           "replaced). Re-pair from the portal.", file=sys.stderr)
                     _state("unpaired", "Re-pair this PC from the Fynn portal.")
+                    # SAY IT ON THE SCREEN, not just in the log. This is the one failure that
+                    # ends the process, and in a windowed build stderr goes to a file nobody
+                    # is looking at — so a revoked machine looked exactly like a broken exe:
+                    # double-click, Drake flickers as the driver attaches, then nothing, with
+                    # the office assuming the software is dead rather than un-paired.
+                    # Modal is right HERE (unlike the missing-tray notice, which had to be
+                    # threaded so it could not block entry): we are exiting either way, and a
+                    # dialog holds the message until somebody actually reads it.
+                    _tell("Fynn connector",
+                          "This PC is no longer connected to Fynn.\n\n"
+                          "Someone removed it in the portal, or it was paired again "
+                          "somewhere else.\n\n"
+                          "In Fynn: Settings → Connect a PC → copy the code.\n"
+                          "Click OK and paste it into the window that opens.")
+                    # ...then OPEN that window. Telling somebody to re-pair while leaving them
+                    # no way to do it is the same dead end twice: double-clicking the exe again
+                    # just repeats this failure, because a stored-but-rejected token still
+                    # routes to `run`. Only when frozen — from a terminal the operator has the
+                    # `setup` subcommand and does not need a window opened for them.
+                    if is_frozen():
+                        return cmd_setup(argparse.Namespace(server=server))
                     return 1
                 print(f"waiting to reach the server: {e}", file=sys.stderr)
                 _state("offline", str(e)[:80])
