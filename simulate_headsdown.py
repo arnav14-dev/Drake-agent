@@ -4706,6 +4706,1108 @@ def case_connector_setup_prefill():
     return _table("the setup window opens already pointing at Fynn", checks)
 
 
+# ---------------------------------------------------------------------------
+# The connector's run loop, rehearsed
+# ---------------------------------------------------------------------------
+#
+# WHY NONE OF THIS READS SOURCE STRINGS. Everything below used to be ONE case that pulled
+# `inspect.getsource(connector.cmd_run)` apart and looked for substrings. The code it
+# guards carries heavy WHY-comments — the comments themselves say "401", "parent=root",
+# "_raise_above_drake" — so the COMMENTS satisfied the checks: five of six deliberate
+# mutations (the ping's `return _unpaired(server)` replaced by `pass`, `parent=root`
+# deleted from the messagebox, `_raise_above_drake` stubbed to an early `return`) left the
+# case green, and the sixth was caught only because it deleted the prose along with the
+# code. A test that reads the sentence next to the fix is a test of the sentence.
+#
+# So these run the REAL `cmd_run`, the real `_unpaired` closure inside it, the real
+# `_flush_spool` / `_deliver_result` / `_set_aside`, the real `Tray`, the real `_tell` and
+# the real `_ask_gui`. Only the edges of the machine are replaced: the network, Drake, the
+# Windows credential store, the clock, the spool folder and tkinter's drawing.
+
+_SIM_CRED = {"server": "https://sim.fynn.invalid", "token": "OLD-TOKEN",
+             "agent_id": "a1", "name": "Front desk"}
+
+
+_SIM_SPOOL_N = [0]
+
+
+def _sim_spool_dir():
+    """A throwaway spool folder — a fresh one per rehearsal.
+
+    NEVER the real one. `cmd_run` DELETES a spool file the moment the server accepts it,
+    and here the server is a fake that says yes — so pointing SPOOL_DIR at a real
+    ~/.fynn-connector/spool would throw away the record of what a robot actually typed
+    into somebody's tax return.
+
+    ONE FOLDER PER REHEARSAL, not one per process: the checks about what was left on disk
+    run after the LAST rehearsal in a case, so a shared folder wiped on the way in would
+    quietly delete the evidence an earlier rehearsal produced — and the check would report
+    "the report was not held" about a run that held it perfectly. Everything lives under a
+    per-pid parent, cleared once, so two suites can run at the same time and neither leaves
+    a pile behind.
+    """
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path as _P
+    root = _P(tempfile.gettempdir()) / f"fynn-sim-{os.getpid()}"
+    _SIM_SPOOL_N[0] += 1
+    if _SIM_SPOOL_N[0] == 1:
+        shutil.rmtree(root, ignore_errors=True)
+    d = root / f"spool-{_SIM_SPOOL_N[0]}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _sim_http(status: int, detail: str = "revoked"):
+    """A real urllib HTTPError, so `_request` does its real classification on it.
+
+    Handing the loop a pre-built ServerError would skip the part most worth testing: that
+    a 401 arriving as an HTTP response still carries its status by the time the run loop
+    reads it.
+    """
+    import io as _io
+    import json as _json
+    import urllib.error
+    return urllib.error.HTTPError(
+        "https://sim.fynn.invalid/x", status, detail, {},
+        _io.BytesIO(_json.dumps({"error": detail}).encode("utf-8")))
+
+
+def _rehearse_cmd_run(answer, *, cred=..., drake=True, report=None, setup=None,
+                      spool=None, tray_factory=None, frozen=True):
+    """One real run of `connector.cmd_run` with only its edges replaced. Returns a record.
+
+    `answer(kind, url, body, rec)` IS the server: it is handed "poll", "ping" or "result"
+    and returns the JSON body, raises `_sim_http(status)` for an HTTP failure, or raises
+    KeyboardInterrupt — the loop's own clean exit — to end the rehearsal at a chosen point.
+    Ending it from the SERVER side is deliberate: a loop that stops because the test told
+    it to proves nothing about a loop whose job is to keep running.
+
+    Everything replaced is something that would otherwise touch the machine this runs on:
+    the network, Drake, Windows Credential Manager, the clock (recorded, never slept), the
+    spool folder, `schtasks`, the log tee (it would append a rehearsal to a real
+    connector.log and swallow the suite's own output) and `atexit` (a real registration
+    fires at interpreter exit, long after the case that made it).
+    """
+    import contextlib
+    import io
+    import json as jsonmod
+    import urllib.request
+
+    import agent
+    import connector
+    import drake_driver as dd
+    import tray as tray_mod
+
+    rec = {"events": [], "states": [], "details": [], "toasts": [], "told": [],
+           "setups": [], "auth": [], "sleeps": [], "atexit": [], "tray": None,
+           "cred": (dict(_SIM_CRED) if cred is ... else cred), "rc": None, "log": "",
+           "spool": None, "gave_up": set(), "ran_away": False,
+           # Every payload actually handed to the entry path, and whether the fake server
+           # has "closed" Drake — see _FakeDriver.window_info.
+           "entries": [], "drake_gone": False}
+
+    spool_dir = _sim_spool_dir()
+    rec["spool"] = spool_dir
+    for name, content in (spool or {}).items():
+        (spool_dir / name).write_text(
+            content if isinstance(content, str) else jsonmod.dumps(content),
+            encoding="utf-8")
+
+    # A rehearsal that cannot end is worse than one that fails: it HANGS the suite, and a
+    # hung suite gets killed and read as "the run was fine, it just took too long". Every
+    # edge spends from one budget; blowing it ends the run and says so in the record.
+    budget = {"n": 0}
+
+    def _spend(what):
+        budget["n"] += 1
+        if budget["n"] > 400:
+            rec["ran_away"] = True
+            raise KeyboardInterrupt(f"the loop would not stop ({what})")
+
+    class _Resp:
+        def __init__(self, body):
+            self._raw = jsonmod.dumps(body or {}).encode("utf-8")
+
+        def read(self):
+            return self._raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        _spend("http")
+        url = req.full_url
+        kind = "result" if "/result" in url else ("ping" if "ready=0" in url else "poll")
+        rec["events"].append(kind)
+        # The token is recorded per request: a re-pair that does not REBIND leaves the
+        # loop polling on the dead one, which looks identical from every other angle.
+        rec["auth"].append(req.headers.get("Authorization", ""))
+        body = jsonmod.loads(req.data.decode("utf-8")) if req.data else None
+        return _Resp(answer(kind, url, body, rec))
+
+    connects = {"n": 0}
+
+    class _FakeDriver:
+        def __init__(self, binding, key_pause=0.03):
+            self.w32 = object()
+
+        def connect(self):
+            connects["n"] += 1
+            _spend("drake")
+            if not (drake(connects["n"]) if callable(drake) else drake):
+                raise RuntimeError("Drake 2025 is not running")
+
+        def window_info(self):
+            # `rec["drake_gone"]` lets the fake SERVER close Drake — the answer callback
+            # flips it while handing back a job, which is the only way to rehearse the one
+            # window that matters: Drake dying inside the 25-second poll, after the
+            # pre-poll liveness check passed and before a single key is sent. An empty
+            # title is exactly what the real driver returns for a window that is gone.
+            if rec.get("drake_gone"):
+                return {}
+            return {"title": "Drake 2025 Tax Software (sim)"}
+
+        def save_screenshot(self, path):
+            # Evidence, not the record. The loop must shrug this off — and a test must
+            # never make it write a PNG somewhere on a real machine.
+            return {"ok": False}
+
+    class _FakeTray:
+        def __init__(self, machine_name="", server="", on_quit=None):
+            self.machine_name = machine_name
+            self.server = server
+            self._on_quit = on_quit
+
+        def start(self):
+            return True
+
+        def stop(self):
+            rec["events"].append("icon-removed")
+
+        def set_state(self, state, detail=""):
+            rec["states"].append(state)
+            rec["details"].append(detail)
+
+        def notify(self, title, message):
+            rec["toasts"].append((title, message))
+
+    def make_tray(**kw):
+        rec["tray"] = (tray_factory or _FakeTray)(**kw)
+        return rec["tray"]
+
+    class _FakeTime:
+        def sleep(self, secs):
+            rec["sleeps"].append(secs)
+            _spend("sleep")
+
+    class _FakeAtExit:
+        def register(self, fn, *a, **k):
+            rec["atexit"].append(fn)
+            return fn
+
+        def unregister(self, fn):
+            pass
+
+    def fake_setup(ns):
+        rec["setups"].append(
+            {"server": getattr(ns, "server", None),
+             "resume_in_place": bool(getattr(ns, "resume_in_place", False))})
+        return 0 if setup is None else setup(rec)
+
+    saved = {k: getattr(connector, k) for k in
+             ("_already_running", "_cred_read", "_tell", "cmd_setup", "SPOOL_DIR", "time",
+              "is_frozen", "_autostart_points_here", "atexit")}
+    saved_gave_up = set(connector._GAVE_UP_ON)
+    saved_other = (tray_mod.install_log_tee, tray_mod.Tray, dd.DrakeDriver,
+                   agent.load_binding, agent._run_one_payload, urllib.request.urlopen)
+    try:
+        connector._already_running = lambda: False
+        connector._cred_read = lambda: (dict(rec["cred"]) if rec["cred"] else None)
+        connector._tell = lambda title, message, raise_it=True: rec["told"].append(
+            (title, message))
+        connector.cmd_setup = fake_setup
+        connector.SPOOL_DIR = spool_dir
+        connector.time = _FakeTime()
+        connector.is_frozen = lambda: frozen
+        # It shells out to schtasks. A test may not rewrite this machine's logon task.
+        connector._autostart_points_here = lambda: True
+        connector.atexit = _FakeAtExit()
+        # Per-process memory of reports already given up on. Left dirty, one case's
+        # rejected job id would make the next case's identical job invisible.
+        connector._GAVE_UP_ON.clear()
+        tray_mod.install_log_tee = lambda: spool_dir.parent / "sim-connector.log"
+        tray_mod.Tray = make_tray
+        dd.DrakeDriver = _FakeDriver
+        agent.load_binding = lambda p: {"navigation": {}}
+        # Recorded, not just answered: "was anything typed at all?" is the only question
+        # that matters when Drake dies mid-poll, and it cannot be read off the reports.
+        def _fake_entry(driver, payload, args, token):
+            rec["entries"].append(payload)
+            return dict(report or {"ok": True, "entered": 0})
+
+        agent._run_one_payload = _fake_entry
+        urllib.request.urlopen = fake_urlopen
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rec["rc"] = connector.cmd_run(connector.build_parser().parse_args(["run"]))
+        rec["log"] = out.getvalue()
+        rec["gave_up"] = set(connector._GAVE_UP_ON)
+    finally:
+        for k, v in saved.items():
+            setattr(connector, k, v)
+        connector._GAVE_UP_ON.clear()
+        connector._GAVE_UP_ON.update(saved_gave_up)
+        (tray_mod.install_log_tee, tray_mod.Tray, dd.DrakeDriver, agent.load_binding,
+         agent._run_one_payload, urllib.request.urlopen) = saved_other
+    return rec
+
+
+def _sim_spool_names(rec, sub=""):
+    """What is sitting in the rehearsal's spool folder afterwards, by name."""
+    d = rec["spool"] / sub if sub else rec["spool"]
+    return sorted(p.name for p in d.iterdir() if p.is_file()) if d.is_dir() else []
+
+
+def case_drake_dies_inside_the_poll():
+    """Drake closes while the connector is holding the line. Does it type into the hole?
+
+    RULE 1 SAID "DRAKE FIRST, THEN WORK", AND WAS ENFORCED ONCE — at startup, and later
+    only just BEFORE the poll. But that poll holds the line for twenty-five seconds, and a
+    preparer closing Drake at 5pm (or a crash, or an IT restart) lands squarely inside it.
+    The job then arrives for a dead driver: the server has already recorded it `running`,
+    so driving it would type a live client's wages into whatever window inherited the
+    focus, and the firm would be left with a stuck job and a screen nobody can account for.
+
+    The honest ending is the one thing that is both safe AND says so: report the job
+    UNTOUCHED — nothing was typed, and nothing may be retried — go back to the waiting
+    state, and tell the person, because "Drake was closed" is the one cause they can fix
+    themselves in five seconds.
+
+    THIS CASE EXISTS BECAUSE MUTATION TESTING FOUND ITS ABSENCE. Deleting the re-check left
+    the whole suite green, which is the same as having no test at all."""
+    import connector
+
+    posted = []
+    connects = []
+
+    def close_drake_then_send_work(kind, url, body, rec):
+        if kind == "result":
+            posted.append(body)
+            # The preparer reopens Drake after seeing the toast. Modelled HERE because the
+            # untouched report is the last thing that happens while it is shut, and a
+            # rehearsal where Drake never comes back could only ever prove the loop waits.
+            rec["drake_gone"] = False
+            return {}
+        if kind == "poll":
+            if rec["events"].count("poll") >= 2:
+                raise KeyboardInterrupt   # one job is enough to judge
+            # Drake goes away DURING this poll — the pre-poll check already passed, which
+            # is precisely the window the old code could not see.
+            rec["drake_gone"] = True
+            return {"job": {"job_id": "sim-dead", "doc_type": "W-2", "doc_id": "d9",
+                            "seq": 1, "payload": {"screen": "W2", "box1": "50000"}}}
+        return {}
+
+    def drake_reopens(n):
+        # Drake is up at startup, and up again when the loop comes back for it — so a
+        # second connect proves the dead driver was dropped rather than reused.
+        connects.append(n)
+        return True
+
+    gone = _rehearse_cmd_run(close_drake_then_send_work, drake=drake_reopens)
+
+    reports = [b.get("report", {}) for b in posted if isinstance(b, dict)]
+    said = " ".join(m for _, m in gone["toasts"])
+
+    checks = [
+        ("NOTHING was typed — the entry path is never reached", gone["entries"] == []),
+        ("the job is not left silently claimed: a report goes back", len(posted) == 1),
+        ("...saying the run did NOT complete",
+         bool(posted) and posted[0].get("ok") is False),
+        ("...naming the real cause, not the document",
+         any("Drake closed" in str(r.get("reason", "")) for r in reports)),
+        ("...and marked untouched, so nobody hunts for half a W-2 in a live return",
+         any(r.get("untouched") for r in reports)),
+        ("...and claiming nothing was entered", all(r.get("entered") == 0 for r in reports)),
+        ("the icon goes back to the state a person can act on",
+         "no-drake" in gone["states"]),
+        ("...and it is said in words, not only a colour",
+         "Drake" in said and ("closed" in said or "Open Drake" in said)),
+        ("the dead driver is dropped, so reopening Drake reconnects instead of reusing it",
+         len(connects) >= 2),
+        ("the loop survives it — this is a lost job, not a lost afternoon",
+         not gone["ran_away"] and gone["events"].count("poll") >= 2),
+    ]
+    return _table("Drake closing mid-poll costs a job, never a return", checks)
+
+
+def case_revoked_machine_is_visible():
+    """When Fynn stops recognising this PC, does anybody find out — through every door?
+
+    THE BUG THIS PINS DOWN cost a real setup session. A revoked machine printed one line to
+    a log file and exited. In a windowed build that is silence: double-click, Drake flickers
+    as the driver attaches, nothing else. It looks exactly like a broken download, and the
+    obvious response — download it again, run it again — reproduces it forever, because a
+    stored-but-rejected token still routes to `run`.
+
+    THREE DOORS reach the same handler, because a revoked PC has to be told whether or not
+    Drake happens to be open and whether or not it is holding a report:
+      1. the job poll;
+      2. the waiting-for-Drake liveness ping, with Drake SHUT — the state that looks most
+         normal, and where a 401 used to be swallowed with everything else;
+      3. a report coming back 401, which used to be filed as "Fynn refused this report",
+         spooled, and retried every five seconds forever ahead of all new work, behind a
+         green "connected, waiting for work" icon.
+
+    And the fourth thing that matters is what must NOT happen: an ordinary server error is
+    not a revocation. Get that wrong and one bad afternoon at the data centre tells every
+    firm in the country that their PC has been removed."""
+    import connector
+
+    def refuse(kind_to_refuse, status=401):
+        def answer(kind, url, body, rec):
+            if kind == kind_to_refuse:
+                raise _sim_http(status)
+            return {}
+        return answer
+
+    # The person clicks past the dialog without re-pairing: the loop must END, not spin.
+    declined = lambda rec: 1
+
+    polled = _rehearse_cmd_run(refuse("poll"), setup=declined)
+    shut = _rehearse_cmd_run(refuse("ping"), drake=False, setup=declined)
+
+    def ping_wobbles(kind, url, body, rec):
+        # Fynn unreachable is NOT a reason to stop waiting for Drake, and it is certainly
+        # not a reason to tell a firm their PC was removed.
+        if kind == "ping":
+            if rec["events"].count("ping") >= 3:
+                raise KeyboardInterrupt
+            raise _sim_http(503, "bad gateway")
+        return {}
+
+    wobble_shut = _rehearse_cmd_run(ping_wobbles, drake=False, setup=declined)
+
+    def poll_wobbles(kind, url, body, rec):
+        if kind == "poll":
+            if rec["events"].count("poll") >= 3:
+                raise KeyboardInterrupt
+            raise _sim_http(500, "boom")
+        return {}
+
+    wobble = _rehearse_cmd_run(poll_wobbles, setup=declined)
+
+    def revoked_mid_report(kind, url, body, rec):
+        if kind == "poll":
+            if rec["events"].count("result"):
+                # A second poll would mean the 401 on the report was shrugged off.
+                raise KeyboardInterrupt
+            return {"job": {"job_id": "sim-77", "doc_type": "W-2", "doc_id": "d1",
+                            "seq": 1, "payload": {"screen": "W2"}}}
+        if kind == "result":
+            raise _sim_http(401)
+        return {}
+
+    mid = _rehearse_cmd_run(revoked_mid_report, report={"ok": True, "entered": 7},
+                            setup=declined)
+
+    # A checkout has the `setup` subcommand and a console; only the frozen exe, where the
+    # person has no other way in, gets the setup window opened for them.
+    checkout = _rehearse_cmd_run(refuse("poll"), setup=declined, frozen=False)
+
+    said = " ".join(m for _, m in polled["told"])
+
+    checks = [
+        ("a 401 from the job poll puts a dialog on screen", len(polled["told"]) == 1),
+        ("...worded for a preparer: what happened and where to click",
+         "no longer connected" in said and "Settings" in said and "Connect a PC" in said),
+        ("...and opens the setup window so they can act on what they just read",
+         len(polled["setups"]) == 1),
+        ("...asking it to RESUME this loop, never to start a second connector",
+         polled["setups"][:1] == [{"server": _SIM_CRED["server"], "resume_in_place": True}]),
+        ("...leaving the icon on 'unpaired', not on the green it was showing a moment ago",
+         polled["states"] == ["starting", "idle", "unpaired"]),
+        ("...and the loop ends rather than hammering a dead token",
+         polled["rc"] == 1 and polled["events"] == ["poll"] and not polled["ran_away"]),
+
+        ("with DRAKE SHUT the liveness ping says it too — the state that looks normal",
+         shut["events"] == ["ping"] and len(shut["told"]) == 1
+         and len(shut["setups"]) == 1 and shut["rc"] == 1),
+        ("...having said 'waiting for Drake' first, then 'unpaired'",
+         shut["states"] == ["starting", "no-drake", "unpaired"]),
+
+        ("but an unreachable Fynn does NOT read as a revocation",
+         not wobble_shut["told"] and not wobble_shut["setups"]
+         and set(wobble_shut["states"]) == {"starting", "no-drake"}),
+        ("...and it keeps waiting for Drake at the usual interval",
+         wobble_shut["sleeps"][:1] == [connector.DRAKE_RETRY_SEC]
+         and wobble_shut["rc"] == 0),
+        ("a 500 on the poll is a bad afternoon, not a removed machine",
+         not wobble["told"] and not wobble["setups"] and "offline" in wobble["states"]),
+
+        ("a 401 on the REPORT reaches the same handler",
+         len(mid["told"]) == 1 and len(mid["setups"]) == 1
+         and mid["states"][-1:] == ["unpaired"]),
+        ("...without burning six retries on a token the server has already refused",
+         mid["events"] == ["poll", "result"]),
+        ("...and the report is HELD, because it is the record of what went into a return",
+         _sim_spool_names(mid) == ["sim-77.json"]),
+        ("...with no toast sending anybody to a portal that never got it",
+         not any("Review it in the Fynn portal" in m for _, m in mid["toasts"])),
+        ("...and no wedge: the loop stops instead of retrying every five seconds",
+         mid["rc"] == 1 and not mid["ran_away"]),
+
+        ("from a terminal it still says so, but opens no window — `setup` is right there",
+         len(checkout["told"]) == 1 and not checkout["setups"]
+         and checkout["rc"] == 1),
+    ]
+    return _table("a machine Fynn no longer knows says so, through every door", checks)
+
+
+def case_repair_resumes_the_loop():
+    """After a successful re-pair, is anything actually running?
+
+    THE INCIDENT THIS PINS DOWN was manufactured by the fix for the one above. The preparer
+    read "This PC is no longer connected to Fynn", clicked OK, pasted a fresh code, and read
+    "Connected as 'Front desk'. This PC will start the connector automatically when you log
+    in. Leave Drake open on its home screen." They clicked OK — and the tray icon vanished.
+    `cmd_setup` returned 0, `_unpaired` returned that 0, the run loop returned it, and the
+    process exited at the exact moment they were most certain they had just fixed it.
+    Nothing ran until the next sign-in, which on a desk that stays signed in is never.
+
+    The same shape sat on the first-run path: an unpaired machine paired, was told to leave
+    Drake open, and then ran nothing at all.
+
+    So this drives the real thing three ways — a re-pair from inside the loop, a first run
+    that pairs from inside `cmd_run`, and the real `cmd_setup` itself — and asks the only
+    question that matters afterwards: is the loop still going, and is it going with the NEW
+    token? A re-pair that leaves the old token bound ping-pongs straight back into the
+    same dialog, which from the outside is indistinguishable from a re-pair that failed."""
+    import connector
+
+    def repaired(rec):
+        rec["cred"] = {"server": _SIM_CRED["server"], "token": "NEW-TOKEN",
+                       "agent_id": "a2", "name": "Front desk (re-paired)"}
+        return 0
+
+    def revoked_then_repaired(kind, url, body, rec):
+        if kind == "result":
+            # The first attempt goes out on the dead token; whatever comes after the
+            # re-pair must not.
+            if rec["auth"][-1] == "Bearer OLD-TOKEN":
+                raise _sim_http(401)
+            return {"ok": True}
+        if kind == "poll":
+            n = rec["events"].count("poll")
+            if n == 1:
+                return {"job": {"job_id": "sim-7", "doc_type": "W-2", "doc_id": "d1",
+                                "seq": 1, "payload": {"screen": "W2"}}}
+            if n >= 3:
+                raise KeyboardInterrupt   # two clean polls after the re-pair is enough
+            return {}
+        return {}
+
+    again = _rehearse_cmd_run(revoked_then_repaired, report={"ok": True, "entered": 7},
+                              setup=repaired)
+    after = again["auth"][2:]            # everything after poll #1 and the 401'd report
+
+    # A machine whose credential cannot be read at all — `unpair` left the logon task
+    # behind, the profile was reset, Credential Manager was wiped. This used to print one
+    # line to a log nobody reads and exit within a second, at every single logon.
+    def stop_at_the_first_poll(kind, url, body, rec):
+        raise KeyboardInterrupt
+
+    first_run = _rehearse_cmd_run(stop_at_the_first_poll, cred=None,
+                                  setup=lambda rec: repaired(rec))
+    gave_up = _rehearse_cmd_run(stop_at_the_first_poll, cred=None, setup=lambda rec: 1)
+
+    def setup_run(*, frozen=True, resume=False):
+        """The REAL cmd_setup, with pairing, the credential store and schtasks faked."""
+        rec = {"told": [], "ran": [], "wrote": [], "rc": None}
+        names = ("_ask_gui", "_request", "_cred_write", "_install_autostart", "_tell",
+                 "is_frozen", "cmd_run", "_cred_read", "_log_location")
+        saved = {n: getattr(connector, n) for n in names}
+        try:
+            connector._ask_gui = lambda d: (_SIM_CRED["server"], "CODE-1")
+            connector._request = lambda *a, **k: {"token": "T2", "agent_id": "a2",
+                                                  "name": "Front desk"}
+            connector._cred_write = lambda data: rec["wrote"].append(data)
+            connector._install_autostart = lambda: True
+            connector._tell = lambda t, m, raise_it=True: rec["told"].append((t, m))
+            connector.is_frozen = lambda: frozen
+            connector.cmd_run = lambda args: (rec["ran"].append(getattr(args, "cmd", "?"))
+                                              or 0)
+            connector._cred_read = lambda: None
+            connector._log_location = lambda: "C:\\sim\\connector.log"
+            ns = connector.build_parser().parse_args(["setup"])
+            ns.resume_in_place = resume
+            rec["rc"] = connector.cmd_setup(ns)
+        finally:
+            for n, v in saved.items():
+                setattr(connector, n, v)
+        return rec
+
+    exe = setup_run()
+    resumed = setup_run(resume=True)
+    dev = setup_run(frozen=False)
+    exe_said = " ".join(m for _, m in exe["told"])
+    resumed_said = " ".join(m for _, m in resumed["told"])
+    dev_said = " ".join(m for _, m in dev["told"])
+
+    checks = [
+        ("a successful re-pair does NOT end the connector",
+         again["rc"] == 0 and not again["ran_away"]),
+        ("...the loop carries straight on, polling again",
+         again["events"].count("poll") >= 2),
+        ("...on the NEW token — an unrebound one ping-pongs back into the same dialog",
+         after and all(a == "Bearer NEW-TOKEN" for a in after)),
+        ("...and the report it was holding goes out and is cleared off the disk",
+         again["events"].count("result") == 2 and _sim_spool_names(again) == []),
+        ("...with the icon off the red 'unpaired' it was left on",
+         again["states"][-1] == "idle"),
+        ("...and the tooltip rebuilt for the name it was re-paired under",
+         getattr(again["tray"], "machine_name", "") == "Front desk (re-paired)"),
+
+        ("a machine with no credential is told, then offered the pairing window",
+         len(first_run["told"]) == 1 and len(first_run["setups"]) == 1),
+        ("...in place, because this run already holds the single-instance mutex",
+         first_run["setups"][0]["resume_in_place"] is True),
+        ("...and once it pairs, the loop actually runs",
+         first_run["events"] == ["poll"] and first_run["rc"] == 0),
+        ("...while a pairing that did not happen stops honestly instead",
+         gave_up["rc"] == 1 and gave_up["events"] == []),
+
+        ("setup from a double-click ENDS BY RUNNING, rather than exiting on 'connected'",
+         exe["ran"] == ["run"] and exe["rc"] == 0),
+        ("...and says so, instead of implying it from 'it will start when you log in'",
+         "straight away" in exe_said and "NOT running" not in exe_said),
+        ("setup called from inside a live loop starts no second connector",
+         resumed["ran"] == [] and resumed["rc"] == 0
+         and "carrying on" in resumed_said),
+        ("a developer's `setup` in a checkout stays explicit, and says it is not running",
+         dev["ran"] == [] and "NOT running yet" in dev_said),
+    ]
+    return _table("a re-pair leaves something running, on the token it just got", checks)
+
+
+def case_held_report_never_blocks_the_loop():
+    """One report Fynn will never accept — does the whole machine stop entering documents?
+
+    THE PUREST CASE OF THIS AUDIT'S BUG CLASS. `_flush_spool` runs before every poll, and
+    it used to hold the loop on ANY non-zero count: a job cancelled server-side (404), a
+    screenshot over the size cap (413), a body the server would not take (400), or a file
+    that could not even be parsed. Every five seconds, forever, ahead of all new work,
+    while the icon sat on green "connected, waiting for work" — a state byte-for-byte
+    identical to working. Documents queued in the portal were never entered and the
+    preparer was given no reason of any kind.
+
+    The fix has two halves and both are load-bearing: a report that can never be delivered
+    is moved ASIDE (never deleted — rule 2 says it is the record of what a robot typed into
+    a live return) and said out loud, while a report that is merely WAITING on a bad network
+    is still retried and still holds the gate, because that one clears itself.
+
+    The last rehearsal is the layer under the fix: a report that cannot even be moved aside
+    must still stop blocking, or the wedge simply moves one folder deeper."""
+
+    def stop_at_the_poll(kind, url, body, rec):
+        # Reaching the poll AT ALL is the point of this case.
+        raise KeyboardInterrupt
+
+    def refuse_the_held_report(kind, url, body, rec):
+        if kind == "result":
+            raise _sim_http(404, "that job no longer exists")
+        # An EMPTY poll on the pass after the rejection: nothing to do, which is the
+        # moment the loop would normally paint the icon green again.
+        if rec["events"].count("poll") >= 2:
+            raise KeyboardInterrupt
+        return {}
+
+    payload = {"ok": True, "report": {"entered": 3, "canary": "sim-canary-9f3"}}
+    dead = _rehearse_cmd_run(refuse_the_held_report, spool={"sim-404.json": payload})
+    unreadable = _rehearse_cmd_run(stop_at_the_poll, spool={"sim-bad.json": "{ half a rep"})
+    torn = _rehearse_cmd_run(stop_at_the_poll, spool={"sim-torn.json.part": payload})
+
+    def wobbly(kind, url, body, rec):
+        if kind == "result":
+            if rec["events"].count("result") >= 8:
+                raise KeyboardInterrupt
+            raise _sim_http(503, "gateway timeout")
+        raise KeyboardInterrupt   # a poll here would mean new work claimed ahead of it
+
+    waiting = _rehearse_cmd_run(wobbly, spool={"sim-503.json": payload})
+
+    def refuse_twice(kind, url, body, rec):
+        if kind == "result":
+            raise _sim_http(404, "that job no longer exists")
+        if rec["events"].count("poll") >= 2:
+            raise KeyboardInterrupt
+        return {}
+
+    # A FILE where the "rejected" folder needs to go, so the move itself cannot work.
+    immovable = _rehearse_cmd_run(refuse_twice,
+                                  spool={"sim-404.json": payload,
+                                         "rejected": "a file in the folder's place"})
+
+    import json as jsonmod
+    kept = rejected_content = None
+    if (dead["spool"] / "rejected" / "sim-404.json").is_file():
+        rejected_content = jsonmod.loads(
+            (dead["spool"] / "rejected" / "sim-404.json").read_text(encoding="utf-8"))
+        kept = True
+
+    checks = [
+        ("a report Fynn will never accept stops blocking the poll",
+         "poll" in dead["events"] and dead["rc"] == 0 and not dead["ran_away"]),
+        ("...after ONE attempt, not one every five seconds forever",
+         dead["events"].count("result") == 1),
+        ("...moved aside rather than deleted — it is the record of what was typed",
+         kept is True and rejected_content == payload
+         and _sim_spool_names(dead) == []),
+        ("...and said out loud, naming what the person has to do about it",
+         any("could not be sent" in t and "Fynn support" in m
+             for t, m in dead["toasts"])),
+        ("...and the icon never goes back to green, not even with nothing left to do",
+         dead["states"][:2] == ["starting", "idle"]
+         and set(dead["states"][2:]) == {"error"}),
+
+        ("a held report that cannot even be read is set aside, not retried for ever",
+         unreadable["events"].count("result") == 0
+         and _sim_spool_names(unreadable, "rejected") == ["sim-bad.json"]
+         and "poll" in unreadable["events"]),
+        ("a half-written .json.part is found at all — glob('*.json') never matched it",
+         _sim_spool_names(torn, "rejected") == ["sim-torn.json.part"]
+         and "poll" in torn["events"] and bool(torn["toasts"])),
+
+        ("a report the network merely could not deliver is NOT given up on",
+         _sim_spool_names(waiting) == ["sim-503.json"]
+         and _sim_spool_names(waiting, "rejected") == []),
+        ("...it is retried hard, the way a stranded return deserves",
+         waiting["events"].count("result") >= 6),
+        ("...and it does hold the gate — but says so, in amber, never in green",
+         "poll" not in waiting["events"]
+         and set(waiting["states"][2:]) == {"offline"}
+         and any("still to go" in d for d in waiting["details"])),
+
+        ("a report that cannot even be moved aside still stops blocking the loop",
+         "poll" in immovable["events"] and immovable["rc"] == 0),
+        ("...is retried once and then remembered, not attempted on every pass",
+         immovable["events"].count("result") == 1
+         and immovable["events"].count("poll") == 2
+         and "sim-404" in immovable["gave_up"]),
+        ("...is still on disk, and its contents go to the log as the last record",
+         (immovable["spool"] / "sim-404.json").is_file()
+         and "sim-canary-9f3" in immovable["log"]),
+    ]
+    return _table("a report that cannot be sent never stops the ones that can", checks)
+
+
+def case_drake_closed_is_said_out_loud():
+    """Drake is shut on the first real run. What does the customer actually see?
+
+    Before this: a grey dot, hidden by default in Windows' ^ overflow flyout, the same grey
+    as "starting" — so even somebody watching the icon could not tell "booting up, wait" from
+    "I need you to open Drake". The instruction that would have fixed it lived in a tooltip,
+    which requires knowing the icon exists, finding it, and hovering. The loop did the right
+    thing every fifteen seconds and told only its log file.
+
+    Three things have to hold, and a fourth must not break: the state gets ITS OWN colour;
+    it puts WORDS on screen on the transition; it does not repeat those words so often that
+    people learn to dismiss the only channel we have; and when the preparer does what they
+    were asked, they are told it worked — otherwise a first run can finish a whole day
+    without one positive confirmation."""
+    import connector
+    import tray as tray_mod
+
+    def opens_on_the_third_look(n):
+        return n >= 3
+
+    def liveness_then_stop(kind, url, body, rec):
+        # The liveness ping must be ANSWERED, not used as the brake: it is the whole
+        # reason the portal can say "PC on, Drake not open" instead of "offline".
+        if kind == "poll":
+            raise KeyboardInterrupt
+        return {}
+
+    opened = _rehearse_cmd_run(liveness_then_stop, drake=opens_on_the_third_look)
+
+    def ping_twice(kind, url, body, rec):
+        if rec["events"].count("ping") >= 2:
+            raise KeyboardInterrupt
+        return {}
+
+    quiet = _rehearse_cmd_run(ping_twice, drake=False, frozen=False)
+
+    waiting = [(t, m) for t, m in opened["toasts"] if "waiting for Drake" in t]
+    connected = [(t, m) for t, m in opened["toasts"] if "connected to Drake" in t]
+    colours = {name: tray_mod.STATES[name][0]
+               for name in ("no-drake", "starting", "offline", "idle")}
+
+    checks = [
+        ("Drake shut puts words on screen, not just a colour on an icon",
+         len(waiting) == 1),
+        ("...telling the preparer the one thing they can do about it",
+         bool(waiting) and "Open Drake" in waiting[0][1]),
+        ("...and the tooltip carries the same instruction",
+         any("Open Drake" in d for d in opened["details"])),
+        ("...said once, not on every fifteen-second pass",
+         opened["states"][:3] == ["starting", "no-drake", "no-drake"]),
+        ("...and repeated slowly enough to stay worth reading (>= 10 min apart)",
+         connector.NO_DRAKE_SAY_EVERY * connector.DRAKE_RETRY_SEC >= 600),
+        ("'waiting for Drake' does not wear the same colour as 'starting'",
+         colours["no-drake"] != colours["starting"]),
+        ("...nor amber, which already means 'cannot reach Fynn'",
+         colours["no-drake"] != colours["offline"] != colours["idle"]),
+        ("when Drake finally opens, the person who did what was asked is told it worked",
+         len(connected) == 1),
+        ("...and that confirmation still never claims a filing",
+         bool(connected) and "never files" in connected[0][1]),
+        ("...and the loop then gets on with work",
+         opened["states"][-1] == "idle" and "poll" in opened["events"]),
+        ("in a checkout it stays quiet — the console in front of the developer said it",
+         quiet["toasts"] == [] and "no-drake" in quiet["states"]),
+    ]
+    return _table("Drake closed is said in words, not left to a grey dot", checks)
+
+
+def case_quit_waits_for_the_loop():
+    """Click Quit. The icon vanishes. Is it safe to start typing into Drake?
+
+    IT WAS NOT. `_quit` removed the icon first and asked the loop to stop second — and the
+    loop deliberately stops only at a safe point, never mid-document. So between the click
+    and the actual stop there could be seconds (a poll), or many minutes (a report's retry
+    chain, a document being entered), in which the only confirmation this product gives said
+    "gone" while the robot was still typing into a live tax return. Somebody who then starts
+    keying by hand is the second keyboard this whole design exists to prevent.
+
+    The REAL Tray runs here, with only pystray's icon object faked, and the REAL run loop
+    drives it: Quit is clicked in the middle of a report going out, exactly as it would be.
+    The latch matters as much as the ordering — without it the document finishes, the loop
+    calls `_state("idle")`, and the icon repaints GREEN in front of somebody who just asked
+    it to stop, which is a worse lie than the one being fixed."""
+    import tray as tray_mod
+
+    class _Icon:
+        """Just enough pystray to be repainted, toasted at, and removed."""
+        def __init__(self):
+            self.stopped = 0
+            self.icon = None
+            self.title = ""
+            self.toasts = []
+
+        def stop(self):
+            self.stopped += 1
+
+        def notify(self, message, title):
+            self.toasts.append((title, message))
+
+    # -- the click on its own, against the real Tray -------------------------
+    icon = _Icon()
+    asked = []
+    t = tray_mod.Tray(machine_name="Front desk", on_quit=lambda: asked.append("stop"))
+    t._icon = icon
+    t.set_state("working", "entering a W-2")
+    t._quit()
+    stopped_at_click, said_at_click, title_at_click = icon.stopped, t._state, t._title()
+    t.set_state("idle")            # the document finishes AFTER the click
+    after_document = t._state
+    t.stop()                       # what atexit does when the process really ends
+
+    # -- and again, through the real run loop --------------------------------
+    loop_icon = _Icon()
+    # Captured BEFORE the rehearsal swaps tray_mod.Tray for its factory — reading it
+    # inside would hand the factory back to itself.
+    real_tray_class = tray_mod.Tray
+
+    def tray_factory(machine_name="", server="", on_quit=None):
+        real = real_tray_class(machine_name=machine_name, server=server, on_quit=on_quit)
+        real._icon = loop_icon
+        real.start = lambda: True   # pystray is the one part that cannot run headless
+        return real
+
+    def quit_mid_report(kind, url, body, rec):
+        if kind == "result":
+            rec["tray"]._quit()     # they click Quit while the report is going out
+            return {"ok": True}
+        if rec["events"].count("poll") > 1:
+            # A second poll means the quit was not honoured at the top of the iteration.
+            raise KeyboardInterrupt
+        return {"job": {"job_id": "sim-9", "doc_type": "W-2", "doc_id": "d1", "seq": 1,
+                        "payload": {"screen": "W2"}}}
+
+    run = _rehearse_cmd_run(quit_mid_report, report={"ok": True, "entered": 7},
+                            tray_factory=tray_factory)
+    survived_the_run = loop_icon.stopped
+    # What atexit would do at the real end of the process. Called here so the check below
+    # is an assertion rather than a side effect hidden inside one.
+    for fn in run["atexit"]:
+        fn()
+
+    checks = [
+        ("clicking Quit does NOT remove the icon", stopped_at_click == 0),
+        ("...it asks the loop to stop", asked == ["stop"]),
+        ("...and says so in words a person can read while they wait",
+         said_at_click == "stopping" and "stopping" in title_at_click),
+        ("...and nothing repaints over that — not even the document that was in flight",
+         after_document == "stopping"),
+        ("the icon still goes when the process really ends", icon.stopped == 1),
+
+        ("through the real loop: the icon survives the click",
+         survived_the_run == 0 and run["rc"] == 0),
+        ("...the document in flight is reported first",
+         run["events"] == ["poll", "result"]),
+        ("...the loop then stops at its safe point, without polling again",
+         run["events"].count("poll") == 1 and not run["ran_away"]),
+        ("...and the icon was never repainted green behind the quit",
+         run["tray"]._state == "stopping"),
+        ("removal is left to the process ending, which is what atexit is for",
+         run["atexit"][:1] == [run["tray"].stop]),
+        ("...and that removal does work when it fires", loop_icon.stopped == 1),
+    ]
+    return _table("Quit: the icon disappearing means stopped, never 'asked to stop'",
+                  checks)
+
+
+def _fake_tkinter():
+    """A tkinter that draws nothing, so the real dialog code can be run headlessly.
+
+    The alternative is real tkinter, which would open windows over whoever is running the
+    suite — and would make the case unrunnable on a build machine. Everything the dialogs
+    actually do to WIN THE FOREGROUND is recorded instead of performed.
+    """
+    import types
+
+    rec = {"roots": [], "boxes": [], "entries": [], "after": [], "typed": [],
+           "press_return": False, "explode": False}
+
+    class _Widget:
+        def __init__(self, master=None, **kw):
+            self.master = master
+            self.kw = dict(kw)
+
+        def grid(self, *a, **k):
+            return self
+
+        def config(self, **k):
+            self.kw.update(k)
+
+        def focus(self):
+            pass
+
+        def bind(self, seq, fn):
+            pass
+
+    class _Entry(_Widget):
+        def __init__(self, master=None, **kw):
+            super().__init__(master, **kw)
+            self._text = rec["typed"].pop(0) if rec["typed"] else ""
+            rec["entries"].append(self)
+
+        def insert(self, index, text):
+            self._text = str(text)
+
+        def get(self):
+            return self._text
+
+    class _Root(_Widget):
+        def __init__(self, *a, **k):
+            if rec["explode"]:
+                raise RuntimeError("no display name and no $DISPLAY environment variable")
+            super().__init__(*a, **k)
+            self.raised = []
+            self.bindings = {}
+            self.destroyed = 0
+            rec["roots"].append(self)
+
+        def title(self, *a):
+            pass
+
+        def resizable(self, *a):
+            pass
+
+        def withdraw(self):
+            pass
+
+        def destroy(self):
+            self.destroyed += 1
+
+        def attributes(self, *a):
+            self.raised.append(tuple(a))
+
+        def lift(self):
+            self.raised.append(("lift",))
+
+        def focus_force(self):
+            self.raised.append(("focus_force",))
+
+        def after(self, ms, fn):
+            rec["after"].append((ms, fn))
+
+        def bind(self, seq, fn):
+            self.bindings[seq] = fn
+
+        def mainloop(self):
+            # "The person pressed Enter" or "the person closed the window" — the two ways
+            # out of the pairing dialog, and setup must do the right thing with both.
+            fn = self.bindings.get("<Return>")
+            if rec["press_return"] and fn is not None:
+                fn(None)
+
+    tk = types.ModuleType("tkinter")
+    tk.Tk = _Root
+    ttk = types.ModuleType("tkinter.ttk")
+    ttk.Frame = _Widget
+    ttk.Label = _Widget
+    ttk.Entry = _Entry
+    ttk.Button = _Widget
+    mb = types.ModuleType("tkinter.messagebox")
+    mb.showinfo = lambda title, message, parent=None: rec["boxes"].append(
+        (title, message, parent))
+    tk.ttk = ttk
+    tk.messagebox = mb
+    return rec, {"tkinter": tk, "tkinter.ttk": ttk, "tkinter.messagebox": mb}
+
+
+def case_dialogs_are_raised_over_drake():
+    """Does anything this program says actually appear IN FRONT of Drake?
+
+    WITHOUT THE RAISE, EVERY WINDOW THIS PROGRAM SHOWS IS INVISIBLE IN PRACTICE. Drake runs
+    maximised and takes the foreground the moment the driver attaches, so a plain `Tk()`
+    opens BEHIND it: created, visible, waiting — while the process blocks on a click nobody
+    knows to make and the person sees Drake flicker and nothing else. That cost a real setup
+    session, and it is what makes every other message in this file worth nothing.
+
+    The REAL `_tell`, `_ask_gui` and `_raise_above_drake` run here against a tkinter that
+    draws nothing. The version of this case that read source strings could not tell the
+    difference between the fix and the comment ABOVE the fix: deleting `parent=root` — which
+    is the whole reason a messagebox inherits the raise, since a parentless one builds its
+    own toplevel and ignores it — left the check green, because the comment two lines up
+    says the words "parent=root"."""
+    import contextlib
+    import io
+    import sys as _sys
+
+    import connector
+    import tray as tray_mod
+
+    rec, mods = _fake_tkinter()
+    saved_mods = {k: _sys.modules.get(k) for k in mods}
+    saved_frozen, saved_box = connector.is_frozen, tray_mod.message_box
+    boxed = []
+    try:
+        _sys.modules.update(mods)
+        connector.is_frozen = lambda: True     # a checkout prints instead of showing a box
+        tray_mod.message_box = lambda t, m: boxed.append((t, m)) or True
+
+        # Both streams: _tell prints its own line, and the tkinter-is-gone rehearsal
+        # below prints the failure to stderr. A PASSING case must not look like a crash.
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            connector._tell("Fynn connector", "This PC is no longer connected to Fynn.")
+            told_root = rec["roots"][-1]
+            told_box = rec["boxes"][-1]
+            # Let go of topmost when the window has won the front, or a pairing dialog
+            # pins itself over every other window on the machine while it is open.
+            dropped_before = list(told_root.raised)
+            for _, fn in list(rec["after"]):
+                fn()
+
+            # The one caller that must NOT steal focus: it runs on a background thread
+            # while the driver may be attached, and a topmost Fynn box can land inside an
+            # evidence screenshot or a read-back OCR crop, which is a safety gate.
+            connector._tell("Fynn connector", "Running in the background.", raise_it=False)
+            quiet_root = rec["roots"][-1]
+            quiet_box = rec["boxes"][-1]
+
+            rec["typed"], rec["press_return"] = ["", "CODE-1"], True
+            asked = connector._ask_gui("https://prefill.fynn.invalid")
+            ask_root = rec["roots"][-1]
+            prefilled = rec["entries"][0]._text if rec["entries"] else None
+
+            rec["press_return"] = False
+            rec["typed"] = ["", ""]
+            closed = connector._ask_gui("https://prefill.fynn.invalid")
+
+            # tkinter gone entirely. The fallback used to be print(), which in the
+            # windowed build it exists for writes to a stdout that is None: a safety net
+            # made of the same material as the hole.
+            rec["explode"] = True
+            connector._tell("Fynn", "Fynn hit a problem it did not expect.")
+    finally:
+        for k, v in saved_mods.items():
+            if v is None:
+                _sys.modules.pop(k, None)
+            else:
+                _sys.modules[k] = v
+        connector.is_frozen, tray_mod.message_box = saved_frozen, saved_box
+
+    # The real _raise_above_drake, against a window that records instead of drawing.
+    class _Root:
+        def __init__(self, lift_raises=False):
+            self.calls = []
+            self.after = lambda ms, fn: self.calls.append(("after", ms, fn))
+            self._lift_raises = lift_raises
+
+        def attributes(self, *a):
+            self.calls.append(("attributes",) + tuple(a))
+
+        def lift(self):
+            if self._lift_raises:
+                raise RuntimeError("the window manager said no")
+            self.calls.append(("lift",))
+
+        def focus_force(self):
+            self.calls.append(("focus_force",))
+
+    plain = _Root()
+    connector._raise_above_drake(plain)
+    after_cb = [c for c in plain.calls if c[0] == "after"]
+    if after_cb:
+        after_cb[0][2]()
+    stubborn = _Root(lift_raises=True)
+    lost = False
+    try:
+        connector._raise_above_drake(stubborn)
+    except Exception:
+        lost = True
+
+    checks = [
+        ("a message box is raised over Drake before it is shown",
+         ("-topmost", True) in dropped_before and ("lift",) in dropped_before),
+        ("...and PARENTED to the raised window, or it ignores the raise entirely",
+         told_box[2] is told_root),
+        ("...carrying the words it was given",
+         told_box[0] == "Fynn connector"
+         and "no longer connected" in told_box[1]),
+        ("...and it stops being topmost afterwards, rather than pinning itself over Drake",
+         ("-topmost", False) in told_root.raised),
+        ("the one notice that must not steal focus does not raise itself",
+         quiet_root.raised == [] and quiet_box[2] is quiet_root),
+        ("the pairing window is raised over Drake too",
+         ("-topmost", True) in ask_root.raised),
+        ("...opens with the Fynn address already in it",
+         prefilled == "https://prefill.fynn.invalid"),
+        ("...and hands back what was typed",
+         asked == ("https://prefill.fynn.invalid", "CODE-1")),
+        ("...while a window that was simply closed pairs nothing", closed is None),
+        ("when tkinter is gone, the last resort is a box Windows draws, not print()",
+         bool(boxed) and "did not expect" in boxed[-1][1]),
+
+        ("the raise takes topmost, lifts, and takes the keyboard for the paste",
+         ("attributes", "-topmost", True) in plain.calls
+         and ("lift",) in plain.calls and ("focus_force",) in plain.calls),
+        ("...and schedules the release of topmost rather than keeping it",
+         bool(after_cb) and ("attributes", "-topmost", False) in plain.calls),
+        ("a window that cannot be raised is still shown — never lost over cosmetics",
+         not lost),
+    ]
+    return _table("every window this program shows opens in front of Drake", checks)
+
+
 def case_tray_notify_is_output_only():
     """Can a toast take the connector down? The tray reports state, it never decides it —
     and a notification failure must never break the thing it reports on.
@@ -5062,6 +6164,13 @@ def main() -> int:
         ('connector_setup_prefill', lambda: case_connector_setup_prefill()),
         ('connector_run_toasts', lambda: case_connector_run_toasts()),
         ('tray_notify_output_only', lambda: case_tray_notify_is_output_only()),
+        ('revoked_machine_is_visible', lambda: case_revoked_machine_is_visible()),
+        ('drake_dies_inside_the_poll', lambda: case_drake_dies_inside_the_poll()),
+        ('repair_resumes_the_loop', lambda: case_repair_resumes_the_loop()),
+        ('held_report_never_blocks', lambda: case_held_report_never_blocks_the_loop()),
+        ('drake_closed_said_out_loud', lambda: case_drake_closed_is_said_out_loud()),
+        ('quit_waits_for_the_loop', lambda: case_quit_waits_for_the_loop()),
+        ('dialogs_raised_over_drake', lambda: case_dialogs_are_raised_over_drake()),
         ('caret_stranded_run_rearms', lambda: case_stranded_run_rearms_caret()),
         ('caret_no_popup_no_caret_rearms', lambda: case_no_popup_no_caret_rearms()),
         ('caret_rearm_impossible_halts', lambda: case_rearm_that_cannot_work_halts_clean()),
@@ -5143,7 +6252,17 @@ def main() -> int:
     for label, fn in cases:
         if only and only.lower() not in label.lower():
             continue
-        fn()
+        try:
+            fn()
+        except Exception:
+            # A CASE THAT CRASHES IS A FAILED CASE, NOT A MISSING ONE. A bare `fn()` here
+            # meant one renamed function (an AttributeError inside a case) aborted the run
+            # and the seventy cases after it never executed — with no summary line to say
+            # so. Recorded through _check, so it counts red like any other failure and the
+            # traceback is right there. KeyboardInterrupt still stops the suite: that one
+            # is a person asking it to stop.
+            import traceback
+            _check(f"{label} — the case itself crashed", False, traceback.format_exc())
     if not _results:
         # An empty run must never look like a clean one — that is how a filter typo
         # turns into 'the mutant was killed' when nothing ran at all.

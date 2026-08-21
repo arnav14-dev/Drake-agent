@@ -55,12 +55,34 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 # State
 # ---------------------------------------------------------------------------
 
-# (colour, short label). The colour is what a person actually reads at a glance, so the
-# three states that mean "somebody has to do something" are the three that are not green.
+# (colour, short label). The colour is what a person actually reads at a glance, so every
+# state that means "somebody has to do something" is a state that is not green.
+#
+# NO TWO STATES MAY SHARE A COLOUR UNLESS THEY MEAN THE SAME THING TO THE PERSON.
+# `no-drake` used to be the same grey as `starting`, so the one state a preparer can
+# actually fix — open Drake — was indistinguishable from "booting up, wait a moment", and
+# somebody watching the icon had no way to tell them apart. It gets its own hue (purple)
+# rather than amber, because amber is already "cannot reach Fynn": painting "open Drake"
+# amber would have sent the office to phone their ISP instead of clicking Drake.
+#
+# `error` is deliberately NOT amber either. Every unexpected internal fault used to be
+# reported as `offline`, so a bug in our own JSON handling read as a network outage and the
+# firm rang their IT provider about weather. It is red-family because the honest reading is
+# "this needs a person", which is what the other two reds already say.
+#
+# `stopping` exists because the icon disappearing has to mean STOPPED. A quit waits for a
+# safe point (never mid-document), so between the click and the actual stop there can be
+# minutes in which the robot is still typing into Drake — see Tray._quit.
 STATES = {
     "starting":  ("#9aa0a6", "starting"),
-    "no-drake":  ("#9aa0a6", "waiting for Drake to open"),
+    # NOT the same grey as `starting`, which is the mistake this block's own rule exists to
+    # prevent: a preparer who clicks Quit at 4:55pm and sees the boot-up grey reads "it is
+    # coming back" and walks away, while the robot is still finishing a document. Darker,
+    # so "on its way out" cannot be mistaken for "on its way in".
+    "stopping":  ("#5f6368", "finishing what it is doing, then stopping"),
+    "no-drake":  ("#a142f4", "waiting for Drake to open"),
     "offline":   ("#e8a33d", "cannot reach Fynn"),
+    "error":     ("#a50e0e", "something went wrong in Fynn — see the log"),
     "idle":      ("#2e9e4f", "connected, waiting for work"),
     "working":   ("#1a73e8", "entering a document"),
     "halted":    ("#d93025", "held — a document needs review in the portal"),
@@ -119,6 +141,17 @@ class _Tee:
             # A log we cannot write is not a reason to refuse to work.
             self._fh = None
 
+    @property
+    def opened(self) -> bool:
+        """Did this tee actually get a file? Callers used to have no way to ask.
+
+        install_log_tee returned the path whether or not anything opened, so the banner,
+        the no-tray dialog and the tray's "Open log" all named a file that might not
+        exist — sending a person to look for the record of what was typed into a return
+        and finding nothing there.
+        """
+        return self._fh is not None
+
     def _rotate_if_needed(self) -> None:
         if self._fh is None or self._written < LOG_MAX_BYTES:
             return
@@ -164,18 +197,91 @@ class _Tee:
             return False
 
 
+# The file the tee actually managed to open, and whether it managed at all. Everything
+# that NAMES the log to a person — the banner, the no-tray dialog, the tray menu — reads
+# these rather than LOG_PATH, so nobody is ever sent to a file that was never written.
+ACTIVE_LOG_PATH = LOG_PATH
+LOG_TEE_OK = False
+
+
+def _log_path_candidates() -> list:
+    """Where to try to write the log, best first.
+
+    ~/.fynn-connector is the documented home and stays first. The fallbacks exist because
+    the log is the record of what a robot typed into somebody's tax return, and losing it
+    to a full disk, an antivirus rule, a FYNN_CONNECTOR_HOME pointed at a mapped drive
+    that is not connected yet at logon, or a stray FILE named .fynn-connector is not a
+    trade worth making when %LOCALAPPDATA% is sitting right there.
+    """
+    cands = [LOG_PATH]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        cands.append(Path(local) / "Fynn" / "connector.log")
+    tmp = os.environ.get("TEMP") or os.environ.get("TMP")
+    if tmp:
+        cands.append(Path(tmp) / "fynn-connector.log")
+    return cands
+
+
 def install_log_tee() -> Path:
     """Send stdout and stderr to the log file as well as wherever they already go.
 
-    Returns the log path. Called once, at the top of `run`, BEFORE anything is printed —
-    including the banner, which is what tells you which version wrote the lines below it.
+    Returns the path that was ACTUALLY opened. Called once, at the top of `run`, BEFORE
+    anything is printed — including the banner, which is what tells you which version
+    wrote the lines below it — and once in `main` for the commands that never reach `run`,
+    because a first install that fails used to leave no trace at all.
 
     `sys.stdout` is None in a windowed (console=False) build, which is exactly the build
     that needs this most; `_Tee` handles a missing stream rather than assuming one.
     """
-    sys.stdout = _Tee(sys.stdout, LOG_PATH)
-    sys.stderr = _Tee(sys.stderr, LOG_PATH)
-    return LOG_PATH
+    global ACTIVE_LOG_PATH, LOG_TEE_OK
+    if isinstance(sys.stdout, _Tee) and isinstance(sys.stderr, _Tee):
+        # ALREADY TEED, and wrapping a tee in a tee writes every line to the log twice.
+        # `setup` now tees in main() and then enters the run loop, which tees again — and
+        # a log that says everything twice is a log somebody stops trusting.
+        return ACTIVE_LOG_PATH
+    out = None
+    for cand in _log_path_candidates():
+        out = _Tee(sys.stdout, cand)
+        if out.opened:
+            ACTIVE_LOG_PATH, LOG_TEE_OK = cand, True
+            break
+    if not LOG_TEE_OK:
+        # Nowhere on this machine would take it. Still tee: the streams stay valid and the
+        # console (if there is one) keeps working. The CALLER is told the truth by
+        # LOG_TEE_OK so it can say "not being written" instead of naming a phantom file.
+        ACTIVE_LOG_PATH = LOG_PATH
+        out = _Tee(sys.stdout, LOG_PATH)
+    sys.stdout = out
+    sys.stderr = _Tee(sys.stderr, ACTIVE_LOG_PATH)
+    return ACTIVE_LOG_PATH
+
+
+def message_box(title: str, text: str) -> bool:
+    """A message box drawn by Windows itself. The last channel left when tkinter is gone.
+
+    `_tell`'s fallback used to be `print`, which in the windowed build it exists for is a
+    guaranteed no-op — sys.stdout is None there, so print raises nothing and writes
+    nowhere. A safety net made of the same material as the hole is not a net.
+
+    MB_SETFOREGROUND|MB_TOPMOST because Drake runs maximised: a box that opens behind it
+    is the same as no box at all, and this one is the fallback for the case where the
+    tkinter raise never happened. Returns False if even this could not be shown.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        MB_OK = 0x0
+        MB_ICONINFORMATION = 0x40
+        MB_SETFOREGROUND = 0x10000
+        MB_TOPMOST = 0x40000
+        ctypes.windll.user32.MessageBoxW(
+            None, str(text), str(title),
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST)
+        return True
+    except Exception:
+        return False
 
 
 def attach_parent_console() -> bool:
@@ -209,17 +315,42 @@ def attach_parent_console() -> bool:
 
 
 def open_log() -> None:
-    """Show the log in whatever the machine uses for text files."""
+    """Show the log in whatever the machine uses for text files.
+
+    This is the only diagnostic the product exposes, so it may not end in a silent `pass`:
+    every step has a next step, and the last one is a box naming the path so it can be
+    typed into Explorer by hand.
+
+    It also NEVER creates the file. It used to write "(nothing logged yet)" into a missing
+    log — so a preparer clicking this after a day of entered documents read a file
+    asserting that nothing had happened, which is an affirmative lie rather than an
+    absence.
+    """
+    path = ACTIVE_LOG_PATH
+    if not path.exists():
+        message_box("Fynn connector",
+                    f"No log has been written on this PC yet.\n\nWhen there is one it "
+                    f"will be here:\n{path}")
+        return
     try:
-        if not LOG_PATH.exists():
-            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            LOG_PATH.write_text("(nothing logged yet)\n", encoding="utf-8")
-        os.startfile(str(LOG_PATH))  # noqa: S606 — Windows-only, and the path is ours
+        os.startfile(str(path))  # noqa: S606 — Windows-only, and the path is ours
+        return
     except Exception:
-        try:
-            subprocess.Popen(["notepad.exe", str(LOG_PATH)])
-        except Exception:
-            pass
+        pass
+    try:
+        subprocess.Popen(["notepad.exe", str(path)])
+        return
+    except Exception:
+        pass
+    try:
+        # No .log handler registered, or the shell verb is blocked by policy: show the
+        # file sitting in its folder instead, which is one double-click from readable.
+        subprocess.Popen(["explorer.exe", f"/select,{path}"])
+        return
+    except Exception:
+        pass
+    message_box("Fynn connector",
+                f"The log could not be opened from here.\n\nIt is at:\n{path}")
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +395,8 @@ class Tray:
         self._thread = None
         self._state = "starting"
         self._detail = ""
+        # One-way: set by _quit and never cleared. See _quit and set_state.
+        self._stopping = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -305,9 +438,20 @@ class Tray:
     # -- input -------------------------------------------------------------
 
     def set_state(self, state: str, detail: str = "") -> None:
-        """Called from the run loop. Never raises, never blocks on the UI."""
-        if state not in STATES:
+        """Called from the run loop. Never raises, never blocks on the UI.
+
+        ONCE QUIT HAS BEEN ASKED FOR, THIS STOPS LISTENING. The run loop keeps working to
+        its safe point after the click — it may finish a document and then call
+        set_state("idle") — and repainting the icon green, "connected, waiting for work",
+        in front of somebody who just clicked Quit is a worse lie than the one this
+        replaces. The latch is one-way and lives here rather than in the loop, so the tray
+        still cannot influence anything: it only refuses to overwrite its own last word.
+        """
+        if state not in STATES or self._stopping:
             return
+        self._paint(state, detail)
+
+    def _paint(self, state: str, detail: str = "") -> None:
         self._state = state
         self._detail = detail or ""
         if self._icon is None:
@@ -350,7 +494,22 @@ class Tray:
         return line[:127]
 
     def _quit(self) -> None:
-        self.stop()
+        """Ask the run loop to stop. THE ICON MUST NOT VANISH YET.
+
+        It used to call stop() first, which removes the icon instantly — and the icon
+        disappearing is the only confirmation this product gives. But a quit deliberately
+        waits for a safe point (never mid-document), so the loop can still be inside a
+        document, inside the 25-second long poll, or inside a report's retry chain: from
+        seconds to many minutes in which the visible state said "gone" while the robot was
+        still typing into a live tax return. Somebody who then starts keying into Drake by
+        hand is the second keyboard this whole design exists to prevent.
+
+        So: say "stopping", latch it so nothing repaints over it, and let the
+        atexit-registered stop() remove the icon when the process actually ends. The icon
+        disappearing then means STOPPED, never "asked to stop".
+        """
+        self._stopping = True
+        self._paint("stopping", "it will not stop mid-document — this can take a minute")
         if self._on_quit is not None:
             try:
                 self._on_quit()
