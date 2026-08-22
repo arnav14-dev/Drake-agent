@@ -1,0 +1,41 @@
+# Windows version resource for the built exe (referenced from connector.spec).
+#
+# THIS IS PART OF THE ANTIVIRUS STORY, NOT COSMETICS. Defender's ML heuristics score
+# an executable partly on what it declares about itself: a 21MB unsigned binary with
+# NO company, NO product name and NO version looks exactly like the things people
+# actually get infected by, and on 2026-08-22 that score plus our keystroke behaviour
+# got a build's hash marked malicious in Microsoft's cloud — after which every
+# customer's download of that exact file said "virus detected". A version resource
+# does not sign the file (only the code-signing certificate truly fixes reputation),
+# but it removes the "anonymous binary" penalty and it is what Windows shows a human
+# who right-clicks → Properties → Details before deciding to trust it.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 1, 0),
+    prodvers=(1, 0, 1, 0),
+    mask=0x3F,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0),
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        "040904B0",
+        [
+          StringStruct("CompanyName", "Fynn Labs"),
+          StringStruct("FileDescription", "Fynn Drake Connector — enters reviewed tax documents into Drake Tax. Never files."),
+          StringStruct("FileVersion", "1.0.1.0"),
+          StringStruct("InternalName", "FynnConnector"),
+          StringStruct("OriginalFilename", "FynnConnector.exe"),
+          StringStruct("ProductName", "Fynn"),
+          StringStruct("ProductVersion", "1.0.1.0"),
+          StringStruct("LegalCopyright", "© 2026 Fynn Labs"),
+        ],
+      )
+    ]),
+    VarFileInfo([VarStruct("Translation", [1033, 1200])]),
+  ],
+)

@@ -94,4 +94,8 @@ exe = EXE(
     # while a tray module ships inside the exe.
     console=False,
     icon=None,
+    # Company/product/version metadata — see version_info.txt for why this exists
+    # (an anonymous binary scores worse with Defender's heuristics, and a build's
+    # hash was cloud-blacklisted on 2026-08-22 partly on that account).
+    version='version_info.txt',
 )

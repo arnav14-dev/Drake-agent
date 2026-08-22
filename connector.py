@@ -60,7 +60,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # Where a fresh install points unless somebody says otherwise. Baked in because the person
 # running setup is a tax preparer, not IT: the address field used to open EMPTY on a fresh
