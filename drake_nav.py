@@ -752,6 +752,18 @@ def open_client(driver, client_id, *, first_name=None, last_name=None, create: b
     import time
     want_name = bool(str(first_name or "").strip() or str(last_name or "").strip())
     chosen, rows = None, []
+    # "NOT FOUND" IS A CLAIM ABOUT DRAKE, AND ONE READ IS NOT EVIDENCE. Drake populates
+    # the grid a beat AFTER the search box fills — read in that beat and an existing
+    # client looks exactly like a missing one. This loop used to break on the FIRST
+    # not-found, so the whole retry existed only for the happy path: a client who was
+    # plainly in Drake was reported as absent, with the agent's own halt screenshot
+    # showing the row that had painted moments later (live, 2026-08-23; the report's
+    # empty candidates list is the fingerprint — the grid was empty, not unmatched).
+    # A miss only counts once the grid has answered the same way, consecutively, for
+    # long enough that "still painting" is no longer a plausible reading. The deadline
+    # still bounds the whole search, so a truly absent client costs ~1.5s more, once.
+    NOT_FOUND_STABLE_READS = 8  # ~1.5s+ of consecutive agreement at 0.15s per lap
+    misses_in_a_row = 0
     deadline = time.time() + float(timeout)
     while time.time() < deadline:
         rows = collect_client_rows(driver.nav_elements(dlg))
@@ -764,8 +776,15 @@ def open_client(driver, client_id, *, first_name=None, last_name=None, create: b
             # name is the fix; loosening the check would not be.
             if not want_name or (chosen["row"].get("name") or "").strip():
                 break
+            misses_in_a_row = 0
         elif chosen.get("not_found"):
-            break
+            misses_in_a_row += 1
+            if misses_in_a_row >= NOT_FOUND_STABLE_READS:
+                break
+        else:
+            # Ambiguity (duplicate ids) is decided at the deadline, not instantly —
+            # half-painted grids can transiently double a row.
+            misses_in_a_row = 0
         time.sleep(0.15)
     if chosen is None:
         return _fail("search", "the client list never became readable")

@@ -5046,6 +5046,110 @@ def case_drake_dies_inside_the_poll():
     return _table("Drake closing mid-poll costs a job, never a return", checks)
 
 
+def case_client_search_grid_race():
+    """Drake paints the search grid a beat after the SSN is typed. Does one early read
+    turn an existing client into "no client in Drake"?
+
+    THE BUG THIS PINS DOWN (live, 2026-08-23): the search loop broke on its FIRST
+    not-found read, so the retry existed only for the happy path. The agent typed the
+    SSN, read the grid before Drake had filtered it, and halted with "no client in Drake
+    has id …" — while its own halt screenshot showed the client's row, painted moments
+    later. The report's fingerprint was an empty candidates list: the grid was EMPTY at
+    decision time, not unmatched.
+
+    Two directions, because the fix must not weaken the gate it lives next to:
+      1. A grid that populates late still finds the client (the race, fixed).
+      2. A grid that stays empty still refuses — a truly absent client remains a clean,
+         honest halt, just a second and a half later.
+
+    THE REAL `open_client` RUNS against a scripted driver whose grid answers empty for
+    the first reads after typing — the exact shape of the live failure."""
+    import drake_nav
+
+    TITLE = "Drake 2025 - Data Entry (000112222 - SAMPLE, JANE)"
+    # The row and its name are SEPARATE elements joined by geometry (see
+    # collect_client_rows) — a rect-less row is filtered out as unreadable, so the
+    # fixture has to be shaped like Drake's real grid, not like a convenient dict.
+    ROW = [
+        {"automation_id": drake_nav.RESULT_ROW_ID_PREFIX + "000112222-0",
+         "rect": [10, 100, 400, 120]},
+        {"automation_id": drake_nav.ROW_CELL_NAME_ID, "name": "SAMPLE, JANE",
+         "rect": [12, 104, 200, 116]},
+    ]
+
+    class ScriptedDriver:
+        """Drake, reduced to the six calls open_client makes — with a slow grid."""
+
+        def __init__(self, rows_appear_on_read, rows):
+            self.rows_appear_on_read = rows_appear_on_read
+            self.rows = rows
+            self.typed = False
+            self.dlg_reads = 0
+            self.opened = False
+            self.connects = []
+
+        def nav_data_entry_window(self):
+            return ({"kind": "data_entry", "title": TITLE} if self.opened
+                    else {"kind": "none", "title": ""})
+
+        def nav_find_window(self, pattern, timeout=0):
+            return {"which": "dlg" if "Open" in str(pattern) or "Create" in str(pattern)
+                    else "home"}
+
+        def nav_elements(self, win):
+            if win.get("which") == "home":
+                return [{"automation_id": drake_nav.OPEN_CREATE_BUTTON_ID}]
+            els = [{"automation_id": drake_nav.SEARCH_BOX_ID},
+                   {"automation_id": drake_nav.DIALOG_OK_ID}]
+            if self.typed:
+                # THE RACE: the grid is empty until Drake's filter catches up.
+                self.dlg_reads += 1
+                if self.dlg_reads >= self.rows_appear_on_read:
+                    els.extend(self.rows)
+            return els
+
+        def nav_type_into(self, el, text):
+            self.typed = True
+            self.dlg_reads = 0
+            return {"ok": True}
+
+        def nav_act(self, el, want=None):
+            if el.get("automation_id") == drake_nav.DIALOG_OK_ID:
+                self.opened = True
+            return {"ok": True}
+
+        def nav_wait_gone(self, dlg, timeout=0):
+            return True
+
+    quiet = lambda *_a, **_k: None
+
+    # 1 — the live failure's exact shape: six empty reads, then the row.
+    slow = ScriptedDriver(rows_appear_on_read=6, rows=ROW)
+    found = drake_nav.open_client(slow, "000112222", first_name="Jane",
+                                  last_name="Sample", timeout=8.0, log=quiet)
+
+    # 2 — a client who genuinely is not there: the grid never fills.
+    absent = ScriptedDriver(rows_appear_on_read=10**9, rows=[])
+    missing = drake_nav.open_client(absent, "000112222", first_name="Jane",
+                                    last_name="Sample", timeout=8.0, log=quiet)
+
+    checks = [
+        ("a grid that paints late still finds the client", found.get("ok") is True),
+        ("...and the run opens the RIGHT return, verified from Drake's own title",
+         found.get("step") == "opened" and "SAMPLE" in str(found.get("reason", ""))),
+        ("...after more than one read of the grid — the first read was empty",
+         slow.dlg_reads >= 6),
+        ("a truly absent client is still refused — the gate is not weakened",
+         missing.get("ok") is False and missing.get("not_found") is True),
+        ("...with the same honest reason a person can act on",
+         "no client in Drake has id" in str(missing.get("reason", ""))),
+        ("...decided only after the grid answered the same way repeatedly",
+         absent.dlg_reads >= 8),
+        ("...and nothing was opened for them", absent.opened is False),
+    ]
+    return _table("a slow search grid never turns into 'no client'", checks)
+
+
 def case_revoked_machine_is_visible():
     """When Fynn stops recognising this PC, does anybody find out — through every door?
 
@@ -6166,6 +6270,7 @@ def main() -> int:
         ('tray_notify_output_only', lambda: case_tray_notify_is_output_only()),
         ('revoked_machine_is_visible', lambda: case_revoked_machine_is_visible()),
         ('drake_dies_inside_the_poll', lambda: case_drake_dies_inside_the_poll()),
+        ('client_search_grid_race', lambda: case_client_search_grid_race()),
         ('repair_resumes_the_loop', lambda: case_repair_resumes_the_loop()),
         ('held_report_never_blocks', lambda: case_held_report_never_blocks_the_loop()),
         ('drake_closed_said_out_loud', lambda: case_drake_closed_is_said_out_loud()),
